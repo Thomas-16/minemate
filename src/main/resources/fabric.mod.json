@@ -33,6 +33,8 @@
 		"fabricloader": ">=0.19.3",
 		"minecraft": "~1.21.1",
 		"java": ">=21",
-		"fabric-api": "*"
+		"fabric-api": "*",
+		"playerengine": ">=1.21.1-1.4.0",
+		"architectury": ">=13.0.8"
 	}
 }

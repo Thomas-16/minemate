@@ -1,6 +1,11 @@
 package io.github.thomas16.minemate;
 
+import io.github.thomas16.minemate.command.CompanionCommands;
+import io.github.thomas16.minemate.dev.DevAutoTest;
+import io.github.thomas16.minemate.entity.MineMateEntities;
+
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 
 import net.minecraft.resources.ResourceLocation;
 
@@ -21,7 +26,11 @@ public class MineMate implements ModInitializer {
 		// However, some things (like resources) may still be uninitialized.
 		// Proceed with mild caution.
 
-		LOGGER.info("Hello Fabric world!");
+		MineMateEntities.register();
+		CommandRegistrationCallback.EVENT.register(
+				(dispatcher, registryAccess, environment) -> CompanionCommands.register(dispatcher));
+		DevAutoTest.init();
+		LOGGER.info("MineMate initialized");
 	}
 
 	public static ResourceLocation id(String path) {

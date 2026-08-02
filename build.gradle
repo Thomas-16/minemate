@@ -12,10 +12,33 @@ repositories {
 	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
 	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
 	// for more information about repositories.
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = "Modrinth"
+				url = "https://api.modrinth.com/maven"
+			}
+		}
+		filter {
+			includeGroup "maven.modrinth"
+		}
+	}
+	maven {
+		name = "Architectury"
+		url = "https://maven.architectury.dev/"
+	}
 }
 
 loom {
 	splitEnvironmentSourceSets()
+
+	runs {
+		server {
+			// Forward the autotest flag from the Gradle invocation into the game JVM:
+			// gradlew runServer -Dminemate.autotest=true
+			vmArg "-Dminemate.autotest=${System.getProperty('minemate.autotest', 'false')}"
+		}
+	}
 
 	mods {
 		"minemate" {
@@ -33,6 +56,11 @@ dependencies {
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// PlayerEngine: LivingEntity body + inventory + Baritone-fork navigation (bundled Automatone).
+	modImplementation "maven.modrinth:playerengine:${project.playerengine_version}"
+	// Architectury API: required at runtime by PlayerEngine.
+	modImplementation "dev.architectury:architectury-fabric:${project.architectury_api_version}"
 }
 
 processResources {

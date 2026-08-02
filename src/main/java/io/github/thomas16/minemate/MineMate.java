@@ -3,6 +3,7 @@ package io.github.thomas16.minemate;
 import io.github.thomas16.minemate.command.CompanionCommands;
 import io.github.thomas16.minemate.dev.DevAutoTest;
 import io.github.thomas16.minemate.entity.MineMateEntities;
+import io.github.thomas16.minemate.integration.PlayerEngineQuiet;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -30,6 +31,7 @@ public class MineMate implements ModInitializer {
 		CommandRegistrationCallback.EVENT.register(
 				(dispatcher, registryAccess, environment) -> CompanionCommands.register(dispatcher));
 		DevAutoTest.init();
+		PlayerEngineQuiet.init();
 		LOGGER.info("MineMate initialized");
 	}
 

@@ -48,6 +48,34 @@ loom {
 	}
 }
 
+// The autotest mutates the world it runs in: it spawns a companion and mines terrain
+// near spawn. Reusing a save across runs lets that damage accumulate until pathfinding
+// scenarios fail for reasons unrelated to the code, so start each run from a fresh world.
+tasks.matching { it.name == 'runServer' }.configureEach {
+	doFirst {
+		if (!Boolean.getBoolean('minemate.autotest')) {
+			return
+		}
+		def runDir = file('run')
+		def levelName = 'world'
+		def properties = new File(runDir, 'server.properties')
+		if (properties.exists()) {
+			def parsed = new Properties()
+			properties.withInputStream { parsed.load(it) }
+			levelName = parsed.getProperty('level-name', 'world')
+		}
+		if (!levelName || levelName.contains('/') || levelName.contains('\\') || levelName.contains('..')) {
+			logger.warn("[autotest] refusing to clear suspicious level-name '${levelName}'")
+			return
+		}
+		def world = new File(runDir, levelName)
+		if (world.exists()) {
+			project.delete(world)
+			logger.lifecycle("[autotest] cleared world '${levelName}' for a reproducible run")
+		}
+	}
+}
+
 dependencies {
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"

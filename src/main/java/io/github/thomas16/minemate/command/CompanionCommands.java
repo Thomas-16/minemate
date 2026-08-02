@@ -1,10 +1,14 @@
 package io.github.thomas16.minemate.command;
 
 import com.mojang.brigadier.CommandDispatcher;
-import com.player2.playerengine.tasks.movement.FollowPlayerTask;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 
 import io.github.thomas16.minemate.entity.CompanionEntity;
 import io.github.thomas16.minemate.entity.MineMateEntities;
+import io.github.thomas16.minemate.task.Goal;
+import io.github.thomas16.minemate.task.GoalProgress;
+import io.github.thomas16.minemate.task.Reasons;
+import io.github.thomas16.minemate.task.TaskOutcome;
 
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -14,45 +18,27 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 
 import java.util.List;
+import java.util.Optional;
 
-/**
- * Dev/debug commands for driving the companion before the voice/LLM layers
- * exist. /companion spawn|follow|stop|dismiss
- */
+/** Temporary developer commands for spawning and directing the companion. */
 public final class CompanionCommands {
 
     private CompanionCommands() {
     }
 
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
-        dispatcher.register(Commands.literal("companion")
-                .then(Commands.literal("spawn").executes(ctx -> spawn(ctx.getSource())))
-                .then(Commands.literal("follow").executes(ctx -> follow(ctx.getSource())))
-                .then(Commands.literal("stop").executes(ctx -> stop(ctx.getSource())))
-                .then(Commands.literal("dismiss").executes(ctx -> dismiss(ctx.getSource()))));
-    }
-
-    private static int follow(CommandSourceStack source) {
-        ServerPlayer player = source.getPlayer();
-        if (player == null) {
-            source.sendFailure(Component.literal("Player-only command"));
-            return 0;
-        }
-        CompanionEntity companion = findCompanion(player);
-        if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby — /companion spawn first"));
-            return 0;
-        }
-        companion.getController().runUserTask(
-                new FollowPlayerTask(player.getName().getString(), 3.0));
-        source.sendSuccess(() -> Component.literal("Companion is following you"), false);
-        return 1;
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("companion");
+        root.then(Commands.literal("spawn").executes(ctx -> spawn(ctx.getSource())));
+        root.then(Commands.literal("dismiss").executes(ctx -> dismiss(ctx.getSource())));
+        root.then(Commands.literal("stop").executes(ctx -> stop(ctx.getSource())));
+        root.then(Commands.literal("status").executes(ctx -> status(ctx.getSource())));
+        CompanionTaskCommands.attach(root);
+        dispatcher.register(root);
     }
 
     private static int stop(CommandSourceStack source) {
-        ServerPlayer player = source.getPlayer();
+        ServerPlayer player = requirePlayer(source);
         if (player == null) {
-            source.sendFailure(Component.literal("Player-only command"));
             return 0;
         }
         CompanionEntity companion = findCompanion(player);
@@ -60,15 +46,41 @@ public final class CompanionCommands {
             source.sendFailure(Component.literal("No companion nearby"));
             return 0;
         }
-        companion.getController().cancelUserTask();
+        if (companion.getSupervisor().isBusy()) {
+            companion.getSupervisor().cancel(Reasons.CANCELLED_BY_OWNER);
+        } else {
+            companion.getController().cancelUserTask();
+        }
         source.sendSuccess(() -> Component.literal("Companion stopped"), false);
         return 1;
     }
 
-    private static int spawn(CommandSourceStack source) {
-        ServerPlayer player = source.getPlayer();
+    private static int status(CommandSourceStack source) {
+        ServerPlayer player = requirePlayer(source);
         if (player == null) {
-            source.sendFailure(Component.literal("Player-only command"));
+            return 0;
+        }
+        CompanionEntity companion = findCompanion(player);
+        if (companion == null) {
+            source.sendFailure(Component.literal("No companion nearby"));
+            return 0;
+        }
+        Optional<Goal> current = companion.getSupervisor().currentGoal();
+        if (current.isPresent()) {
+            Optional<GoalProgress> progress = companion.getSupervisor().currentProgress();
+            String suffix = progress.map(value -> " — " + value.text()).orElse(" — waiting to start");
+            source.sendSuccess(() -> Component.literal("Current: " + current.get().description() + suffix), false);
+            return 1;
+        }
+        Optional<TaskOutcome> outcome = companion.getSupervisor().lastOutcome();
+        String text = outcome.map(value -> "Idle — last: " + value.detail()).orElse("Idle");
+        source.sendSuccess(() -> Component.literal(text), false);
+        return 1;
+    }
+
+    private static int spawn(CommandSourceStack source) {
+        ServerPlayer player = requirePlayer(source);
+        if (player == null) {
             return 0;
         }
         ServerLevel level = player.serverLevel();
@@ -87,9 +99,8 @@ public final class CompanionCommands {
     }
 
     private static int dismiss(CommandSourceStack source) {
-        ServerPlayer player = source.getPlayer();
+        ServerPlayer player = requirePlayer(source);
         if (player == null) {
-            source.sendFailure(Component.literal("Player-only command"));
             return 0;
         }
         CompanionEntity companion = findCompanion(player);
@@ -102,12 +113,21 @@ public final class CompanionCommands {
         return 1;
     }
 
+    static ServerPlayer requirePlayer(CommandSourceStack source) {
+        ServerPlayer player = source.getPlayer();
+        if (player == null) {
+            source.sendFailure(Component.literal("Player-only command"));
+        }
+        return player;
+    }
+
     /** Finds the player's own companion within 128 blocks. */
     static CompanionEntity findCompanion(ServerPlayer player) {
         List<CompanionEntity> companions = player.serverLevel().getEntitiesOfClass(
                 CompanionEntity.class,
                 player.getBoundingBox().inflate(128.0),
-                c -> c.isAlive() && c.getOwnerUuid().map(player.getUUID()::equals).orElse(false));
+                candidate -> candidate.isAlive()
+                        && candidate.getOwnerUuid().map(player.getUUID()::equals).orElse(false));
         return companions.isEmpty() ? null : companions.get(0);
     }
 }

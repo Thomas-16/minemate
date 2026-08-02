@@ -12,6 +12,8 @@ import com.player2.playerengine.automaton.api.entity.LivingEntityInventory;
 import com.player2.playerengine.player2api.Character;
 
 import io.github.thomas16.minemate.MineMate;
+import io.github.thomas16.minemate.task.Reasons;
+import io.github.thomas16.minemate.task.TaskSupervisor;
 
 import net.minecraft.core.Vec3i;
 import net.minecraft.nbt.CompoundTag;
@@ -57,6 +59,7 @@ public class CompanionEntity extends LivingEntity
     private LivingEntityInventory inventory;
     private LivingEntityHungerManager hungerManager;
     private PlayerEngineController controller;
+    private TaskSupervisor supervisor;
 
     private UUID ownerUuid;
     private Vec3 lastVelocity = Vec3.ZERO;
@@ -71,12 +74,18 @@ public class CompanionEntity extends LivingEntity
             this.controller = new PlayerEngineController(
                     IBaritone.KEY.get(this), DUMMY_CHARACTER, MineMate.MOD_ID);
             this.controller.setChatClefEnabled(false);
+            this.supervisor = new TaskSupervisor(this);
         }
     }
 
     /** Server-side only; null on the client. */
     public PlayerEngineController getController() {
         return controller;
+    }
+
+    /** Server-side only; null on the client. */
+    public TaskSupervisor getSupervisor() {
+        return supervisor;
     }
 
     public Optional<UUID> getOwnerUuid() {
@@ -110,6 +119,7 @@ public class CompanionEntity extends LivingEntity
         ++this.attackStrengthTicker;
         if (!this.level().isClientSide && this.controller != null) {
             this.controller.serverTick();
+            this.supervisor.tick();
         }
         super.tick();
         this.updateSwingTime();
@@ -119,6 +129,7 @@ public class CompanionEntity extends LivingEntity
     @Override
     public void remove(RemovalReason reason) {
         if (!this.level().isClientSide && this.controller != null) {
+            this.supervisor.shutdown(Reasons.COMPANION_REMOVED);
             this.controller.stop();
         }
         super.remove(reason);

@@ -40,6 +40,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -96,6 +97,7 @@ public final class DevAutoTest {
     private static boolean done;
     private static final List<BlockPos> worldMaterialPositions = new ArrayList<>();
     private static final List<ItemEntity> observedFetchDrops = new ArrayList<>();
+    private static final List<FetchThrowObservation> observedFetchThrows = new ArrayList<>();
 
     private DevAutoTest() {
     }
@@ -565,14 +567,15 @@ public final class DevAutoTest {
 
     private static boolean acceptFetchOakBoatDelivery(TaskOutcome outcome) {
         int delivered = fakeOwnerInventoryCount(Items.OAK_BOAT);
-        boolean accepted = succeeded(outcome) && delivered >= 2;
+        String trajectoryViolation = fetchTrajectoryViolation(true);
+        boolean accepted = succeeded(outcome) && delivered >= 2 && trajectoryViolation == null;
         if (!accepted) {
             MineMate.LOGGER.error(
                     "[autotest] fetch postcondition delivered={} logs={} planks={} tables={} boats={} "
-                            + "observedDrops={} engineState={} engineLog={}",
+                            + "observedDrops={} trajectory={} engineState={} engineLog={}",
                     delivered, inventoryCount(Items.OAK_LOG), inventoryCount(Items.OAK_PLANKS),
                     inventoryCount(Items.CRAFTING_TABLE), inventoryCount(Items.OAK_BOAT),
-                    describeObservedDrops(), outcome.engineState(), outcome.engineLog());
+                    describeObservedDrops(), trajectoryViolation, outcome.engineState(), outcome.engineLog());
         }
         return accepted;
     }
@@ -604,6 +607,7 @@ public final class DevAutoTest {
         }
         companion.setOwnerUuid(fakeOwner.getUUID());
         observedFetchDrops.clear();
+        observedFetchThrows.clear();
         for (int offset = 0; offset < 5; offset++) {
             placeFixtureBlock(spawn.offset(3 + offset, 0, 6), Blocks.OAK_LOG);
         }
@@ -619,6 +623,7 @@ public final class DevAutoTest {
         }
         fakeOwner = null;
         observedFetchDrops.clear();
+        observedFetchThrows.clear();
         clearFixtures();
     }
 
@@ -631,12 +636,22 @@ public final class DevAutoTest {
                 ItemEntity.class, companion.getBoundingBox().inflate(24.0))) {
             if (!observedFetchDrops.contains(drop)) {
                 observedFetchDrops.add(drop);
+                if (drop.getItem().is(Items.OAK_BOAT)) {
+                    Vec3 towardOwner = fakeOwner.position().subtract(drop.position());
+                    observedFetchThrows.add(new FetchThrowObservation(
+                            drop.getDeltaMovement(), new Vec3(towardOwner.x, 0.0, towardOwner.z)));
+                }
             }
         }
         for (ItemEntity drop : level.getEntitiesOfClass(
-                ItemEntity.class, fakeOwner.getBoundingBox().inflate(6.0))) {
+                ItemEntity.class, fakeOwner.getBoundingBox().inflate(1.0, 0.5, 1.0))) {
             if (!observedFetchDrops.contains(drop)) {
                 observedFetchDrops.add(drop);
+                if (drop.getItem().is(Items.OAK_BOAT)) {
+                    Vec3 towardOwner = fakeOwner.position().subtract(drop.position());
+                    observedFetchThrows.add(new FetchThrowObservation(
+                            drop.getDeltaMovement(), new Vec3(towardOwner.x, 0.0, towardOwner.z)));
+                }
             }
             if (drop.getItem().is(Items.OAK_BOAT)) {
                 drop.playerTouch(fakeOwner);
@@ -645,6 +660,10 @@ public final class DevAutoTest {
     }
 
     private static String fetchDropInvariant() {
+        String trajectoryViolation = fetchTrajectoryViolation(false);
+        if (trajectoryViolation != null) {
+            return trajectoryViolation;
+        }
         for (ItemEntity drop : observedFetchDrops) {
             // GiveItemToPlayerTask hands boats to the fake owner through vanilla
             // playerTouch, whose removed entity may retain its old stack object.
@@ -660,10 +679,33 @@ public final class DevAutoTest {
         return compositeActivityInvariant();
     }
 
+    private static String fetchTrajectoryViolation(boolean requireObservation) {
+        if (observedFetchThrows.isEmpty()) {
+            return requireObservation ? "no oak boat delivery drop was observed" : null;
+        }
+        for (FetchThrowObservation observation : observedFetchThrows) {
+            Vec3 velocity = observation.velocity();
+            Vec3 horizontalVelocity = new Vec3(velocity.x, 0.0, velocity.z);
+            Vec3 towardOwner = observation.towardOwner();
+            if (horizontalVelocity.length() < 0.08) {
+                return "delivery drop had no meaningful horizontal velocity: " + velocity;
+            }
+            if (towardOwner.lengthSqr() > 1.0e-6
+                    && horizontalVelocity.normalize().dot(towardOwner.normalize()) < 0.9) {
+                return "delivery drop was not aimed at owner: velocity=" + velocity
+                        + " towardOwner=" + towardOwner;
+            }
+        }
+        return null;
+    }
+
     private static String describeObservedDrops() {
-        return observedFetchDrops.stream()
+        return "entities=" + observedFetchDrops.stream()
                 .map(drop -> "[removed=" + drop.isRemoved() + ",stack=" + drop.getItem() + "]")
-                .toList().toString();
+                .toList() + ", throws=" + observedFetchThrows;
+    }
+
+    private record FetchThrowObservation(Vec3 velocity, Vec3 towardOwner) {
     }
 
     private static String craftSearchWindowInvariant() {

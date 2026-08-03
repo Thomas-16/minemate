@@ -3,7 +3,8 @@
 	"package": "io.github.thomas16.minemate.mixin",
 	"compatibilityLevel": "JAVA_21",
 	"mixins": [
-		"CraftMacroResourceTaskMixin"
+		"CraftMacroResourceTaskMixin",
+		"GiveItemToPlayerTaskMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

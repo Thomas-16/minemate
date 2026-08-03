@@ -5,9 +5,11 @@ import com.player2.playerengine.executor.RollbackPolicy;
 import com.player2.playerengine.executor.StepExecution;
 import com.player2.playerengine.executor.StepState;
 import com.player2.playerengine.tasks.base.Task;
+import com.player2.playerengine.tasks.base.TaskChain;
 
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.entity.CompanionEntity;
+import io.github.thomas16.minemate.integration.CompanionMovement;
 
 import java.util.Objects;
 import java.util.Optional;
@@ -27,6 +29,9 @@ public final class TaskSupervisor {
     private static final int PROGRESS_INTERVAL_TICKS = 40;
     private static final double ADVANCE_EPSILON = 1.0e-3;
 
+    /** Consecutive ticks another chain may own the body before the goal is given up on. */
+    private static final int PREEMPT_LIMIT_TICKS = 600;
+
     private final CompanionEntity companion;
     private final PlayerEngineController controller;
 
@@ -42,6 +47,8 @@ public final class TaskSupervisor {
     private GoalProgress lastProgress;
     private TaskOutcome lastOutcome;
     private boolean engineFinishHint;
+    private String preemptingChain;
+    private int preemptedTicks;
 
     public TaskSupervisor(CompanionEntity companion) {
         this.companion = Objects.requireNonNull(companion, "companion");
@@ -109,6 +116,11 @@ public final class TaskSupervisor {
         }
 
         ticks++;
+        updateChainOwnership();
+        if (preemptedTicks >= PREEMPT_LIMIT_TICKS) {
+            finish(OutcomeStatus.BLOCKED, Reasons.PREEMPTED);
+            return;
+        }
         if (ticks % SAMPLE_INTERVAL_TICKS == 0 && !sampleProgress()) {
             return;
         }
@@ -143,8 +155,43 @@ public final class TaskSupervisor {
             return;
         }
         if (ticks % PROGRESS_INTERVAL_TICKS == 0 && lastProgress != null) {
-            TaskListeners.fireProgress(companion, goal, lastProgress);
+            TaskListeners.fireProgress(companion, goal, annotate(lastProgress));
         }
+    }
+
+    /**
+     * MineMate's goals run on PlayerEngine's user chain at a flat priority 50, and
+     * survival chains outrank it (mob defense reaches 80). While one of them owns
+     * the body the goal's task is interrupted, yet its step stays RUNNING — so
+     * without this the supervisor keeps narrating progress for a task that is not
+     * running, and eventually blames the stall on the goal itself.
+     */
+    private void updateChainOwnership() {
+        TaskChain current = controller.getTaskRunner().getCurrentTaskChain();
+        if (current == null || current == controller.getUserTaskChain()) {
+            if (preemptingChain != null) {
+                // Our task resumes from scratch next tick; start it from a clean slate.
+                CompanionMovement.halt(controller);
+            }
+            preemptingChain = null;
+            preemptedTicks = 0;
+            return;
+        }
+        if (preemptingChain == null && !controller.getBaritone().getPathingBehavior().isPathing()) {
+            // The handover clears neither pathing nor forced inputs. Drop whatever the
+            // interrupted task was holding, unless the new owner is already steering.
+            CompanionMovement.halt(controller);
+        }
+        preemptingChain = current.getName();
+        preemptedTicks++;
+    }
+
+    private GoalProgress annotate(GoalProgress progress) {
+        if (preemptingChain == null) {
+            return progress;
+        }
+        return new GoalProgress(progress.have(), progress.want(), progress.advance(),
+                progress.text() + " — paused: " + preemptingChain);
     }
 
     /** Server-thread-only. */
@@ -163,6 +210,12 @@ public final class TaskSupervisor {
     public Optional<GoalProgress> currentProgress() {
         assertServerThread();
         return Optional.ofNullable(lastProgress);
+    }
+
+    /** Server-thread-only. Names the PlayerEngine chain currently holding the body, if not ours. */
+    public Optional<String> preemptingChain() {
+        assertServerThread();
+        return Optional.ofNullable(preemptingChain);
     }
 
     /** Server-thread-only. */
@@ -190,6 +243,8 @@ public final class TaskSupervisor {
         ticksSinceAdvance = 0;
         lastProgress = null;
         engineFinishHint = false;
+        preemptingChain = null;
+        preemptedTicks = 0;
         activeStepId = goal.id();
 
         try {
@@ -231,7 +286,8 @@ public final class TaskSupervisor {
             if (progress.advance() > bestAdvance + ADVANCE_EPSILON) {
                 bestAdvance = progress.advance();
                 ticksSinceAdvance = 0;
-            } else if (ticks > 0) {
+            } else if (ticks > 0 && preemptingChain == null) {
+                // A preempted task cannot advance; that is not the goal stalling.
                 ticksSinceAdvance += SAMPLE_INTERVAL_TICKS;
             }
             return true;
@@ -291,12 +347,18 @@ public final class TaskSupervisor {
         runningTask = null;
         engineFinishHint = false;
         lastProgress = null;
+        preemptingChain = null;
+        preemptedTicks = 0;
 
         if (finishedGoal == null) {
             return;
         }
         if (finishedExecution != null && finishedExecution.getState() == StepState.RUNNING && stepId != null) {
+            // Cancelling routes through UserTaskChain.onTaskFinish, which stops the legs itself.
             controller.getStepExecutorAdapter().cancel(stepId);
+        } else {
+            // No cancel to route through: nothing else would drop a latched input.
+            CompanionMovement.halt(controller);
         }
         int have = progress == null ? 0 : progress.have();
         int want = progress == null ? 0 : progress.want();
@@ -334,6 +396,8 @@ public final class TaskSupervisor {
             case Reasons.NO_PROGRESS -> "No progress on: " + goal.description();
             case Reasons.TIMEOUT -> "Timed out: " + goal.description();
             case Reasons.CANCELLED_BY_OWNER -> "Stopped: " + goal.description();
+            case Reasons.PREEMPTED -> "The companion's own survival behavior took over during: "
+                    + goal.description();
             case Reasons.SUPERSEDED -> "Replaced by a new order: " + goal.description();
             case Reasons.COMPANION_DIED -> "Companion died while trying to " + goal.description();
             case Reasons.COMPANION_REMOVED -> "Companion was removed while trying to " + goal.description();

@@ -1,5 +1,6 @@
 package io.github.thomas16.minemate.dev;
 
+import com.player2.playerengine.PlayerEngineController;
 import com.player2.playerengine.tasks.base.Task;
 
 import io.github.thomas16.minemate.MineMate;
@@ -19,12 +20,18 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Difficulty;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MobSpawnType;
+import net.minecraft.world.entity.monster.Zombie;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
  * Sequential headless verification for the task supervisor, enabled with
@@ -34,6 +41,7 @@ public final class DevAutoTest {
     private static final int GLOBAL_CAP_TICKS = 6000;
 
     private static CompanionEntity companion;
+    private static Zombie hostile;
     private static List<Scenario> scenarios = List.of();
     private static int scenarioIndex;
     private static int scenarioTicks;
@@ -117,7 +125,15 @@ public final class DevAutoTest {
                         ignored -> Goals.goTo(spawn.getX() + 100_000, spawn.getZ(), 2.5),
                         outcome -> outcome.status() == OutcomeStatus.CANCELLED
                                 && Reasons.CANCELLED_BY_OWNER.equals(outcome.reason()),
-                        400));
+                        400),
+                new Scenario("defense_leash",
+                        ignored -> Goals.goTo(spawn.getX() + 16, spawn.getZ(), 2.5),
+                        outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
+                                && Reasons.GOAL_MET.equals(outcome.reason()),
+                        2400,
+                        ignoredServer -> armHostile(spawn),
+                        DevAutoTest::disarmHostile,
+                        DevAutoTest::defenseLeashInvariant));
         scenarioIndex = 0;
         startScenario(server);
     }
@@ -148,6 +164,11 @@ public final class DevAutoTest {
 
         scenarioTicks++;
         Scenario scenario = scenarios.get(scenarioIndex);
+        String violation = scenario.invariant().get();
+        if (violation != null) {
+            fail(server, scenario.name() + " invariant broken: " + violation);
+            return;
+        }
         if ("cancel".equals(scenario.name()) && scenarioTicks == 40) {
             companion.getSupervisor().cancel(Reasons.CANCELLED_BY_OWNER);
         }
@@ -162,6 +183,7 @@ public final class DevAutoTest {
         currentOutcome = null;
         advanceRequested = false;
         advanceNotBeforeTick = -1;
+        scenario.setup().accept(server);
         currentGoal = scenario.goal().apply(companion);
         if (companion.getSupervisor().submit(currentGoal)
                 != io.github.thomas16.minemate.task.TaskSupervisor.SubmitResult.ACCEPTED) {
@@ -173,6 +195,7 @@ public final class DevAutoTest {
 
     private static void finishScenario(MinecraftServer server) {
         Scenario scenario = scenarios.get(scenarioIndex);
+        scenario.teardown().accept(server);
         if (currentOutcome == null || !scenario.accepts().test(currentOutcome)) {
             fail(server, scenario.name() + " returned "
                     + (currentOutcome == null ? "no outcome" : currentOutcome.toCompactString()));
@@ -188,6 +211,48 @@ public final class DevAutoTest {
             return;
         }
         startScenario(server);
+    }
+
+    /**
+     * The suite's world is provisioned peaceful, where PlayerEngine's mob defense
+     * short-circuits to {@code -Infinity} and can never preempt anything. Raising the
+     * difficulty and putting a zombie next to the companion is the only way to exercise
+     * the leash headlessly. Night time keeps the zombie from burning away mid-scenario.
+     */
+    private static void armHostile(BlockPos spawn) {
+        ServerLevel level = (ServerLevel) companion.level();
+        // The preceding scenarios chase a goal 100k blocks away, which walks the companion
+        // out of the ticking spawn chunks — where it stops being ticked at all, and no goal
+        // can ever finish. Start this one from spawn so it stays inside them.
+        companion.teleportTo(spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5);
+        level.getServer().setDifficulty(Difficulty.EASY, true);
+        level.setDayTime(18_000L);
+        hostile = EntityType.ZOMBIE.spawn(level, spawn.offset(2, 0, 2), MobSpawnType.COMMAND);
+        if (hostile != null) {
+            hostile.setPersistenceRequired();
+        }
+    }
+
+    private static void disarmHostile(MinecraftServer server) {
+        if (hostile != null) {
+            hostile.discard();
+            hostile = null;
+        }
+        if (companion != null) {
+            ((ServerLevel) companion.level()).setDayTime(1000L);
+        }
+        server.setDifficulty(Difficulty.PEACEFUL, true);
+    }
+
+    private static String defenseLeashInvariant() {
+        PlayerEngineController controller = companion.getController();
+        if (!controller.getShouldDefendFromHostiles()) {
+            return "mob defense was not suppressed while the companion had no owner to leash to";
+        }
+        if (controller.getTaskRunner().getCurrentTaskChain() == controller.getMobDefenseChain()) {
+            return "mob defense took the body from the user task chain";
+        }
+        return null;
     }
 
     private static Goal withTimeout(Goal goal, int timeoutTicks) {
@@ -209,6 +274,9 @@ public final class DevAutoTest {
     private static void fail(MinecraftServer server, String reason) {
         done = true;
         MineMate.LOGGER.error("[autotest] AUTOTEST FAIL — {}", reason);
+        if (scenarioIndex < scenarios.size()) {
+            scenarios.get(scenarioIndex).teardown().accept(server);
+        }
         despawnCompanion();
         server.halt(false);
     }
@@ -226,8 +294,22 @@ public final class DevAutoTest {
         companion = null;
     }
 
+    /**
+     * @param setup     prepares the world before the goal is submitted
+     * @param teardown  undoes {@code setup}, on pass and on fail alike, so scenarios stay isolated
+     * @param invariant checked every tick; a non-null return fails the scenario with that message
+     */
     private record Scenario(String name, Function<CompanionEntity, Goal> goal,
-            Predicate<TaskOutcome> accepts, int hardCapTicks) {
+            Predicate<TaskOutcome> accepts, int hardCapTicks,
+            Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
+            Supplier<String> invariant) {
+
+        private Scenario(String name, Function<CompanionEntity, Goal> goal,
+                Predicate<TaskOutcome> accepts, int hardCapTicks) {
+            this(name, goal, accepts, hardCapTicks, server -> {
+            }, server -> {
+            }, () -> null);
+        }
     }
 
     /** Finishes between supervisor sample intervals to exercise terminal re-sampling. */

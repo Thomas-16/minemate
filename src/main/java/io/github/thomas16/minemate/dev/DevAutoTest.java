@@ -291,8 +291,7 @@ public final class DevAutoTest {
                         DevAutoTest::directActivityInvariant),
                 new Scenario("withdraw_success",
                         ignored -> Goals.withdraw(companion, storagePos, Items.DIRT, 4),
-                        outcome -> succeeded(outcome) && inventoryCount(Items.DIRT) >= 4
-                                && storageCount(Items.DIRT) == 0,
+                        DevAutoTest::acceptWithdrawSuccess,
                         1200,
                         ignoredServer -> {
                             prepareStorage(2);
@@ -551,6 +550,16 @@ public final class DevAutoTest {
         return accepted;
     }
 
+    private static boolean acceptWithdrawSuccess(TaskOutcome outcome) {
+        int stored = storageCount(Items.DIRT);
+        int held = inventoryCount(Items.DIRT);
+        boolean accepted = succeeded(outcome) && held >= 4 && stored == 0;
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] withdraw postcondition stored={} held={}", stored, held);
+        }
+        return accepted;
+    }
+
     private static boolean acceptMobDefenseReflex(TaskOutcome outcome) {
         boolean accepted = succeeded(outcome) && sawMobDefenseReflex && sawMobDefenseClear;
         if (!accepted) {
@@ -742,11 +751,20 @@ public final class DevAutoTest {
         companion.getLivingInventory().clearContent();
         companion.getHungerManager().setFoodLevel(20);
         companion.getHungerManager().setSaturationLevel(5.0F);
-        level.setBlockAndUpdate(storagePos, Blocks.AIR.defaultBlockState());
-        level.setBlockAndUpdate(furnacePos, Blocks.AIR.defaultBlockState());
+        removeContainerFixtureWithoutDrops(level, storagePos);
+        removeContainerFixtureWithoutDrops(level, furnacePos);
         for (ItemStack stack : stacks) {
             insert(stack.copy());
         }
+    }
+
+    private static void removeContainerFixtureWithoutDrops(ServerLevel level, BlockPos position) {
+        BlockEntity blockEntity = level.getBlockEntity(position);
+        if (blockEntity instanceof Container container) {
+            container.clearContent();
+            container.setChanged();
+        }
+        level.setBlockAndUpdate(position, Blocks.AIR.defaultBlockState());
     }
 
     private static void prepareFurnace(ItemStack... stacks) {
@@ -821,8 +839,8 @@ public final class DevAutoTest {
         restoreEatingSettings();
         companion.getHungerManager().setFoodLevel(20);
         companion.getHungerManager().setSaturationLevel(5.0F);
-        level.setBlockAndUpdate(storagePos, Blocks.AIR.defaultBlockState());
-        level.setBlockAndUpdate(furnacePos, Blocks.AIR.defaultBlockState());
+        removeContainerFixtureWithoutDrops(level, storagePos);
+        removeContainerFixtureWithoutDrops(level, furnacePos);
         companion.teleportTo(spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5);
     }
 

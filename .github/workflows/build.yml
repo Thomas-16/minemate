@@ -28,3 +28,41 @@ jobs:
         with:
           name: Artifacts
           path: build/libs/
+
+  autotest:
+    name: headless autotest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v6
+      - name: validate gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+      # The suite runs a real dedicated server, so it uses the Java version Minecraft
+      # 1.21.1 targets rather than the newer one the compile job checks against.
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - name: setup gradle
+        uses: gradle/actions/setup-gradle@v6
+      - name: make gradle wrapper executable
+        run: chmod +x ./gradlew
+      # The runServer task provisions run/ itself when the autotest flag is set: it
+      # accepts the EULA, writes the server properties the scenarios depend on, and
+      # regenerates the world. run/ is gitignored, so none of it exists here.
+      - name: run headless autotest
+        run: |
+          set -o pipefail
+          ./gradlew runServer -Dminemate.autotest=true --console=plain 2>&1 | tee autotest.log
+      # The suite halts the server cleanly whether it passes or fails, so runServer
+      # exits 0 either way. This log line is the only reliable signal.
+      - name: assert suite passed
+        run: grep -q 'AUTOTEST PASS' autotest.log
+      - name: capture autotest log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: autotest-log
+          path: autotest.log

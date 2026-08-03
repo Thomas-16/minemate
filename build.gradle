@@ -48,30 +48,52 @@ loom {
 	}
 }
 
-// The autotest mutates the world it runs in: it spawns a companion and mines terrain
-// near spawn. Reusing a save across runs lets that damage accumulate until pathfinding
-// scenarios fail for reasons unrelated to the code, so start each run from a fresh world.
+// Provision everything the headless suite depends on, so it behaves identically on a
+// developer's machine and on a clean CI checkout. run/ is gitignored, which means CI
+// starts with no server.properties and no eula.txt at all.
+def autotestWorldName = 'autotest-world'
+
 tasks.matching { it.name == 'runServer' }.configureEach {
 	doFirst {
 		if (!Boolean.getBoolean('minemate.autotest')) {
 			return
 		}
 		def runDir = file('run')
-		def levelName = 'world'
-		def properties = new File(runDir, 'server.properties')
-		if (properties.exists()) {
-			def parsed = new Properties()
-			properties.withInputStream { parsed.load(it) }
-			levelName = parsed.getProperty('level-name', 'world')
+		runDir.mkdirs()
+
+		// The dedicated server refuses to boot without this. Accepted deliberately for
+		// the automated suite; it is not written for an ordinary runServer.
+		new File(runDir, 'eula.txt').text = 'eula=true\n'
+
+		// Merge in only the keys the scenarios depend on, leaving any other local
+		// settings alone. A superflat, peaceful world keeps pathfinding and mining
+		// deterministic, and the disabled watchdog stops a slow CI runner from being
+		// killed mid-scenario.
+		def propertiesFile = new File(runDir, 'server.properties')
+		def serverProperties = new Properties()
+		if (propertiesFile.exists()) {
+			propertiesFile.withInputStream { serverProperties.load(it) }
 		}
-		if (!levelName || levelName.contains('/') || levelName.contains('\\') || levelName.contains('..')) {
-			logger.warn("[autotest] refusing to clear suspicious level-name '${levelName}'")
-			return
+		serverProperties.putAll([
+				'level-name'        : autotestWorldName,
+				'level-type'        : 'minecraft:flat',
+				'generator-settings': '{}',
+				'difficulty'        : 'peaceful',
+				'spawn-monsters'    : 'false',
+				'online-mode'       : 'false',
+				'max-tick-time'     : '-1'
+		])
+		propertiesFile.withOutputStream {
+			serverProperties.store(it, 'Managed by the MineMate autotest task')
 		}
-		def world = new File(runDir, levelName)
+
+		// The suite spawns a companion and mines terrain near spawn. Reusing a save lets
+		// that damage accumulate until pathfinding scenarios fail for reasons unrelated
+		// to the code, so every run starts from a freshly generated world.
+		def world = new File(runDir, autotestWorldName)
 		if (world.exists()) {
 			project.delete(world)
-			logger.lifecycle("[autotest] cleared world '${levelName}' for a reproducible run")
+			logger.lifecycle("[autotest] cleared world '${autotestWorldName}' for a reproducible run")
 		}
 	}
 }

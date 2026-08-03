@@ -72,19 +72,19 @@ public final class CompanionCommands {
         Optional<Goal> current = companion.getSupervisor().currentGoal();
         if (current.isPresent()) {
             Optional<GoalProgress> progress = companion.getSupervisor().currentProgress();
-            String suffix = progress.map(value -> " — " + value.text()).orElse(" — waiting to start");
+            String suffix = progress.map(value -> " - " + value.text()).orElse(" - waiting to start");
             Optional<TaskActivitySnapshot> activity = companion.getSupervisor().currentActivity();
-            String scope = " — " + current.get().executionProfile().scope().name().toLowerCase();
+            String scope = " - " + current.get().executionProfile().scope().name().toLowerCase();
             String phase = activity.map(TaskActivitySnapshot::phase)
                     .filter(value -> !value.isBlank() && progress.map(p -> !value.equals(p.text())).orElse(true))
-                    .map(value -> " — " + value).orElse("");
+                    .map(value -> " - " + value).orElse("");
             String paused = activity.filter(TaskActivitySnapshot::preempted)
-                    .map(value -> " — paused: " + value.preemptingChain()).orElse("");
-            String budget = activity.map(value -> " — ticks " + value.elapsedTicks() + "/"
+                    .map(value -> " - paused: " + value.preemptingChain()).orElse("");
+            String budget = activity.map(value -> " - ticks " + value.elapsedTicks() + "/"
                     + (value.timeoutTicks() == 0 ? "unbounded" : value.timeoutTicks())).orElse("");
             String taskTree = activity.map(TaskActivitySnapshot::taskTree)
                     .filter(value -> !value.isBlank())
-                    .map(value -> " — task: " + bounded(value, 180)).orElse("");
+                    .map(value -> " - task: " + bounded(value, 180)).orElse("");
             String reflex = reflexSuffix(companion.getReflexSnapshot());
             source.sendSuccess(
                     () -> Component.literal("Current: " + current.get().description()
@@ -92,7 +92,7 @@ public final class CompanionCommands {
             return 1;
         }
         Optional<TaskOutcome> outcome = companion.getSupervisor().lastOutcome();
-        String text = outcome.map(value -> "Idle — last: " + value.detail()).orElse("Idle")
+        String text = outcome.map(value -> "Idle - last: " + value.detail()).orElse("Idle")
                 + reflexSuffix(companion.getReflexSnapshot());
         source.sendSuccess(() -> Component.literal(text), false);
         return 1;
@@ -100,15 +100,16 @@ public final class CompanionCommands {
 
     private static String reflexSuffix(ReflexSnapshot reflex) {
         if (reflex == null || !reflex.active()) {
-            return reflex != null && reflex.defenseSuppressed() ? " — mob defense leashed" : "";
+            return reflex != null && reflex.defenseSuppressed() ? " - mob defense leashed" : "";
         }
         String detail = reflex.detail().isBlank() ? "" : ": " + reflex.detail();
-        return " — reflex " + reflex.kind().name().toLowerCase() + detail;
+        return " - reflex " + reflex.kind().name().toLowerCase() + detail;
     }
 
     private static String bounded(String value, int maximum) {
         String oneLine = value.replace('\n', ' ').replace('\r', ' ');
-        return oneLine.length() <= maximum ? oneLine : oneLine.substring(0, maximum - 1) + "…";
+        return oneLine.length() <= maximum
+                ? oneLine : oneLine.substring(0, Math.max(0, maximum - 3)) + "...";
     }
 
     private static int spawn(CommandSourceStack source) {

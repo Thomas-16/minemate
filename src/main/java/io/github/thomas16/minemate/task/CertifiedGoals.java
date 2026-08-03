@@ -73,7 +73,7 @@ final class CertifiedGoals {
                         throw new GoalStartException(TaskTerminalResult.blocked(Reasons.NO_CRAFTING_RECIPE));
                     }
                     return macro.taskOrNull();
-                }, probe, 6000, 1200);
+                }, probe, 6000, 0);
     }
 
     static Goal smelt(CompanionEntity companion, Item input, int desiredOutputTotal) {

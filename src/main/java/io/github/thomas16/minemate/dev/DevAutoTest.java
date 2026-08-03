@@ -1,5 +1,6 @@
 package io.github.thomas16.minemate.dev;
 
+import com.mojang.authlib.GameProfile;
 import com.player2.playerengine.PlayerEngineController;
 import com.player2.playerengine.PlayerEngineSettings;
 import com.player2.playerengine.tasks.base.Task;
@@ -19,26 +20,32 @@ import io.github.thomas16.minemate.task.TaskListeners;
 import io.github.thomas16.minemate.task.TaskOutcome;
 import io.github.thomas16.minemate.integration.ReflexKind;
 
+import net.fabricmc.fabric.api.entity.FakePlayer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.Difficulty;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MobSpawnType;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.Container;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -49,9 +56,12 @@ import java.util.function.Supplier;
  * {@code gradlew runServer -Dminemate.autotest=true}.
  */
 public final class DevAutoTest {
-    private static final int GLOBAL_CAP_TICKS = 12_000;
+    private static final int GLOBAL_CAP_TICKS = 30_000;
+    private static final UUID FAKE_OWNER_UUID =
+            UUID.fromString("bbf6e9b1-075b-4d78-928d-a73cc6c6155f");
 
     private static CompanionEntity companion;
+    private static FakePlayer fakeOwner;
     private static Mob hostile;
     private static BlockPos spawn;
     private static BlockPos storagePos;
@@ -72,6 +82,8 @@ public final class DevAutoTest {
     private static int advanceNotBeforeTick = -1;
     private static String listenerFailure;
     private static boolean done;
+    private static final List<BlockPos> worldMaterialPositions = new ArrayList<>();
+    private static final List<ItemEntity> observedFetchDrops = new ArrayList<>();
 
     private DevAutoTest() {
     }
@@ -80,7 +92,7 @@ public final class DevAutoTest {
         if (!Boolean.getBoolean("minemate.autotest")) {
             return;
         }
-        MineMate.LOGGER.info("[autotest] enabled — will run task supervisor scenarios");
+        MineMate.LOGGER.info("[autotest] enabled - will run task supervisor scenarios");
 
         TaskListeners.register(new TaskListener() {
             @Override
@@ -181,6 +193,28 @@ public final class DevAutoTest {
                                 new ItemStack(Items.OAK_LOG, 1)),
                         ignoredServer -> clearFixtures(),
                         DevAutoTest::compositeActivityInvariant),
+                new Scenario("craft_search_window",
+                        ignored -> withTimeout(Goals.craft(companion, Items.IRON_SWORD, 1), 400),
+                        outcome -> outcome.status() == OutcomeStatus.TIMED_OUT
+                                && Reasons.TIMEOUT.equals(outcome.reason()),
+                        600,
+                        ignoredServer -> prepareInventory(),
+                        ignoredServer -> clearFixtures(),
+                        DevAutoTest::craftSearchWindowInvariant),
+                new Scenario("craft_iron_sword_world",
+                        ignored -> Goals.craft(companion, Items.IRON_SWORD, 1),
+                        outcome -> succeeded(outcome) && inventoryCount(Items.IRON_SWORD) >= 1,
+                        6200,
+                        ignoredServer -> prepareIronSwordWorld(),
+                        ignoredServer -> clearFixtures(),
+                        DevAutoTest::compositeActivityInvariant),
+                new Scenario("fetch_oak_boat_delivery",
+                        ignored -> Goals.fetch("oak_boat", 2),
+                        DevAutoTest::acceptFetchOakBoatDelivery,
+                        6200,
+                        ignoredServer -> prepareFetchOakBoats(),
+                        DevAutoTest::clearFetchOakBoats,
+                        DevAutoTest::fetchDropInvariant),
                 new Scenario("craft_no_recipe",
                         ignored -> Goals.craft(companion, Items.BEDROCK, 1),
                         outcome -> outcome.status() == OutcomeStatus.BLOCKED
@@ -229,14 +263,6 @@ public final class DevAutoTest {
                         400,
                         ignoredServer -> prepareFurnace(new ItemStack(Items.COBBLESTONE, 4),
                                 new ItemStack(Items.COAL, 1)),
-                        ignoredServer -> clearFixtures(),
-                        () -> null),
-                new Scenario("deposit_already_satisfied",
-                        ignored -> Goals.deposit(companion, storagePos, Items.DIRT, 4),
-                        outcome -> succeeded(outcome) && storageCount(Items.DIRT) == 4
-                                && inventoryCount(Items.DIRT) == 0,
-                        100,
-                        ignoredServer -> prepareStorage(4),
                         ignoredServer -> clearFixtures(),
                         () -> null),
                 new Scenario("deposit_success",
@@ -305,6 +331,14 @@ public final class DevAutoTest {
                         ignoredServer -> prepareInventory(),
                         ignoredServer -> clearFixtures(),
                         () -> null),
+                new Scenario("deposit_already_satisfied",
+                        ignored -> Goals.deposit(companion, storagePos, Items.DIRT, 4),
+                        outcome -> succeeded(outcome) && storageCount(Items.DIRT) == 4
+                                && inventoryCount(Items.DIRT) == 0,
+                        100,
+                        ignoredServer -> prepareStorage(4),
+                        ignoredServer -> clearFixtures(),
+                        () -> null),
                 new Scenario("eating_reflex",
                         ignored -> reflexObservationGoal(),
                         outcome -> succeeded(outcome) && sawEatingReflex && sawEatingClear,
@@ -345,6 +379,7 @@ public final class DevAutoTest {
                 sawMobDefenseClear = true;
             }
         }
+        trackFetchDropsAndTouchOwner();
         globalTicks++;
         if (listenerFailure != null) {
             fail(server, listenerFailure);
@@ -406,11 +441,11 @@ public final class DevAutoTest {
                     + (currentOutcome == null ? "no outcome" : currentOutcome.toCompactString()));
             return;
         }
-        MineMate.LOGGER.info("[autotest] {} PASS — {}", scenario.name(), currentOutcome.toCompactString());
+        MineMate.LOGGER.info("[autotest] {} PASS - {}", scenario.name(), currentOutcome.toCompactString());
         scenarioIndex++;
         if (scenarioIndex >= scenarios.size()) {
             done = true;
-            MineMate.LOGGER.info("[autotest] AUTOTEST PASS — all {} scenarios passed", scenarios.size());
+            MineMate.LOGGER.info("[autotest] AUTOTEST PASS - all {} scenarios passed", scenarios.size());
             despawnCompanion();
             server.halt(false);
             return;
@@ -492,8 +527,139 @@ public final class DevAutoTest {
         return accepted;
     }
 
+    private static boolean acceptFetchOakBoatDelivery(TaskOutcome outcome) {
+        int delivered = fakeOwnerInventoryCount(Items.OAK_BOAT);
+        boolean accepted = succeeded(outcome) && delivered >= 2;
+        if (!accepted) {
+            MineMate.LOGGER.error(
+                    "[autotest] fetch postcondition delivered={} logs={} planks={} tables={} boats={} "
+                            + "observedDrops={} engineState={} engineLog={}",
+                    delivered, inventoryCount(Items.OAK_LOG), inventoryCount(Items.OAK_PLANKS),
+                    inventoryCount(Items.CRAFTING_TABLE), inventoryCount(Items.OAK_BOAT),
+                    describeObservedDrops(), outcome.engineState(), outcome.engineLog());
+        }
+        return accepted;
+    }
+
+    private static void prepareIronSwordWorld() {
+        prepareInventory();
+        for (int offset = 0; offset < 5; offset++) {
+            placeFixtureBlock(spawn.offset(3 + offset, 0, 6), Blocks.OAK_LOG);
+        }
+        for (int offset = 0; offset < 8; offset++) {
+            placeFixtureBlock(spawn.offset(3 + offset, 0, -6), Blocks.COBBLESTONE);
+            placeFixtureBlock(spawn.offset(3 + offset, 0, -7), Blocks.COBBLESTONE);
+        }
+        placeFixtureBlock(spawn.offset(8, 0, 2), Blocks.IRON_ORE);
+        placeFixtureBlock(spawn.offset(9, 0, 2), Blocks.IRON_ORE);
+        placeFixtureBlock(spawn.offset(10, 0, 2), Blocks.IRON_ORE);
+        placeFixtureBlock(spawn.offset(8, 0, -2), Blocks.COAL_ORE);
+        placeFixtureBlock(spawn.offset(9, 0, -2), Blocks.COAL_ORE);
+    }
+
+    private static void prepareFetchOakBoats() {
+        prepareInventory();
+        ServerLevel level = (ServerLevel) companion.level();
+        fakeOwner = FakePlayer.get(level, new GameProfile(FAKE_OWNER_UUID, "MineMateTestOwner"));
+        fakeOwner.getInventory().clearContent();
+        fakeOwner.moveTo(spawn.getX() - 3.5, spawn.getY(), spawn.getZ() + 0.5, 0.0F, 0.0F);
+        if (level.getEntity(fakeOwner.getUUID()) == null) {
+            level.addNewPlayer(fakeOwner);
+        }
+        companion.setOwnerUuid(fakeOwner.getUUID());
+        observedFetchDrops.clear();
+        for (int offset = 0; offset < 5; offset++) {
+            placeFixtureBlock(spawn.offset(3 + offset, 0, 6), Blocks.OAK_LOG);
+        }
+        companion.getController().getEntityTracker().setDirty();
+        companion.getController().getEntityTracker().ensureUpdated();
+    }
+
+    private static void clearFetchOakBoats(MinecraftServer server) {
+        companion.setOwnerUuid(null);
+        if (fakeOwner != null && !fakeOwner.isRemoved()) {
+            ((ServerLevel) companion.level()).removePlayerImmediately(
+                    fakeOwner, Entity.RemovalReason.DISCARDED);
+        }
+        fakeOwner = null;
+        observedFetchDrops.clear();
+        clearFixtures();
+    }
+
+    private static void trackFetchDropsAndTouchOwner() {
+        if (fakeOwner == null || fakeOwner.isRemoved() || companion == null) {
+            return;
+        }
+        ServerLevel level = (ServerLevel) companion.level();
+        for (ItemEntity drop : level.getEntitiesOfClass(
+                ItemEntity.class, companion.getBoundingBox().inflate(24.0))) {
+            if (!observedFetchDrops.contains(drop)) {
+                observedFetchDrops.add(drop);
+            }
+        }
+        for (ItemEntity drop : level.getEntitiesOfClass(
+                ItemEntity.class, fakeOwner.getBoundingBox().inflate(6.0))) {
+            if (!observedFetchDrops.contains(drop)) {
+                observedFetchDrops.add(drop);
+            }
+            if (drop.getItem().is(Items.OAK_BOAT)) {
+                drop.playerTouch(fakeOwner);
+            }
+        }
+    }
+
+    private static String fetchDropInvariant() {
+        for (ItemEntity drop : observedFetchDrops) {
+            // GiveItemToPlayerTask hands boats to the fake owner through vanilla
+            // playerTouch, whose removed entity may retain its old stack object.
+            // The regression under test is CompanionEntity collecting ingredients.
+            if (drop.isRemoved() && !drop.getItem().isEmpty()
+                    && !drop.getItem().is(Items.OAK_BOAT)) {
+                return "removed item entity retained " + drop.getItem();
+            }
+            if (!drop.isRemoved() && drop.getItem().isEmpty()) {
+                return "live item entity had an empty stack";
+            }
+        }
+        return compositeActivityInvariant();
+    }
+
+    private static String describeObservedDrops() {
+        return observedFetchDrops.stream()
+                .map(drop -> "[removed=" + drop.isRemoved() + ",stack=" + drop.getItem() + "]")
+                .toList().toString();
+    }
+
+    private static String craftSearchWindowInvariant() {
+        double dx = companion.getX() - (spawn.getX() + 0.5);
+        double dz = companion.getZ() - (spawn.getZ() + 0.5);
+        if (dx * dx + dz * dz > 64.0) {
+            companion.teleportTo(spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5);
+        }
+        return compositeActivityInvariant();
+    }
+
+    private static void placeFixtureBlock(BlockPos position, Block block) {
+        ServerLevel level = (ServerLevel) companion.level();
+        level.setBlockAndUpdate(position, block.defaultBlockState());
+        level.setBlockAndUpdate(position.above(), Blocks.AIR.defaultBlockState());
+        worldMaterialPositions.add(position);
+    }
+
+    private static void clearWorldMaterials() {
+        if (companion == null || worldMaterialPositions.isEmpty()) {
+            return;
+        }
+        ServerLevel level = (ServerLevel) companion.level();
+        for (BlockPos position : worldMaterialPositions) {
+            level.setBlockAndUpdate(position, Blocks.AIR.defaultBlockState());
+        }
+        worldMaterialPositions.clear();
+    }
+
     private static void prepareInventory(ItemStack... stacks) {
         ServerLevel level = (ServerLevel) companion.level();
+        clearWorldMaterials();
         companion.teleportTo(spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5);
         companion.getLivingInventory().clearContent();
         companion.getHungerManager().setFoodLevel(20);
@@ -572,6 +738,7 @@ public final class DevAutoTest {
             return;
         }
         ServerLevel level = (ServerLevel) companion.level();
+        clearWorldMaterials();
         companion.getLivingInventory().clearContent();
         restoreEatingSettings();
         companion.getHungerManager().setFoodLevel(20);
@@ -614,6 +781,20 @@ public final class DevAutoTest {
     private static int inventoryCount(Item item) {
         int count = 0;
         Container inventory = companion.getLivingInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            if (inventory.getItem(slot).is(item)) {
+                count += inventory.getItem(slot).getCount();
+            }
+        }
+        return count;
+    }
+
+    private static int fakeOwnerInventoryCount(Item item) {
+        if (fakeOwner == null) {
+            return 0;
+        }
+        int count = 0;
+        Container inventory = fakeOwner.getInventory();
         for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
             if (inventory.getItem(slot).is(item)) {
                 count += inventory.getItem(slot).getCount();
@@ -695,7 +876,7 @@ public final class DevAutoTest {
 
     private static void fail(MinecraftServer server, String reason) {
         done = true;
-        MineMate.LOGGER.error("[autotest] AUTOTEST FAIL — {}", reason);
+        MineMate.LOGGER.error("[autotest] AUTOTEST FAIL - {}", reason);
         if (scenarioIndex < scenarios.size()) {
             scenarios.get(scenarioIndex).teardown().accept(server);
         }

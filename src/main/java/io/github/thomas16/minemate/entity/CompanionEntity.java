@@ -169,12 +169,17 @@ public class CompanionEntity extends LivingEntity
                 this.getBoundingBox().inflate(range.getX(), range.getY(), range.getZ()))) {
             if (!itemEntity.isRemoved() && !itemEntity.getItem().isEmpty() && !itemEntity.hasPickUpDelay()) {
                 ItemStack stack = itemEntity.getItem();
-                int count = stack.getCount();
+                int countBefore = stack.getCount();
                 if (this.inventory.insertStack(stack)) {
-                    this.take(itemEntity, count);
+                    int collected = countBefore - stack.getCount();
+                    if (collected <= 0) {
+                        continue;
+                    }
+                    this.take(itemEntity, collected);
                     if (stack.isEmpty()) {
                         itemEntity.discard();
-                        stack.setCount(count);
+                    } else {
+                        itemEntity.setItem(stack);
                     }
                 }
             }

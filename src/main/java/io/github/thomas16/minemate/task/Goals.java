@@ -3,11 +3,13 @@ package io.github.thomas16.minemate.task;
 import com.player2.playerengine.TaskCatalogue;
 import com.player2.playerengine.tasks.ResourceTask;
 import com.player2.playerengine.tasks.base.Task;
+import com.player2.playerengine.tasks.crafting.CraftMacroTasks;
 import com.player2.playerengine.tasks.entity.GiveItemToPlayerTask;
 import com.player2.playerengine.tasks.entity.KillEntityTask;
 import com.player2.playerengine.tasks.movement.FollowPlayerTask;
 import com.player2.playerengine.tasks.movement.GetToXZTask;
 import com.player2.playerengine.util.ItemTarget;
+import com.player2.playerengine.util.helpers.StorageHelper;
 
 import io.github.thomas16.minemate.entity.CompanionEntity;
 
@@ -148,9 +150,9 @@ public final class Goals {
             return new Goal(Goal.nextId(), kind, description,
                     GoalExecutionProfile.composite(
                             "May gather ingredients, craft tools, smelt, fight, and travel before delivery"),
-                    () -> new OwnerGiveItemTask(resource, count),
+                    () -> new OwnerGiveItemTask(resource, count, matches),
                     new FetchProbe(matches, resource, count),
-                    COLLECT_TIMEOUT_TICKS, COLLECT_STALL_TICKS);
+                    COLLECT_TIMEOUT_TICKS, 0);
         }
         return new Goal(Goal.nextId(), kind, description,
                 GoalExecutionProfile.composite(
@@ -165,9 +167,20 @@ public final class Goals {
     }
 
     private static ServerPlayer owner(GoalProbe.Context context) {
-        return context.companion().getOwnerUuid()
-                .map(uuid -> context.companion().getServer().getPlayerList().getPlayer(uuid))
-                .orElse(null);
+        return owner(context.companion());
+    }
+
+    private static ServerPlayer owner(CompanionEntity companion) {
+        UUID ownerUuid = companion.getOwnerUuid().orElse(null);
+        if (ownerUuid == null) {
+            return null;
+        }
+        ServerPlayer connected = companion.getServer().getPlayerList().getPlayer(ownerUuid);
+        if (connected != null) {
+            return connected;
+        }
+        Entity loaded = ((ServerLevel) companion.level()).getEntity(ownerUuid);
+        return loaded instanceof ServerPlayer serverPlayer ? serverPlayer : null;
     }
 
     private static int playerInventoryCount(ServerPlayer player, Item[] matches) {
@@ -277,44 +290,101 @@ public final class Goals {
     private static final class OwnerGiveItemTask extends Task {
         private final String resource;
         private final int count;
-        private GiveItemToPlayerTask delegate;
+        private final Item[] matches;
+        private ItemTarget target;
+        private Task acquisition;
+        private GiveItemToPlayerTask delivery;
+        private String ownerName;
+        private String acquisitionFailure;
+        private int ownerBaseline;
+        private boolean acquisitionComplete;
         private boolean done;
 
-        private OwnerGiveItemTask(String resource, int count) {
+        private OwnerGiveItemTask(String resource, int count, Item[] matches) {
             this.resource = resource;
             this.count = count;
+            this.matches = matches.clone();
         }
 
         @Override
         protected void onStart() {
             done = false;
+            acquisitionComplete = false;
+            acquisitionFailure = null;
+            acquisition = null;
+            delivery = null;
+            target = null;
+            ownerName = null;
             if (!(controller.getEntity() instanceof CompanionEntity companion)) {
                 fail(Reasons.OWNER_OFFLINE);
                 return;
             }
-            ServerPlayer owner = companion.getOwnerUuid()
-                    .map(uuid -> companion.getServer().getPlayerList().getPlayer(uuid))
-                    .orElse(null);
+            ServerPlayer owner = Goals.owner(companion);
             if (owner == null) {
                 fail(Reasons.OWNER_OFFLINE);
                 return;
             }
-            delegate = new GiveItemToPlayerTask(owner.getGameProfile().getName(),
-                    new ItemTarget(resource, count));
+            ownerName = owner.getGameProfile().getName();
+            ownerBaseline = playerInventoryCount(owner, matches);
+            target = new ItemTarget(resource, count);
+            acquisitionComplete = StorageHelper.itemTargetsMet(controller, target);
+            if (!acquisitionComplete) {
+                acquisition = createAcquisitionTask();
+            }
         }
 
         @Override
         protected Task onTick() {
-            if (delegate == null) {
+            if (target == null) {
                 return null;
             }
-            if (delegate.stopped() || delegate.isFinished()) {
+            if (!acquisitionComplete) {
+                if (StorageHelper.itemTargetsMet(controller, target)) {
+                    acquisitionComplete = true;
+                } else {
+                    if (acquisition == null) {
+                        acquisition = createAcquisitionTask();
+                    }
+                    if (acquisition.stopped() || acquisition.isFinished()) {
+                        acquisitionFailure = resourceFailureInTree().orElse(Reasons.RESOURCE_UNAVAILABLE);
+                        fail(acquisitionFailure);
+                        return null;
+                    }
+                    setDebugState("Acquiring " + resource + " for owner");
+                    return acquisition;
+                }
+            }
+            if (delivery == null) {
+                delivery = new GiveItemToPlayerTask(ownerName, target);
+            }
+            if (ownerReceivedItems()) {
                 done = true;
                 stop();
                 return null;
             }
-            setDebugState("Fetching " + resource + " for owner");
-            return delegate;
+            if (delivery.stopped() || delivery.isFinished()) {
+                setDebugState("Waiting for owner to pick up " + resource);
+                return null;
+            }
+            setDebugState("Delivering " + resource + " to owner");
+            return delivery;
+        }
+
+        private boolean ownerReceivedItems() {
+            if (!(controller.getEntity() instanceof CompanionEntity companion)) {
+                return false;
+            }
+            ServerPlayer owner = Goals.owner(companion);
+            return owner != null && playerInventoryCount(owner, matches) >= ownerBaseline + count;
+        }
+
+        private Task createAcquisitionTask() {
+            CraftMacroTasks.MacroProbe macro = CraftMacroTasks.macroOutcome(controller, target);
+            if (macro.outcome() == CraftMacroTasks.MacroOutcome.MACRO_CREATED
+                    && macro.taskOrNull() != null) {
+                return macro.taskOrNull();
+            }
+            return TaskCatalogue.getItemTask(resource, count);
         }
 
         @Override
@@ -338,6 +408,16 @@ public final class Goals {
         }
 
         private Optional<String> resourceFailure() {
+            if (acquisitionFailure != null) {
+                return Optional.of(acquisitionFailure);
+            }
+            if (!acquisitionComplete) {
+                return resourceFailureInTree();
+            }
+            return Optional.empty();
+        }
+
+        private Optional<String> resourceFailureInTree() {
             String[] reason = new String[1];
             thisOrChildSatisfies(task -> {
                 if (task instanceof ResourceTask resourceTask) {

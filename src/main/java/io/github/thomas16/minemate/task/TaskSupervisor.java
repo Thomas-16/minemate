@@ -218,7 +218,7 @@ public final class TaskSupervisor {
             return progress;
         }
         return new GoalProgress(progress.have(), progress.want(), progress.advance(),
-                progress.text() + " — paused: " + preemptingChain);
+                progress.text() + " - paused: " + preemptingChain);
     }
 
     /** Server-thread-only. */
@@ -474,7 +474,7 @@ public final class TaskSupervisor {
         if (value == null || value.length() <= maxLength) {
             return value == null ? "" : value;
         }
-        return value.substring(0, Math.max(0, maxLength - 1)) + "…";
+        return value.substring(0, Math.max(0, maxLength - 3)) + "...";
     }
 
     private void finishQueued(Goal finishedGoal, OutcomeStatus status, String reason) {

@@ -33,6 +33,11 @@ loom {
 	splitEnvironmentSourceSets()
 
 	runs {
+		client {
+			programArg "--username"
+			programArg "Player67"
+		}
+
 		server {
 			// Forward autotest selection from the Gradle invocation into the game JVM.
 			vmArg "-Dminemate.autotest=${System.getProperty('minemate.autotest', 'false')}"

@@ -12,6 +12,7 @@ import com.player2.playerengine.automaton.api.entity.LivingEntityInventory;
 import com.player2.playerengine.player2api.Character;
 
 import io.github.thomas16.minemate.MineMate;
+import io.github.thomas16.minemate.integration.CompanionDefensePolicy;
 import io.github.thomas16.minemate.task.Reasons;
 import io.github.thomas16.minemate.task.TaskSupervisor;
 
@@ -74,6 +75,7 @@ public class CompanionEntity extends LivingEntity
             this.controller = new PlayerEngineController(
                     IBaritone.KEY.get(this), DUMMY_CHARACTER, MineMate.MOD_ID);
             this.controller.setChatClefEnabled(false);
+            CompanionDefensePolicy.install(this.controller);
             this.supervisor = new TaskSupervisor(this);
         }
     }
@@ -118,6 +120,8 @@ public class CompanionEntity extends LivingEntity
         this.inventory.updateItems();
         ++this.attackStrengthTicker;
         if (!this.level().isClientSide && this.controller != null) {
+            // Before serverTick: the leash decides which chain TaskRunner may pick this tick.
+            CompanionDefensePolicy.tick(this, this.controller);
             this.controller.serverTick();
             this.supervisor.tick();
         }

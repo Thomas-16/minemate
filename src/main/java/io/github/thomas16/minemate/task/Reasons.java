@@ -14,6 +14,7 @@ public final class Reasons {
     public static final String ENGINE_FALSE_SUCCESS = "engine_false_success";
     public static final String UNKNOWN_RESOURCE = "unknown_resource";
     public static final String RESOURCE_UNAVAILABLE = "resource_unavailable";
+    public static final String PREEMPTED = "preempted";
     public static final String TARGET_GONE = "target_gone";
     public static final String OWNER_OFFLINE = "owner_offline";
 

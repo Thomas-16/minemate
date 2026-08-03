@@ -69,7 +69,10 @@ public final class CompanionCommands {
         if (current.isPresent()) {
             Optional<GoalProgress> progress = companion.getSupervisor().currentProgress();
             String suffix = progress.map(value -> " — " + value.text()).orElse(" — waiting to start");
-            source.sendSuccess(() -> Component.literal("Current: " + current.get().description() + suffix), false);
+            String paused = companion.getSupervisor().preemptingChain()
+                    .map(chain -> " — paused: " + chain).orElse("");
+            source.sendSuccess(
+                    () -> Component.literal("Current: " + current.get().description() + suffix + paused), false);
             return 1;
         }
         Optional<TaskOutcome> outcome = companion.getSupervisor().lastOutcome();

@@ -55,7 +55,7 @@ jobs:
       - name: run headless autotest
         run: |
           set -o pipefail
-          ./gradlew runServer -Dminemate.autotest=true --console=plain 2>&1 | tee autotest.log
+          ./gradlew -Dminemate.autotest=true -Dminemate.autotest.profile=full runServer --console=plain 2>&1 | tee autotest.log
       # The suite halts the server cleanly whether it passes or fails, so runServer
       # exits 0 either way. This log line is the only reliable signal.
       - name: assert suite passed

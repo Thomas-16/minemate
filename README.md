@@ -28,11 +28,14 @@ capability matrix and certification boundaries.
 
 ```text
 ./gradlew build
-./gradlew runServer -Dminemate.autotest=true
+./gradlew -Dminemate.autotest=true runServer --console=plain
+./gradlew -Dminemate.autotest=true -Dminemate.autotest.profile=full runServer --console=plain
 ```
 
-Use `-Dminemate.autotest.scenario=<name>` to run one headless scenario. CI performs both
-the build and complete server suite.
+The first server command runs the local smoke profile. The second runs all scenarios,
+including the slower iron-sword world-acquisition case; CI explicitly uses this full
+profile. Use `-Dminemate.autotest.scenario=<name>` to run one or more comma-separated
+headless scenarios regardless of profile.
 
 ## License
 

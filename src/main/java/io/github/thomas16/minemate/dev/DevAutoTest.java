@@ -44,7 +44,9 @@ import net.minecraft.world.level.levelgen.Heightmap;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -57,6 +59,16 @@ import java.util.function.Supplier;
  */
 public final class DevAutoTest {
     private static final int GLOBAL_CAP_TICKS = 30_000;
+    private static final Set<String> SMOKE_SCENARIOS = Set.of(
+            "terminal_resample",
+            "mine_success",
+            "goto_success",
+            "cancel",
+            "craft_success",
+            "fetch_oak_boat_delivery",
+            "smelt_success",
+            "deposit_success",
+            "container_missing");
     private static final UUID FAKE_OWNER_UUID =
             UUID.fromString("bbf6e9b1-075b-4d78-928d-a73cc6c6155f");
 
@@ -348,12 +360,36 @@ public final class DevAutoTest {
                         () -> null));
         String selectedScenario = System.getProperty("minemate.autotest.scenario", "").trim();
         if (!selectedScenario.isEmpty()) {
-            List<String> selectedNames = List.of(selectedScenario.split(","));
+            List<String> selectedNames = List.of(selectedScenario.split(",")).stream()
+                    .map(String::trim)
+                    .filter(name -> !name.isEmpty())
+                    .toList();
+            List<String> availableNames = scenarios.stream().map(Scenario::name).toList();
+            List<String> unknownNames = selectedNames.stream()
+                    .filter(name -> !availableNames.contains(name))
+                    .toList();
+            if (!unknownNames.isEmpty()) {
+                fail(server, "unknown selected scenario(s): " + String.join(",", unknownNames));
+                return;
+            }
             scenarios = scenarios.stream().filter(scenario -> selectedNames.contains(scenario.name())).toList();
             if (scenarios.isEmpty()) {
                 fail(server, "unknown selected scenario: " + selectedScenario);
                 return;
             }
+            MineMate.LOGGER.info("[autotest] profile=focused scenarios={}", scenarios.size());
+        } else {
+            String profile = System.getProperty("minemate.autotest.profile", "smoke")
+                    .trim().toLowerCase(Locale.ROOT);
+            if ("smoke".equals(profile)) {
+                scenarios = scenarios.stream()
+                        .filter(scenario -> SMOKE_SCENARIOS.contains(scenario.name()))
+                        .toList();
+            } else if (!"full".equals(profile)) {
+                fail(server, "unknown autotest profile: " + profile);
+                return;
+            }
+            MineMate.LOGGER.info("[autotest] profile={} scenarios={}", profile, scenarios.size());
         }
         scenarioIndex = 0;
         startScenario(server);

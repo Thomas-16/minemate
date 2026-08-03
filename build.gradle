@@ -34,9 +34,9 @@ loom {
 
 	runs {
 		server {
-			// Forward the autotest flag from the Gradle invocation into the game JVM:
-			// gradlew runServer -Dminemate.autotest=true
+			// Forward autotest selection from the Gradle invocation into the game JVM.
 			vmArg "-Dminemate.autotest=${System.getProperty('minemate.autotest', 'false')}"
+			vmArg "-Dminemate.autotest.profile=${System.getProperty('minemate.autotest.profile', 'smoke')}"
 			vmArg "-Dminemate.autotest.scenario=${System.getProperty('minemate.autotest.scenario', '')}"
 		}
 	}

@@ -48,6 +48,14 @@ public final class CompanionDefensePolicy {
 
     /** Server-thread-only. Re-decides whether mob defense may own the body this tick. */
     public static void tick(CompanionEntity companion, PlayerEngineController controller) {
+        // A headless server has no ServerPlayer owner. This narrowly scoped test switch lets
+        // DevAutoTest exercise the real MobDefenseChain transition without weakening the
+        // production owner leash or persisting a PlayerEngine setting.
+        if (Boolean.getBoolean("minemate.autotest")
+                && Boolean.getBoolean("minemate.autotest.unleashMobDefense")) {
+            controller.setShouldDefendFromHostiles(false);
+            return;
+        }
         boolean suppressed = controller.getShouldDefendFromHostiles();
         ServerPlayer owner = owner(companion);
         double distance = owner == null || owner.level() != companion.level()

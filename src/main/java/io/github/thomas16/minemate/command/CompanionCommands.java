@@ -9,8 +9,11 @@ import io.github.thomas16.minemate.task.Goal;
 import io.github.thomas16.minemate.task.GoalProgress;
 import io.github.thomas16.minemate.task.Reasons;
 import io.github.thomas16.minemate.task.TaskOutcome;
+import io.github.thomas16.minemate.task.TaskActivitySnapshot;
+import io.github.thomas16.minemate.integration.ReflexSnapshot;
 
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -26,13 +29,14 @@ public final class CompanionCommands {
     private CompanionCommands() {
     }
 
-    public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
+    public static void register(CommandDispatcher<CommandSourceStack> dispatcher,
+            CommandBuildContext registryAccess) {
         LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("companion");
         root.then(Commands.literal("spawn").executes(ctx -> spawn(ctx.getSource())));
         root.then(Commands.literal("dismiss").executes(ctx -> dismiss(ctx.getSource())));
         root.then(Commands.literal("stop").executes(ctx -> stop(ctx.getSource())));
         root.then(Commands.literal("status").executes(ctx -> status(ctx.getSource())));
-        CompanionTaskCommands.attach(root);
+        CompanionTaskCommands.attach(root, registryAccess);
         dispatcher.register(root);
     }
 
@@ -69,16 +73,42 @@ public final class CompanionCommands {
         if (current.isPresent()) {
             Optional<GoalProgress> progress = companion.getSupervisor().currentProgress();
             String suffix = progress.map(value -> " — " + value.text()).orElse(" — waiting to start");
-            String paused = companion.getSupervisor().preemptingChain()
-                    .map(chain -> " — paused: " + chain).orElse("");
+            Optional<TaskActivitySnapshot> activity = companion.getSupervisor().currentActivity();
+            String scope = " — " + current.get().executionProfile().scope().name().toLowerCase();
+            String phase = activity.map(TaskActivitySnapshot::phase)
+                    .filter(value -> !value.isBlank() && progress.map(p -> !value.equals(p.text())).orElse(true))
+                    .map(value -> " — " + value).orElse("");
+            String paused = activity.filter(TaskActivitySnapshot::preempted)
+                    .map(value -> " — paused: " + value.preemptingChain()).orElse("");
+            String budget = activity.map(value -> " — ticks " + value.elapsedTicks() + "/"
+                    + (value.timeoutTicks() == 0 ? "unbounded" : value.timeoutTicks())).orElse("");
+            String taskTree = activity.map(TaskActivitySnapshot::taskTree)
+                    .filter(value -> !value.isBlank())
+                    .map(value -> " — task: " + bounded(value, 180)).orElse("");
+            String reflex = reflexSuffix(companion.getReflexSnapshot());
             source.sendSuccess(
-                    () -> Component.literal("Current: " + current.get().description() + suffix + paused), false);
+                    () -> Component.literal("Current: " + current.get().description()
+                            + scope + suffix + budget + phase + taskTree + paused + reflex), false);
             return 1;
         }
         Optional<TaskOutcome> outcome = companion.getSupervisor().lastOutcome();
-        String text = outcome.map(value -> "Idle — last: " + value.detail()).orElse("Idle");
+        String text = outcome.map(value -> "Idle — last: " + value.detail()).orElse("Idle")
+                + reflexSuffix(companion.getReflexSnapshot());
         source.sendSuccess(() -> Component.literal(text), false);
         return 1;
+    }
+
+    private static String reflexSuffix(ReflexSnapshot reflex) {
+        if (reflex == null || !reflex.active()) {
+            return reflex != null && reflex.defenseSuppressed() ? " — mob defense leashed" : "";
+        }
+        String detail = reflex.detail().isBlank() ? "" : ": " + reflex.detail();
+        return " — reflex " + reflex.kind().name().toLowerCase() + detail;
+    }
+
+    private static String bounded(String value, int maximum) {
+        String oneLine = value.replace('\n', ' ').replace('\r', ' ');
+        return oneLine.length() <= maximum ? oneLine : oneLine.substring(0, maximum - 1) + "…";
     }
 
     private static int spawn(CommandSourceStack source) {

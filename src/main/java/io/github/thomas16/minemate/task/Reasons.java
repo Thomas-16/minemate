@@ -17,6 +17,23 @@ public final class Reasons {
     public static final String PREEMPTED = "preempted";
     public static final String TARGET_GONE = "target_gone";
     public static final String OWNER_OFFLINE = "owner_offline";
+    public static final String NO_CRAFTING_RECIPE = "no_crafting_recipe";
+    public static final String MATERIALS_UNAVAILABLE = "materials_unavailable";
+    public static final String NO_SMELTING_RECIPE = "no_smelting_recipe";
+    public static final String NO_FUEL = "no_fuel";
+    public static final String PARTIAL_OUT_OF_FUEL = "partial_out_of_fuel";
+    public static final String FURNACE_TAMPERED = "furnace_tampered";
+    public static final String FURNACE_GONE = "furnace_gone";
+    public static final String FURNACE_IN_USE = "furnace_in_use";
+    public static final String SMELT_STALLED = "smelt_stalled";
+    public static final String SETUP_FAILED = "setup_failed";
+    public static final String INSUFFICIENT_ITEMS = "insufficient_items";
+    public static final String INSUFFICIENT_SPACE = "insufficient_space";
+    public static final String CONTAINER_MISSING = "container_missing";
+    public static final String CONTAINER_TOO_FAR = "container_too_far";
+    public static final String CONTAINER_UNREACHABLE = "container_unreachable";
+    public static final String CONTAINER_UNSUPPORTED = "container_unsupported";
+    public static final String CONTAINER_CHANGED = "container_changed";
 
     private Reasons() {
     }

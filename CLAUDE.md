@@ -8,6 +8,7 @@
 - `command` — temporary hardcoded task input; the planner replaces it in stage 4.
 - `integration` — isolated PlayerEngine configuration and compatibility quirks.
 - `dev` — sequential headless integration test; run with `gradlew runServer -Dminemate.autotest=true`. The task provisions `run/` and regenerates the world each time, so runs cannot contaminate each other. It halts the server cleanly whether or not scenarios pass, so CI asserts on the `AUTOTEST PASS` log line rather than the exit code.
+  Pass `-Dminemate.autotest.scenario=<name>` as well to run one scenario while debugging.
 
 Build with `gradlew build`; launch a client with `gradlew runClient`. The project is pinned to Minecraft 1.21.1, Java 21, and Mojang mappings.
 

@@ -13,6 +13,7 @@ import io.github.thomas16.minemate.entity.CompanionEntity;
 
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.item.Item;
@@ -37,6 +38,24 @@ public final class Goals {
         return collect("fetch", resource, count);
     }
 
+    public static Goal craft(CompanionEntity companion, Item output, int desiredTotal) {
+        return CertifiedGoals.craft(companion, output, desiredTotal);
+    }
+
+    public static Goal smelt(CompanionEntity companion, Item input, int desiredOutputTotal) {
+        return CertifiedGoals.smelt(companion, input, desiredOutputTotal);
+    }
+
+    public static Goal deposit(CompanionEntity companion, BlockPos containerPos, Item item,
+            int desiredContainerTotal) {
+        return CertifiedGoals.deposit(companion, containerPos, item, desiredContainerTotal);
+    }
+
+    public static Goal withdraw(CompanionEntity companion, BlockPos containerPos, Item item,
+            int desiredInventoryTotal) {
+        return CertifiedGoals.withdraw(companion, containerPos, item, desiredInventoryTotal);
+    }
+
     public static Goal goTo(int x, int z, double arriveRadius) {
         if (arriveRadius <= 0.0) {
             throw new IllegalArgumentException("Arrival radius must be positive");
@@ -49,7 +68,9 @@ public final class Goals {
             return GoalProgress.approach(distance, arriveRadius,
                     "%.1f blocks from %d, %d".formatted(distance, x, z));
         };
-        return new Goal(Goal.nextId(), "goto", description, () -> new GetToXZTask(x, z),
+        return new Goal(Goal.nextId(), "goto", description,
+                GoalExecutionProfile.direct("May break or place route-support blocks while pathfinding"),
+                () -> new GetToXZTask(x, z),
                 probe, 2400, 400);
     }
 
@@ -76,7 +97,8 @@ public final class Goals {
                 return new GoalProgress(0, 1, advance, text);
             }
         };
-        return new Goal(Goal.nextId(), "kill", description, () -> {
+        return new Goal(Goal.nextId(), "kill", description,
+                GoalExecutionProfile.direct("Pursues and attacks the selected entity"), () -> {
             Entity target = level.getEntity(targetUuid);
             if (target == null || target.isRemoved() || !target.isAlive()) {
                 throw new IllegalStateException(Reasons.TARGET_GONE);
@@ -109,6 +131,7 @@ public final class Goals {
             }
         };
         return new Goal(Goal.nextId(), "follow", "follow " + playerName,
+                GoalExecutionProfile.continuous("Continuously pathfinds toward the selected player"),
                 () -> new FollowPlayerTask(playerName, distance), probe, 0, 0);
     }
 
@@ -123,11 +146,15 @@ public final class Goals {
         String description = kind + " " + count + " " + resource;
         if ("fetch".equals(kind)) {
             return new Goal(Goal.nextId(), kind, description,
+                    GoalExecutionProfile.composite(
+                            "May gather ingredients, craft tools, smelt, fight, and travel before delivery"),
                     () -> new OwnerGiveItemTask(resource, count),
                     new FetchProbe(matches, resource, count),
                     COLLECT_TIMEOUT_TICKS, COLLECT_STALL_TICKS);
         }
         return new Goal(Goal.nextId(), kind, description,
+                GoalExecutionProfile.composite(
+                        "May gather ingredients, craft tools, smelt, fight, and travel to obtain the item"),
                 () -> TaskCatalogue.getItemTask(resource, count),
                 new CollectProbe(matches, resource, count),
                 COLLECT_TIMEOUT_TICKS, COLLECT_STALL_TICKS);

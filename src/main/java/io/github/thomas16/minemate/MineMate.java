@@ -32,7 +32,7 @@ public class MineMate implements ModInitializer {
 
 		MineMateEntities.register();
 		CommandRegistrationCallback.EVENT.register(
-				(dispatcher, registryAccess, environment) -> CompanionCommands.register(dispatcher));
+				(dispatcher, registryAccess, environment) -> CompanionCommands.register(dispatcher, registryAccess));
 		TaskListeners.register(new LoggingTaskListener());
 		TaskListeners.register(new ChatTaskListener());
 		DevAutoTest.init();

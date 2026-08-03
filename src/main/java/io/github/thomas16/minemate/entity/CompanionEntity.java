@@ -13,6 +13,8 @@ import com.player2.playerengine.player2api.Character;
 
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.integration.CompanionDefensePolicy;
+import io.github.thomas16.minemate.integration.CompanionReflexTelemetry;
+import io.github.thomas16.minemate.integration.ReflexSnapshot;
 import io.github.thomas16.minemate.task.Reasons;
 import io.github.thomas16.minemate.task.TaskSupervisor;
 
@@ -61,6 +63,7 @@ public class CompanionEntity extends LivingEntity
     private LivingEntityHungerManager hungerManager;
     private PlayerEngineController controller;
     private TaskSupervisor supervisor;
+    private CompanionReflexTelemetry reflexTelemetry;
 
     private UUID ownerUuid;
     private Vec3 lastVelocity = Vec3.ZERO;
@@ -77,6 +80,7 @@ public class CompanionEntity extends LivingEntity
             this.controller.setChatClefEnabled(false);
             CompanionDefensePolicy.install(this.controller);
             this.supervisor = new TaskSupervisor(this);
+            this.reflexTelemetry = new CompanionReflexTelemetry(this, this.controller);
         }
     }
 
@@ -88,6 +92,11 @@ public class CompanionEntity extends LivingEntity
     /** Server-side only; null on the client. */
     public TaskSupervisor getSupervisor() {
         return supervisor;
+    }
+
+    /** Latest server-side automatic-chain telemetry; null only on the client. */
+    public ReflexSnapshot getReflexSnapshot() {
+        return reflexTelemetry == null ? null : reflexTelemetry.snapshot();
     }
 
     public Optional<UUID> getOwnerUuid() {
@@ -123,6 +132,7 @@ public class CompanionEntity extends LivingEntity
             // Before serverTick: the leash decides which chain TaskRunner may pick this tick.
             CompanionDefensePolicy.tick(this, this.controller);
             this.controller.serverTick();
+            this.reflexTelemetry.tick();
             this.supervisor.tick();
         }
         super.tick();

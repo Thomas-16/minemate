@@ -34,7 +34,7 @@
 		"minecraft": "~1.21.1",
 		"java": ">=21",
 		"fabric-api": "*",
-		"playerengine": ">=1.21.1-1.4.0",
+		"playerengine": "=1.21.1-1.4.0",
 		"architectury": ">=13.0.8"
 	}
 }

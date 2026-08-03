@@ -11,15 +11,20 @@ import io.github.thomas16.minemate.task.Goal;
 import io.github.thomas16.minemate.task.Goals;
 
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.commands.arguments.coordinates.ColumnPosArgument;
+import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
+import net.minecraft.commands.arguments.item.ItemArgument;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ColumnPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.item.Item;
 
 import java.util.Collection;
 import java.util.List;
@@ -32,19 +37,54 @@ final class CompanionTaskCommands {
     private CompanionTaskCommands() {
     }
 
-    static void attach(LiteralArgumentBuilder<CommandSourceStack> root) {
+    static void attach(LiteralArgumentBuilder<CommandSourceStack> root, CommandBuildContext registryAccess) {
         root.then(Commands.literal("follow")
                 .executes(ctx -> follow(ctx.getSource(), null))
                 .then(Commands.argument("player", EntityArgument.player())
                         .executes(ctx -> follow(ctx.getSource(), EntityArgument.getPlayer(ctx, "player")))));
         root.then(resourceCommand("mine"));
         root.then(resourceCommand("fetch"));
+        root.then(itemCommand("craft", registryAccess));
+        root.then(itemCommand("smelt", registryAccess));
+        root.then(storageCommand("deposit", registryAccess));
+        root.then(storageCommand("withdraw", registryAccess));
         root.then(Commands.literal("goto")
                 .then(Commands.argument("pos", ColumnPosArgument.columnPos())
                         .executes(ctx -> goTo(ctx.getSource(), ColumnPosArgument.getColumnPos(ctx, "pos")))));
         root.then(Commands.literal("kill")
                 .then(Commands.argument("target", EntityArgument.entity())
                         .executes(ctx -> kill(ctx.getSource(), EntityArgument.getEntity(ctx, "target")))));
+    }
+
+    private static LiteralArgumentBuilder<CommandSourceStack> itemCommand(String kind,
+            CommandBuildContext registryAccess) {
+        RequiredArgumentBuilder<CommandSourceStack, ?> item = Commands.argument("item",
+                ItemArgument.item(registryAccess))
+                .executes(ctx -> production(ctx.getSource(), kind,
+                        ItemArgument.getItem(ctx, "item").getItem(), 1));
+        item.then(Commands.argument("count", IntegerArgumentType.integer(1, 2304))
+                .executes(ctx -> production(ctx.getSource(), kind,
+                        ItemArgument.getItem(ctx, "item").getItem(),
+                        IntegerArgumentType.getInteger(ctx, "count"))));
+        return Commands.literal(kind).then(item);
+    }
+
+    private static LiteralArgumentBuilder<CommandSourceStack> storageCommand(String kind,
+            CommandBuildContext registryAccess) {
+        RequiredArgumentBuilder<CommandSourceStack, ?> container = Commands.argument("container",
+                BlockPosArgument.blockPos());
+        RequiredArgumentBuilder<CommandSourceStack, ?> item = Commands.argument("item",
+                ItemArgument.item(registryAccess))
+                .executes(ctx -> storage(ctx.getSource(), kind,
+                        BlockPosArgument.getLoadedBlockPos(ctx, "container"),
+                        ItemArgument.getItem(ctx, "item").getItem(), 1));
+        item.then(Commands.argument("count", IntegerArgumentType.integer(1, 2304))
+                .executes(ctx -> storage(ctx.getSource(), kind,
+                        BlockPosArgument.getLoadedBlockPos(ctx, "container"),
+                        ItemArgument.getItem(ctx, "item").getItem(),
+                        IntegerArgumentType.getInteger(ctx, "count"))));
+        container.then(item);
+        return Commands.literal(kind).then(container);
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> resourceCommand(String kind) {
@@ -72,6 +112,18 @@ final class CompanionTaskCommands {
     private static int collect(CommandSourceStack source, String kind, String resource, int count) {
         return executeGoal(source, companion -> "mine".equals(kind)
                 ? Goals.mine(resource, count) : Goals.fetch(resource, count));
+    }
+
+    private static int production(CommandSourceStack source, String kind, Item item, int count) {
+        return executeGoal(source, companion -> "craft".equals(kind)
+                ? Goals.craft(companion, item, count) : Goals.smelt(companion, item, count));
+    }
+
+    private static int storage(CommandSourceStack source, String kind, BlockPos container,
+            Item item, int count) {
+        return executeGoal(source, companion -> "deposit".equals(kind)
+                ? Goals.deposit(companion, container, item, count)
+                : Goals.withdraw(companion, container, item, count));
     }
 
     private static int goTo(CommandSourceStack source, ColumnPos position) {

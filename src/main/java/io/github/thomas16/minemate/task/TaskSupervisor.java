@@ -6,6 +6,7 @@ import com.player2.playerengine.executor.StepExecution;
 import com.player2.playerengine.executor.StepState;
 import com.player2.playerengine.tasks.base.Task;
 import com.player2.playerengine.tasks.base.TaskChain;
+import com.player2.playerengine.tasks.crafting.DescribesProgress;
 
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.entity.CompanionEntity;
@@ -46,6 +47,7 @@ public final class TaskSupervisor {
     private int ticksSinceAdvance;
     private GoalProgress lastProgress;
     private TaskOutcome lastOutcome;
+    private TaskActivitySnapshot currentActivity;
     private boolean engineFinishHint;
     private String preemptingChain;
     private int preemptedTicks;
@@ -100,62 +102,87 @@ public final class TaskSupervisor {
     /** Server-thread-only. Samples and advances the active goal once per entity tick. */
     public void tick() {
         assertServerThread();
-        if (!companion.isAlive() || companion.isRemoved()) {
-            if (goal != null) {
-                finish(OutcomeStatus.FAILED, Reasons.COMPANION_DIED);
-            } else if (pending != null) {
-                finishPending(OutcomeStatus.FAILED, Reasons.COMPANION_DIED);
-            }
-            return;
-        }
-        if (pending != null) {
-            startPending();
-        }
-        if (goal == null) {
-            return;
-        }
-
-        ticks++;
-        updateChainOwnership();
-        if (preemptedTicks >= PREEMPT_LIMIT_TICKS) {
-            finish(OutcomeStatus.BLOCKED, Reasons.PREEMPTED);
-            return;
-        }
-        if (ticks % SAMPLE_INTERVAL_TICKS == 0 && !sampleProgress()) {
-            return;
-        }
-        if (lastProgress != null && lastProgress.complete()) {
-            finish(OutcomeStatus.SUCCEEDED, Reasons.GOAL_MET);
-            return;
-        }
-
-        GoalProbe.Context context = context();
-        String blocked;
         try {
-            blocked = goal.probe().blockedReason(context);
-        } catch (Throwable error) {
-            MineMate.LOGGER.error("Goal probe failed while checking {}", goal.id(), error);
-            finish(OutcomeStatus.FAILED, Reasons.ENGINE_FAILED);
-            return;
-        }
-        if (blocked != null) {
-            finish(OutcomeStatus.BLOCKED, blocked);
-            return;
-        }
-        if ((execution != null && execution.isTerminal()) || engineFinishHint) {
-            finishFromEngine();
-            return;
-        }
-        if (goal.timeoutTicks() > 0 && ticks >= goal.timeoutTicks()) {
-            finish(OutcomeStatus.TIMED_OUT, Reasons.TIMEOUT);
-            return;
-        }
-        if (goal.stallTicks() > 0 && ticksSinceAdvance >= goal.stallTicks()) {
-            finish(OutcomeStatus.TIMED_OUT, Reasons.NO_PROGRESS);
-            return;
-        }
-        if (ticks % PROGRESS_INTERVAL_TICKS == 0 && lastProgress != null) {
-            TaskListeners.fireProgress(companion, goal, annotate(lastProgress));
+            if (!companion.isAlive() || companion.isRemoved()) {
+                if (goal != null) {
+                    finish(OutcomeStatus.FAILED, Reasons.COMPANION_DIED);
+                } else if (pending != null) {
+                    finishPending(OutcomeStatus.FAILED, Reasons.COMPANION_DIED);
+                }
+                return;
+            }
+            if (pending != null) {
+                startPending();
+            }
+            if (goal == null) {
+                return;
+            }
+
+            ticks++;
+            updateChainOwnership();
+            if (preemptedTicks >= PREEMPT_LIMIT_TICKS) {
+                finish(OutcomeStatus.BLOCKED, Reasons.PREEMPTED);
+                return;
+            }
+            if (ticks % SAMPLE_INTERVAL_TICKS == 0 && !sampleProgress()) {
+                return;
+            }
+            if (lastProgress != null && lastProgress.complete()) {
+                finish(OutcomeStatus.SUCCEEDED, Reasons.GOAL_MET);
+                return;
+            }
+
+            GoalProbe.Context context = context();
+            TaskTerminalResult terminal;
+            try {
+                terminal = goal.probe().terminalResult(context);
+            } catch (Throwable error) {
+                MineMate.LOGGER.error("Goal probe failed while mapping terminal result for {}", goal.id(), error);
+                finish(OutcomeStatus.FAILED, Reasons.ENGINE_FAILED);
+                return;
+            }
+            if (terminal != null) {
+                // Structured PlayerEngine outcomes can arrive between the five-tick samples.
+                // Refresh MineMate's independent verifier so partial work is never reported as 0/N.
+                if (!sampleProgress() || goal == null) {
+                    return;
+                }
+                if (lastProgress != null && lastProgress.complete()) {
+                    finish(OutcomeStatus.SUCCEEDED, Reasons.GOAL_MET);
+                    return;
+                }
+                finish(terminal.status(), terminal.reason(), terminal.moved());
+                return;
+            }
+            String blocked;
+            try {
+                blocked = goal.probe().blockedReason(context);
+            } catch (Throwable error) {
+                MineMate.LOGGER.error("Goal probe failed while checking {}", goal.id(), error);
+                finish(OutcomeStatus.FAILED, Reasons.ENGINE_FAILED);
+                return;
+            }
+            if (blocked != null) {
+                finish(OutcomeStatus.BLOCKED, blocked);
+                return;
+            }
+            if ((execution != null && execution.isTerminal()) || engineFinishHint) {
+                finishFromEngine();
+                return;
+            }
+            if (goal.timeoutTicks() > 0 && ticks >= goal.timeoutTicks()) {
+                finish(OutcomeStatus.TIMED_OUT, Reasons.TIMEOUT);
+                return;
+            }
+            if (goal.stallTicks() > 0 && ticksSinceAdvance >= goal.stallTicks()) {
+                finish(OutcomeStatus.TIMED_OUT, Reasons.NO_PROGRESS);
+                return;
+            }
+            if (ticks % PROGRESS_INTERVAL_TICKS == 0 && lastProgress != null) {
+                TaskListeners.fireProgress(companion, goal, annotate(lastProgress));
+            }
+        } finally {
+            refreshActivity();
         }
     }
 
@@ -224,6 +251,12 @@ public final class TaskSupervisor {
         return Optional.ofNullable(lastOutcome);
     }
 
+    /** Server-thread-only canonical activity telemetry for snapshots, status, and tests. */
+    public Optional<TaskActivitySnapshot> currentActivity() {
+        assertServerThread();
+        return Optional.ofNullable(currentActivity);
+    }
+
     /** Server-thread-only. Stops tracked work before the entity/controller is removed. */
     public void shutdown(String reason) {
         assertServerThread();
@@ -270,6 +303,12 @@ public final class TaskSupervisor {
                 }
             }
         } catch (Throwable error) {
+            if (error instanceof GoalStartException controlled) {
+                MineMate.LOGGER.info("Goal {} could not start: {}", goal.id(), controlled.result().reason());
+                sampleControlledStartFailure();
+                finish(controlled.result().status(), controlled.result().reason(), controlled.result().moved());
+                return;
+            }
             String reason = Reasons.TARGET_GONE.equals(error.getMessage())
                     || Reasons.OWNER_OFFLINE.equals(error.getMessage())
                     ? error.getMessage() : Reasons.ENGINE_BLOCKED;
@@ -300,6 +339,16 @@ public final class TaskSupervisor {
 
     private GoalProbe.Context context() {
         return new GoalProbe.Context(companion, controller, runningTask, ticks);
+    }
+
+    private void sampleControlledStartFailure() {
+        try {
+            lastProgress = Objects.requireNonNull(goal.probe().sample(context()),
+                    "goal probe returned null");
+        } catch (Throwable ignored) {
+            // A controlled start failure still owns its typed outcome. Some legacy probes
+            // require a running task and therefore cannot add counts at this point.
+        }
     }
 
     private void finishFromEngine() {
@@ -335,6 +384,10 @@ public final class TaskSupervisor {
     }
 
     private void finish(OutcomeStatus status, String reason) {
+        finish(status, reason, -1);
+    }
+
+    private void finish(OutcomeStatus status, String reason, int moved) {
         Goal finishedGoal = goal;
         StepExecution finishedExecution = execution;
         String stepId = activeStepId;
@@ -349,6 +402,7 @@ public final class TaskSupervisor {
         lastProgress = null;
         preemptingChain = null;
         preemptedTicks = 0;
+        currentActivity = null;
 
         if (finishedGoal == null) {
             return;
@@ -366,7 +420,8 @@ public final class TaskSupervisor {
         String engineLog = finishedExecution == null || finishedExecution.getLastLogEntry() == null
                 ? "" : finishedExecution.getLastLogEntry();
         lastOutcome = new TaskOutcome(finishedGoal.id(), finishedGoal.kind(), status, reason,
-                detail(finishedGoal, status, reason), have, want, elapsed, engineState, engineLog);
+                detail(finishedGoal, status, reason), moved, have, want,
+                elapsed, engineState, engineLog);
         TaskListeners.fireFinished(companion, finishedGoal, lastOutcome);
     }
 
@@ -376,12 +431,58 @@ public final class TaskSupervisor {
         finishQueued(finishedGoal, status, reason);
     }
 
+    private void refreshActivity() {
+        if (goal == null || runningTask == null) {
+            currentActivity = null;
+            return;
+        }
+        String phase = describedProgress(runningTask);
+        if (phase.isEmpty() && lastProgress != null) {
+            phase = lastProgress.text();
+        }
+        String tree;
+        try {
+            tree = bounded(runningTask.getTaskTree(), 1200);
+        } catch (Throwable error) {
+            tree = "";
+        }
+        currentActivity = new TaskActivitySnapshot(goal.id(), goal.kind(), goal.executionProfile(),
+                ticks, goal.timeoutTicks(), phase, tree, lastProgress,
+                preemptingChain == null ? "" : preemptingChain);
+    }
+
+    private static String describedProgress(Task root) {
+        String[] result = new String[1];
+        try {
+            root.thisOrChildSatisfies(task -> {
+                if (task instanceof DescribesProgress described) {
+                    String text = described.describeProgress();
+                    if (text != null && !text.isBlank()) {
+                        result[0] = text;
+                        return true;
+                    }
+                }
+                return false;
+            });
+        } catch (Throwable ignored) {
+            return "";
+        }
+        return result[0] == null ? "" : bounded(result[0], 300);
+    }
+
+    private static String bounded(String value, int maxLength) {
+        if (value == null || value.length() <= maxLength) {
+            return value == null ? "" : value;
+        }
+        return value.substring(0, Math.max(0, maxLength - 1)) + "…";
+    }
+
     private void finishQueued(Goal finishedGoal, OutcomeStatus status, String reason) {
         if (finishedGoal == null) {
             return;
         }
         lastOutcome = new TaskOutcome(finishedGoal.id(), finishedGoal.kind(), status, reason,
-                detail(finishedGoal, status, reason), 0, 0, 0L, "NONE", "");
+                detail(finishedGoal, status, reason), -1, 0, 0, 0L, "NONE", "");
         TaskListeners.fireFinished(companion, finishedGoal, lastOutcome);
     }
 
@@ -405,6 +506,20 @@ public final class TaskSupervisor {
             case Reasons.RESOURCE_UNAVAILABLE -> "Resource unavailable for: " + goal.description();
             case Reasons.TARGET_GONE -> "Target is gone for: " + goal.description();
             case Reasons.OWNER_OFFLINE -> "Player is offline for: " + goal.description();
+            case Reasons.NO_CRAFTING_RECIPE -> "No crafting recipe for: " + goal.description();
+            case Reasons.MATERIALS_UNAVAILABLE -> "Required crafting materials are unavailable for: "
+                    + goal.description();
+            case Reasons.NO_SMELTING_RECIPE -> "No standard furnace recipe for: " + goal.description();
+            case Reasons.NO_FUEL, Reasons.PARTIAL_OUT_OF_FUEL -> "Furnace fuel is insufficient for: "
+                    + goal.description();
+            case Reasons.FURNACE_TAMPERED, Reasons.FURNACE_GONE, Reasons.FURNACE_IN_USE,
+                    Reasons.SMELT_STALLED, Reasons.SETUP_FAILED -> "Furnace work could not continue ("
+                            + reason + "): " + goal.description();
+            case Reasons.INSUFFICIENT_ITEMS, Reasons.INSUFFICIENT_SPACE,
+                    Reasons.CONTAINER_MISSING, Reasons.CONTAINER_TOO_FAR,
+                    Reasons.CONTAINER_UNREACHABLE, Reasons.CONTAINER_UNSUPPORTED,
+                    Reasons.CONTAINER_CHANGED -> "Storage transfer could not finish (" + reason + "): "
+                            + goal.description();
             case Reasons.ENGINE_FALSE_SUCCESS -> "Task ended before its goal was met: " + goal.description();
             case Reasons.ENGINE_BLOCKED -> "Task engine was blocked on: " + goal.description();
             default -> status + ": " + goal.description();

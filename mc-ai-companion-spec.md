@@ -2,6 +2,15 @@
 
 Target: singleplayer, all inference hosted, **single-jar distribution, no sidecar**.
 
+## Product goal
+
+Build a genuinely intelligent Minecraft companion with strong world awareness, multi-step
+planning, reliable task execution and recovery, useful memory, player understanding, and
+initiative. It should feel like a capable teammate, not a natural-language command parser.
+
+The LLM decides intent and plans with high-level tools; deterministic game code executes and
+verifies every step. Better context, skills, outcomes, and evaluation matter as much as the model.
+
 Notes:
 
 1. Treat these are only recommendations and not of must-dos.
@@ -50,17 +59,37 @@ the same voice.
 
 - **Fast (20Hz, server tick, pure Java):** follow distance, threat response, eating, tool
   selection, hazard avoidance. No inference. This is what makes it feel alive.
-- **Slow (seconds, LLM):** receives a compact world snapshot (<300 tokens), emits a _goal_
-  plus a line of dialogue. Never a movement.
+- **Slow (seconds, LLM):** receives a compact, relevant world snapshot and emits dialogue plus
+  a bounded structured plan. It never emits movement, and replans after meaningful events or
+  task outcomes instead of running a long plan blindly.
 
 Tool schema at the level of `mine_iron(32)`, not `press_w()`. Every tool interruptible,
 resumable, and returns a structured failure reason.
 
 Snapshot contents: position, health/hunger, hotbar + notable inventory, time of day,
-nearby hostile count, current task + progress, last few events, player's relative position.
+nearby threats/entities, current plan/task + progress, last outcome, recent events, and the
+player's relative position. Keep canonical world state separate from the budgeted LLM view.
 
 Trigger planner calls on events (took damage, task failed, nightfall, player moved 100+
 blocks) rather than a fixed timer.
+
+## PlayerEngine capability base
+
+Treat PlayerEngine as the companion's deterministic motor-skill library; MineMate supplies
+world context, judgment, memory, composition, and verified outcomes. Its existing capabilities
+include:
+
+- Survival: MLG bucket clutching, lava/drowning/fire escape, eating, and unstuck recovery.
+- Defense: shielding, projectile dodging, creeper spacing, retreating, and weapon selection.
+- Items: equipment, crafting, cooking, smelting, smithing, and tool acquisition.
+- Storage: chest scanning, depositing, withdrawing, and organized storage.
+- Projects: farm setup/repair/harvest, block placement, structures, and Nether portals.
+- Exploration: boats, dimension travel, beds, fishing, temples, and strongholds.
+- Experimental: full-game and Ender Dragon task sequences.
+
+Classify these as automatic **reflexes**, planner-facing **reliable tools**, or hidden
+**experimental skills**. Verify each against `CompanionEntity`, add reflex/task telemetry to the
+world snapshot, and expose only capabilities with good outcome checks and scenario coverage.
 
 ## Latency
 
@@ -89,10 +118,20 @@ complete sentence. Emit a filler ack ("hm—") on transcript receipt to mask the
 
 1. PlayerEngine entity that follows you. No AI, no voice. _(Expect this to take a week.)_
 2. Chat commands → hardcoded tasks. Build success/failure/blocked reporting here.
-3. TTS only — type in chat, hear positional speech. Proves the WAV → `short[]` path.
-4. Swap command parser for the LLM planner.
-5. Add STT + push-to-talk keybind.
-6. Memory, initiative, event-triggered personality.
+3. Audit PlayerEngine's existing skills, verify `CompanionEntity` compatibility, instrument its
+   reflexes, and expose a small set of reliable high-level tools.
+4. Add planner foundations: world snapshots, recent-event journal, typed tool registry,
+   multi-step plan executor, and a scripted fake planner for headless tests.
+5. Add a thin text-only hosted LLM planner. Validate every tool call, execute one step at a
+   time, feed outcomes back, and handle malformed output/network failure safely.
+6. Expand deterministic skills from evaluation failures: inventory/storage, equipment,
+   safe travel, landmarks, protection, and useful task compositions.
+7. Add episodic/spatial memory, player modeling, initiative, and reflection.
+8. Add positional TTS, then STT + push-to-talk, without coupling voice to the planner.
+
+Maintain a small scenario suite throughout: plan validity, completion and recovery rates,
+unnecessary model calls, missing context, latency, and cost. Improve intelligence from evidence,
+not prompt feel alone.
 
 ## Gotchas
 
@@ -104,7 +143,8 @@ complete sentence. Emit a filler ack ("hm—") on transcript receipt to mask the
 - **No internet, no companion.** Fail with a clear message, not a stall.
 - **Silence hallucination.** PTT sends near-empty clips; Whisper invents text
   ("Thanks for watching!"). Gate on clip length / RMS before sending.
-- **Building isn't supported** by PlayerEngine. Mining/fetching/fighting work. Scope around it.
+- **Advanced building is experimental.** PlayerEngine contains placement and structure tasks,
+  but verify them with `CompanionEntity` before exposing them to the planner.
 - **Chunk loading.** A non-player entity likely won't tick its own chunks off-screen. Decide
   early: leashed to render distance, or forced chunk ticket?
 - **Version drift.** Pin 1.21.1 in `gradle.properties`. Chasing latest MC kills the project.

@@ -4,7 +4,8 @@
 	"compatibilityLevel": "JAVA_21",
 	"mixins": [
 		"CraftMacroResourceTaskMixin",
-		"GiveItemToPlayerTaskMixin"
+		"GiveItemToPlayerTaskMixin",
+		"PlayerDefenseChainMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

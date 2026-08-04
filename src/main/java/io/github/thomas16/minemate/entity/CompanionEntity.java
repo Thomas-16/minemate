@@ -188,6 +188,9 @@ public class CompanionEntity extends LivingEntity
 
     @Override
     public boolean doHurtTarget(Entity target) {
+        if (this.ownerUuid != null && this.ownerUuid.equals(target.getUUID())) {
+            return false;
+        }
         float damage = (float) this.getAttributeValue(Attributes.ATTACK_DAMAGE);
         DamageSource damageSource = this.damageSources().mobAttack(this);
         if (this.level() instanceof ServerLevel serverLevel) {

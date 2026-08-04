@@ -64,6 +64,7 @@ public final class DevAutoTest {
     private static final int GLOBAL_CAP_TICKS = 30_000;
     private static final Set<String> SMOKE_SCENARIOS = Set.of(
             "debug_snapshot",
+            "owner_friendly_fire",
             "terminal_resample",
             "mine_success",
             "goto_success",
@@ -75,6 +76,8 @@ public final class DevAutoTest {
             "container_missing");
     private static final UUID FAKE_OWNER_UUID =
             UUID.fromString("bbf6e9b1-075b-4d78-928d-a73cc6c6155f");
+    private static final UUID FRIENDLY_FIRE_OWNER_UUID =
+            UUID.fromString("5ec29e35-81d1-4c23-aef9-0e394daaf52d");
     private static final UUID DEBUG_VIEWER_UUID =
             UUID.fromString("e1cdca3b-20c4-4853-9352-474eb62406b7");
 
@@ -90,6 +93,10 @@ public final class DevAutoTest {
     private static boolean sawEatingClear;
     private static boolean sawMobDefenseReflex;
     private static boolean sawMobDefenseClear;
+    private static boolean ownerDamageAccepted;
+    private static boolean ownerDirectAttackBlocked;
+    private static float companionHealthBeforeOwnerDamage;
+    private static float ownerHealthBeforeFriendlyFire;
     private static Boolean originalHungerEnabled;
     private static Boolean originalAutoEat;
     private static List<Scenario> scenarios = List.of();
@@ -171,6 +178,13 @@ public final class DevAutoTest {
                         ignoredServer -> prepareDebugSnapshotFixture(),
                         ignoredServer -> clearDebugSnapshotFixture(),
                         DevAutoTest::debugSnapshotFixtureInvariant),
+                new Scenario("owner_friendly_fire",
+                        ignored -> reflexObservationGoal(),
+                        DevAutoTest::succeeded,
+                        400,
+                        ignoredServer -> prepareOwnerFriendlyFire(),
+                        ignoredServer -> clearOwnerFriendlyFire(),
+                        DevAutoTest::ownerFriendlyFireInvariant),
                 // EntityTracker observes the fixture reliably before long-range pathing has
                 // populated its unreachable/cache state; the submitted wait task still proves
                 // real user-chain preemption and resumption.
@@ -636,33 +650,83 @@ public final class DevAutoTest {
 
     private static void prepareFetchOakBoats() {
         prepareInventory();
-        ServerLevel level = (ServerLevel) companion.level();
-        fakeOwner = FakePlayer.get(level, new GameProfile(FAKE_OWNER_UUID, "MineMateTestOwner"));
-        fakeOwner.getInventory().clearContent();
-        fakeOwner.moveTo(spawn.getX() - 3.5, spawn.getY(), spawn.getZ() + 0.5, 0.0F, 0.0F);
-        if (level.getEntity(fakeOwner.getUUID()) == null) {
-            level.addNewPlayer(fakeOwner);
-        }
-        companion.setOwnerUuid(fakeOwner.getUUID());
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateTestOwner");
         observedFetchDrops.clear();
         observedFetchThrows.clear();
         for (int offset = 0; offset < 5; offset++) {
             placeFixtureBlock(spawn.offset(3 + offset, 0, 6), Blocks.OAK_LOG);
         }
+    }
+
+    private static void prepareFakeOwner(UUID ownerUuid, String ownerName) {
+        ServerLevel level = (ServerLevel) companion.level();
+        fakeOwner = FakePlayer.get(level, new GameProfile(ownerUuid, ownerName));
+        fakeOwner.getInventory().clearContent();
+        fakeOwner.setHealth(fakeOwner.getMaxHealth());
+        fakeOwner.moveTo(spawn.getX() - 3.5, spawn.getY(), spawn.getZ() + 0.5, 0.0F, 0.0F);
+        if (level.getEntity(fakeOwner.getUUID()) == null) {
+            level.addNewPlayer(fakeOwner);
+        }
+        companion.setOwnerUuid(fakeOwner.getUUID());
         companion.getController().getEntityTracker().setDirty();
         companion.getController().getEntityTracker().ensureUpdated();
     }
 
     private static void clearFetchOakBoats(MinecraftServer server) {
+        clearFakeOwner();
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        clearFixtures();
+    }
+
+    private static void clearFakeOwner() {
         companion.setOwnerUuid(null);
         if (fakeOwner != null && !fakeOwner.isRemoved()) {
             ((ServerLevel) companion.level()).removePlayerImmediately(
                     fakeOwner, Entity.RemovalReason.DISCARDED);
         }
         fakeOwner = null;
-        observedFetchDrops.clear();
-        observedFetchThrows.clear();
+    }
+
+    private static void prepareOwnerFriendlyFire() {
+        prepareInventory();
+        companion.teleportTo(spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5);
+        prepareFakeOwner(FRIENDLY_FIRE_OWNER_UUID, "MineMateFriendlyFireOwner");
+
+        companion.setHealth(13.0F);
+        ownerHealthBeforeFriendlyFire = fakeOwner.getHealth();
+        ownerDirectAttackBlocked = !companion.doHurtTarget(fakeOwner);
+        companionHealthBeforeOwnerDamage = companion.getHealth();
+        ownerDamageAccepted = companion.hurt(
+                companion.damageSources().playerAttack(fakeOwner), 1.0F);
+    }
+
+    private static void clearOwnerFriendlyFire() {
+        clearFakeOwner();
+        companion.setHealth(companion.getMaxHealth());
+        ownerDamageAccepted = false;
+        ownerDirectAttackBlocked = false;
         clearFixtures();
+    }
+
+    private static String ownerFriendlyFireInvariant() {
+        if (!ownerDirectAttackBlocked) {
+            return "the direct attack boundary did not exclude the owner";
+        }
+        if (!ownerDamageAccepted || companion.getHealth() >= companionHealthBeforeOwnerDamage) {
+            return "the owner's damage did not reach the companion";
+        }
+        if (fakeOwner == null || fakeOwner.isRemoved()) {
+            return "the fake owner was not available during the retaliation window";
+        }
+        if (fakeOwner.getHealth() != ownerHealthBeforeFriendlyFire) {
+            return "the companion damaged its owner";
+        }
+        if (companion.getReflexSnapshot() != null
+                && companion.getReflexSnapshot().kind() == ReflexKind.PLAYER_DEFENSE) {
+            return "owner damage activated PlayerEngine player defense";
+        }
+        return null;
     }
 
     private static void trackFetchDropsAndTouchOwner() {

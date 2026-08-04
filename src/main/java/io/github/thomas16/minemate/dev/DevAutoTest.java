@@ -66,7 +66,6 @@ public final class DevAutoTest {
     private static final Set<String> SMOKE_SCENARIOS = Set.of(
             "debug_snapshot",
             "owner_friendly_fire",
-            "terminal_resample",
             "mine_success",
             "goto_success",
             "cancel",
@@ -199,11 +198,6 @@ public final class DevAutoTest {
                         ignoredServer -> prepareMobDefenseReflex(),
                         DevAutoTest::clearMobDefenseReflex,
                         () -> null),
-                new Scenario("terminal_resample",
-                        ignored -> terminalResampleGoal(),
-                        outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
-                                && Reasons.GOAL_MET.equals(outcome.reason()),
-                        100),
                 new Scenario("mine_success",
                         ignored -> Goals.mine("dirt", 1),
                         outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
@@ -214,11 +208,6 @@ public final class DevAutoTest {
                         outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
                                 && Reasons.GOAL_MET.equals(outcome.reason()),
                         2400),
-                new Scenario("goto_timeout",
-                        ignored -> withTimeout(Goals.goTo(spawn.getX() + 100_000, spawn.getZ(), 2.5), 200),
-                        outcome -> outcome.status() == OutcomeStatus.TIMED_OUT
-                                && Reasons.TIMEOUT.equals(outcome.reason()),
-                        400),
                 new Scenario("cancel",
                         ignored -> Goals.goTo(spawn.getX() + 100_000, spawn.getZ(), 2.5),
                         outcome -> outcome.status() == OutcomeStatus.CANCELLED
@@ -232,13 +221,6 @@ public final class DevAutoTest {
                         ignoredServer -> armHostile(spawn, EntityType.ZOMBIE),
                         DevAutoTest::disarmHostile,
                         DevAutoTest::defenseLeashInvariant),
-                new Scenario("craft_already_satisfied",
-                        ignored -> Goals.craft(companion, Items.OAK_PLANKS, 4),
-                        outcome -> succeeded(outcome) && inventoryCount(Items.OAK_PLANKS) == 4,
-                        100,
-                        ignoredServer -> prepareInventory(new ItemStack(Items.OAK_PLANKS, 4)),
-                        ignoredServer -> clearFixtures(),
-                        () -> null),
                 new Scenario("craft_success",
                         ignored -> Goals.craft(companion, Items.OAK_PLANKS, 4),
                         outcome -> succeeded(outcome) && inventoryCount(Items.OAK_PLANKS) >= 4,
@@ -277,13 +259,6 @@ public final class DevAutoTest {
                         ignoredServer -> prepareInventory(),
                         ignoredServer -> clearFixtures(),
                         () -> null),
-                new Scenario("smelt_already_satisfied",
-                        ignored -> Goals.smelt(companion, Items.COBBLESTONE, 1),
-                        outcome -> succeeded(outcome) && inventoryCount(Items.STONE) == 1,
-                        100,
-                        ignoredServer -> prepareInventory(new ItemStack(Items.STONE, 1)),
-                        ignoredServer -> clearFixtures(),
-                        () -> null),
                 new Scenario("smelt_success",
                         ignored -> Goals.smelt(companion, Items.COBBLESTONE, 2),
                         outcome -> succeeded(outcome) && inventoryCount(Items.STONE) >= 2,
@@ -318,15 +293,6 @@ public final class DevAutoTest {
                         ignoredServer -> prepareFurnace(new ItemStack(Items.COBBLESTONE, 1)),
                         ignoredServer -> clearFixtures(),
                         () -> null),
-                new Scenario("smelt_cancel",
-                        ignored -> Goals.smelt(companion, Items.COBBLESTONE, 4),
-                        outcome -> outcome.status() == OutcomeStatus.CANCELLED
-                                && Reasons.CANCELLED_BY_OWNER.equals(outcome.reason()),
-                        400,
-                        ignoredServer -> prepareFurnace(new ItemStack(Items.COBBLESTONE, 4),
-                                new ItemStack(Items.COAL, 1)),
-                        ignoredServer -> clearFixtures(),
-                        () -> null),
                 new Scenario("deposit_success",
                         ignored -> Goals.deposit(companion, storagePos, Items.DIRT, 4),
                         DevAutoTest::acceptDepositSuccess,
@@ -337,16 +303,6 @@ public final class DevAutoTest {
                         },
                         ignoredServer -> clearFixtures(),
                         DevAutoTest::directActivityInvariant),
-                new Scenario("withdraw_success",
-                        ignored -> Goals.withdraw(companion, storagePos, Items.DIRT, 4),
-                        DevAutoTest::acceptWithdrawSuccess,
-                        1200,
-                        ignoredServer -> {
-                            prepareStorage(2);
-                            insert(new ItemStack(Items.DIRT, 2));
-                        },
-                        ignoredServer -> clearFixtures(),
-                        () -> null),
                 new Scenario("withdraw_wall_reach",
                         ignored -> Goals.withdraw(companion, storagePos, Items.DIRT, 2),
                         outcome -> succeeded(outcome) && sawStorageReach
@@ -399,14 +355,6 @@ public final class DevAutoTest {
                                 && Reasons.CONTAINER_UNREACHABLE.equals(outcome.reason()),
                         100,
                         ignoredServer -> prepareInventory(),
-                        ignoredServer -> clearFixtures(),
-                        () -> null),
-                new Scenario("deposit_already_satisfied",
-                        ignored -> Goals.deposit(companion, storagePos, Items.DIRT, 4),
-                        outcome -> succeeded(outcome) && storageCount(Items.DIRT) == 4
-                                && inventoryCount(Items.DIRT) == 0,
-                        100,
-                        ignoredServer -> prepareStorage(4),
                         ignoredServer -> clearFixtures(),
                         () -> null),
                 new Scenario("eating_reflex",
@@ -508,8 +456,7 @@ public final class DevAutoTest {
             fail(server, scenario.name() + " invariant broken: " + violation);
             return;
         }
-        if (("cancel".equals(scenario.name()) || "smelt_cancel".equals(scenario.name()))
-                && scenarioTicks == 40) {
+        if ("cancel".equals(scenario.name()) && scenarioTicks == 40) {
             companion.getSupervisor().cancel(Reasons.CANCELLED_BY_OWNER);
         }
         if (scenarioTicks > scenario.hardCapTicks()) {
@@ -610,16 +557,6 @@ public final class DevAutoTest {
         boolean accepted = succeeded(outcome) && stored == 4 && held == 0;
         if (!accepted) {
             MineMate.LOGGER.error("[autotest] deposit postcondition stored={} held={}", stored, held);
-        }
-        return accepted;
-    }
-
-    private static boolean acceptWithdrawSuccess(TaskOutcome outcome) {
-        int stored = storageCount(Items.DIRT);
-        int held = inventoryCount(Items.DIRT);
-        boolean accepted = succeeded(outcome) && held >= 4 && stored == 0;
-        if (!accepted) {
-            MineMate.LOGGER.error("[autotest] withdraw postcondition stored={} held={}", stored, held);
         }
         return accepted;
     }

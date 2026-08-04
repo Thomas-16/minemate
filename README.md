@@ -21,6 +21,11 @@ PlayerEngine phase/task tree, preempting chain, and current reflex. Existing `mi
 `fetch` aliases remain available; `mine` is composite item acquisition and its future
 planner-facing name is `acquire_item`.
 
+`/companion debugUI` opens a read-only live inspector for your nearby companion. Its
+Overview, Inventory, and Execution tabs show exact server-owned slots and equipment,
+vitals and movement, current goal/task/engine/reflex telemetry, and the last outcome.
+The screen refreshes twice per second and requires MineMate on both the server and client.
+
 See [playerengine-capability-audit.md](playerengine-capability-audit.md) for the audited
 capability matrix and certification boundaries.
 

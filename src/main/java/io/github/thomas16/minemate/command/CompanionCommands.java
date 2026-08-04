@@ -4,6 +4,7 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 
 import io.github.thomas16.minemate.entity.CompanionEntity;
+import io.github.thomas16.minemate.debug.CompanionDebugNetworking;
 import io.github.thomas16.minemate.entity.MineMateEntities;
 import io.github.thomas16.minemate.task.Goal;
 import io.github.thomas16.minemate.task.GoalProgress;
@@ -36,6 +37,7 @@ public final class CompanionCommands {
         root.then(Commands.literal("dismiss").executes(ctx -> dismiss(ctx.getSource())));
         root.then(Commands.literal("stop").executes(ctx -> stop(ctx.getSource())));
         root.then(Commands.literal("status").executes(ctx -> status(ctx.getSource())));
+        root.then(Commands.literal("debugUI").executes(ctx -> debugUi(ctx.getSource())));
         CompanionTaskCommands.attach(root, registryAccess);
         dispatcher.register(root);
     }
@@ -95,6 +97,23 @@ public final class CompanionCommands {
         String text = outcome.map(value -> "Idle - last: " + value.detail()).orElse("Idle")
                 + reflexSuffix(companion.getReflexSnapshot());
         source.sendSuccess(() -> Component.literal(text), false);
+        return 1;
+    }
+
+    private static int debugUi(CommandSourceStack source) {
+        ServerPlayer player = requirePlayer(source);
+        if (player == null) {
+            return 0;
+        }
+        CompanionEntity companion = findCompanion(player);
+        if (companion == null) {
+            source.sendFailure(Component.literal("No companion nearby"));
+            return 0;
+        }
+        if (!CompanionDebugNetworking.open(player, companion)) {
+            source.sendFailure(Component.literal("MineMate's client mod is required for the debug UI"));
+            return 0;
+        }
         return 1;
     }
 

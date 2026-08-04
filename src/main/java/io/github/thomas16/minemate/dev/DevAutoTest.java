@@ -6,6 +6,7 @@ import com.player2.playerengine.PlayerEngineSettings;
 import com.player2.playerengine.tasks.base.Task;
 
 import io.github.thomas16.minemate.MineMate;
+import io.github.thomas16.minemate.debug.CompanionDebugSnapshot;
 import io.github.thomas16.minemate.entity.CompanionEntity;
 import io.github.thomas16.minemate.entity.MineMateEntities;
 import io.github.thomas16.minemate.task.Goal;
@@ -46,6 +47,7 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -61,6 +63,7 @@ import java.util.function.Supplier;
 public final class DevAutoTest {
     private static final int GLOBAL_CAP_TICKS = 30_000;
     private static final Set<String> SMOKE_SCENARIOS = Set.of(
+            "debug_snapshot",
             "terminal_resample",
             "mine_success",
             "goto_success",
@@ -72,9 +75,13 @@ public final class DevAutoTest {
             "container_missing");
     private static final UUID FAKE_OWNER_UUID =
             UUID.fromString("bbf6e9b1-075b-4d78-928d-a73cc6c6155f");
+    private static final UUID DEBUG_VIEWER_UUID =
+            UUID.fromString("e1cdca3b-20c4-4853-9352-474eb62406b7");
 
     private static CompanionEntity companion;
     private static FakePlayer fakeOwner;
+    private static FakePlayer debugViewer;
+    private static CompanionDebugSnapshot debugFixtureSnapshot;
     private static Mob hostile;
     private static BlockPos spawn;
     private static BlockPos storagePos;
@@ -138,7 +145,14 @@ public final class DevAutoTest {
         companion = new CompanionEntity(MineMateEntities.COMPANION, level);
         companion.moveTo(spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5, 0.0F, 0.0F);
         level.addFreshEntity(companion);
+        debugViewer = FakePlayer.get(level, new GameProfile(DEBUG_VIEWER_UUID, "MineMateDebugViewer"));
         level.setBlockAndUpdate(spawn.offset(3, 0, 0), Blocks.DIRT.defaultBlockState());
+
+        String idleDebugViolation = debugSnapshotInvariant();
+        if (idleDebugViolation != null) {
+            fail(server, "debug idle snapshot invalid: " + idleDebugViolation);
+            return;
+        }
 
         try {
             Goals.fetch("unobtainium", 1);
@@ -149,6 +163,14 @@ public final class DevAutoTest {
         }
 
         scenarios = List.of(
+                new Scenario("debug_snapshot",
+                        ignored -> terminalResampleGoal(),
+                        outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
+                                && Reasons.GOAL_MET.equals(outcome.reason()),
+                        100,
+                        ignoredServer -> prepareDebugSnapshotFixture(),
+                        ignoredServer -> clearDebugSnapshotFixture(),
+                        DevAutoTest::debugSnapshotFixtureInvariant),
                 // EntityTracker observes the fixture reliably before long-range pathing has
                 // populated its unreachable/cache state; the submitted wait task still proves
                 // real user-chain preemption and resumption.
@@ -425,6 +447,13 @@ public final class DevAutoTest {
         if (globalTicks > GLOBAL_CAP_TICKS) {
             fail(server, "global tick cap exceeded");
             return;
+        }
+        if (globalTicks % 5 == 0 || advanceRequested) {
+            String debugViolation = debugSnapshotInvariant();
+            if (debugViolation != null) {
+                fail(server, "debug snapshot invalid: " + debugViolation);
+                return;
+            }
         }
         if (advanceRequested) {
             if (advanceNotBeforeTick < 0) {
@@ -756,6 +785,149 @@ public final class DevAutoTest {
         for (ItemStack stack : stacks) {
             insert(stack.copy());
         }
+    }
+
+    private static void prepareDebugSnapshotFixture() {
+        prepareInventory();
+        companion.setOwnerUuid(debugViewer.getUUID());
+        companion.getLivingInventory().main.set(11, new ItemStack(Items.DIRT, 7));
+        ItemStack pickaxe = new ItemStack(Items.IRON_PICKAXE);
+        pickaxe.setDamageValue(7);
+        companion.getLivingInventory().main.set(12, pickaxe);
+        companion.getLivingInventory().armor.set(3, new ItemStack(Items.IRON_HELMET));
+        companion.getLivingInventory().offHand.set(0, new ItemStack(Items.TORCH, 12));
+        companion.getLivingInventory().selectedSlot = 2;
+        companion.getHungerManager().setFoodLevel(7);
+        companion.getHungerManager().setSaturationLevel(1.5F);
+        companion.getHungerManager().setExhaustion(2.25F);
+        debugFixtureSnapshot = CompanionDebugSnapshot.capture(companion, debugViewer);
+    }
+
+    private static void clearDebugSnapshotFixture() {
+        companion.setOwnerUuid(null);
+        companion.getLivingInventory().selectedSlot = 0;
+        companion.getHungerManager().setExhaustion(0.0F);
+        debugFixtureSnapshot = null;
+        clearFixtures();
+    }
+
+    private static String debugSnapshotFixtureInvariant() {
+        CompanionDebugSnapshot snapshot = debugFixtureSnapshot;
+        if (snapshot == null) {
+            return "initial fixture snapshot was absent";
+        }
+        if (!snapshot.ownerId().equals(debugViewer.getUUID())
+                || !"MineMateDebugViewer".equals(snapshot.ownerName())) {
+            return "owner identity was not preserved";
+        }
+        if (snapshot.mainInventory().size() != 36 || snapshot.armorInventory().size() != 4) {
+            return "inventory shape was not 36 main plus 4 armor slots";
+        }
+        if (!snapshot.mainInventory().get(11).is(Items.DIRT)
+                || snapshot.mainInventory().get(11).getCount() != 7) {
+            return "main[11] was not the exact dirt stack";
+        }
+        if (!snapshot.mainInventory().get(12).is(Items.IRON_PICKAXE)
+                || snapshot.mainInventory().get(12).getDamageValue() != 7) {
+            return "main[12] did not preserve item damage";
+        }
+        if (!snapshot.armorInventory().get(3).is(Items.IRON_HELMET)) {
+            return "head armor slot was not preserved";
+        }
+        if (!snapshot.offhand().is(Items.TORCH) || snapshot.offhand().getCount() != 12) {
+            return "offhand stack was not preserved";
+        }
+        if (snapshot.selectedSlot() != 2) {
+            return "selected hotbar slot was " + snapshot.selectedSlot();
+        }
+        if (snapshot.food() != 7 || snapshot.saturation() != 1.5F || snapshot.exhaustion() != 2.25F) {
+            return "hunger fields were not preserved";
+        }
+        CompanionDebugSnapshot liveSnapshot = CompanionDebugSnapshot.capture(companion, debugViewer);
+        if (scenarioTicks >= 2 && (liveSnapshot.goal() == null || liveSnapshot.activity() == null)) {
+            return "active goal telemetry was absent";
+        }
+        return null;
+    }
+
+    /** Compares the debug DTO against its canonical sources throughout every scenario. */
+    private static String debugSnapshotInvariant() {
+        if (debugViewer == null) {
+            return "debug viewer was not initialized";
+        }
+        CompanionDebugSnapshot snapshot = CompanionDebugSnapshot.capture(companion, debugViewer);
+        if (!snapshot.companionId().equals(companion.getUUID())
+                || snapshot.entityId() != companion.getId()) {
+            return "entity identity mismatch";
+        }
+        if (snapshot.mainInventory().size() != companion.getLivingInventory().main.size()
+                || snapshot.armorInventory().size() != companion.getLivingInventory().armor.size()) {
+            return "inventory size mismatch";
+        }
+        if (snapshot.selectedSlot() != companion.getLivingInventory().selectedSlot
+                || snapshot.food() != companion.getHungerManager().getFoodLevel()
+                || Float.compare(snapshot.saturation(), companion.getHungerManager().getSaturationLevel()) != 0
+                || Float.compare(snapshot.exhaustion(), companion.getHungerManager().getExhaustion()) != 0) {
+            return "inventory or hunger scalar mismatch";
+        }
+
+        Optional<Goal> goal = companion.getSupervisor().currentGoal();
+        if (goal.isPresent() != (snapshot.goal() != null)) {
+            return "goal presence mismatch";
+        }
+        if (goal.isPresent() && (!goal.get().id().equals(snapshot.goal().id())
+                || !goal.get().kind().equals(snapshot.goal().kind())
+                || !goal.get().description().equals(snapshot.goal().description())
+                || !goal.get().executionProfile().scope().name().equals(snapshot.goal().scope()))) {
+            return "goal detail mismatch";
+        }
+
+        Optional<GoalProgress> progress = companion.getSupervisor().currentProgress();
+        if (progress.isPresent() != (snapshot.progress() != null)) {
+            return "progress presence mismatch";
+        }
+        if (progress.isPresent() && (progress.get().have() != snapshot.progress().have()
+                || progress.get().want() != snapshot.progress().want()
+                || Double.compare(progress.get().advance(), snapshot.progress().advance()) != 0
+                || !Objects.equals(progress.get().text(), snapshot.progress().text()))) {
+            return "progress detail mismatch";
+        }
+
+        Optional<io.github.thomas16.minemate.task.TaskActivitySnapshot> activity =
+                companion.getSupervisor().currentActivity();
+        if (activity.isPresent() != (snapshot.activity() != null)) {
+            return "activity presence mismatch";
+        }
+        if (activity.isPresent() && (activity.get().elapsedTicks() != snapshot.activity().elapsedTicks()
+                || activity.get().timeoutTicks() != snapshot.activity().timeoutTicks()
+                || !activity.get().phase().equals(snapshot.activity().phase())
+                || !activity.get().taskTree().equals(snapshot.activity().taskTree())
+                || !activity.get().preemptingChain().equals(snapshot.activity().preemptingChain()))) {
+            return "activity detail mismatch";
+        }
+
+        Optional<TaskOutcome> outcome = companion.getSupervisor().lastOutcome();
+        if (outcome.isPresent() != (snapshot.lastOutcome() != null)) {
+            return "outcome presence mismatch";
+        }
+        if (outcome.isPresent() && (!outcome.get().goalId().equals(snapshot.lastOutcome().goalId())
+                || !outcome.get().kind().equals(snapshot.lastOutcome().kind())
+                || !outcome.get().status().name().equals(snapshot.lastOutcome().status())
+                || !outcome.get().reason().equals(snapshot.lastOutcome().reason())
+                || outcome.get().moved() != snapshot.lastOutcome().moved()
+                || outcome.get().have() != snapshot.lastOutcome().have()
+                || outcome.get().want() != snapshot.lastOutcome().want()
+                || outcome.get().elapsedMs() != snapshot.lastOutcome().elapsedMs()
+                || !Objects.equals(outcome.get().engineState(), snapshot.lastOutcome().engineState())
+                || !Objects.equals(outcome.get().engineLog(), snapshot.lastOutcome().engineLog()))) {
+            return "outcome detail mismatch";
+        }
+        if (!companion.getReflexSnapshot().kind().name().equals(snapshot.reflex().kind())
+                || !companion.getReflexSnapshot().chain().equals(snapshot.reflex().chain())
+                || companion.getReflexSnapshot().defenseSuppressed() != snapshot.reflex().defenseSuppressed()) {
+            return "reflex detail mismatch";
+        }
+        return null;
     }
 
     private static void removeContainerFixtureWithoutDrops(ServerLevel level, BlockPos position) {

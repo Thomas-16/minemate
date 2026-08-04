@@ -3,9 +3,11 @@
 	"package": "io.github.thomas16.minemate.mixin",
 	"compatibilityLevel": "JAVA_21",
 	"mixins": [
+		"BoundedContainerTransferTaskMixin",
 		"CraftMacroResourceTaskMixin",
 		"GiveItemToPlayerTaskMixin",
-		"PlayerDefenseChainMixin"
+		"PlayerDefenseChainMixin",
+		"SmeltDeferredTaskMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

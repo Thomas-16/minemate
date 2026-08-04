@@ -19,6 +19,7 @@ import io.github.thomas16.minemate.task.Reasons;
 import io.github.thomas16.minemate.task.TaskListener;
 import io.github.thomas16.minemate.task.TaskListeners;
 import io.github.thomas16.minemate.task.TaskOutcome;
+import io.github.thomas16.minemate.integration.CompanionReachability;
 import io.github.thomas16.minemate.integration.ReflexKind;
 
 import net.fabricmc.fabric.api.entity.FakePlayer;
@@ -72,6 +73,7 @@ public final class DevAutoTest {
             "craft_success",
             "fetch_oak_boat_delivery",
             "smelt_success",
+            "smelt_wall_reach",
             "deposit_success",
             "container_missing");
     private static final UUID FAKE_OWNER_UUID =
@@ -93,6 +95,8 @@ public final class DevAutoTest {
     private static boolean sawEatingClear;
     private static boolean sawMobDefenseReflex;
     private static boolean sawMobDefenseClear;
+    private static boolean sawStorageReach;
+    private static boolean sawFurnaceReach;
     private static boolean ownerDamageAccepted;
     private static boolean ownerDirectAttackBlocked;
     private static float companionHealthBeforeOwnerDamage;
@@ -289,6 +293,14 @@ public final class DevAutoTest {
                                 new ItemStack(Items.COAL, 1)),
                         ignoredServer -> clearFixtures(),
                         DevAutoTest::directActivityInvariant),
+                new Scenario("smelt_wall_reach",
+                        ignored -> Goals.smelt(companion, Items.COBBLESTONE, 1),
+                        outcome -> succeeded(outcome) && sawFurnaceReach
+                                && inventoryCount(Items.STONE) >= 1,
+                        1800,
+                        ignoredServer -> prepareWalledFurnace(),
+                        ignoredServer -> clearFixtures(),
+                        DevAutoTest::walledFurnaceInvariant),
                 new Scenario("smelt_no_recipe",
                         ignored -> Goals.smelt(companion, Items.BEDROCK, 1),
                         outcome -> outcome.status() == OutcomeStatus.BLOCKED
@@ -335,6 +347,15 @@ public final class DevAutoTest {
                         },
                         ignoredServer -> clearFixtures(),
                         () -> null),
+                new Scenario("withdraw_wall_reach",
+                        ignored -> Goals.withdraw(companion, storagePos, Items.DIRT, 2),
+                        outcome -> succeeded(outcome) && sawStorageReach
+                                && storageCount(Items.DIRT) == 0
+                                && inventoryCount(Items.DIRT) == 2,
+                        1200,
+                        ignoredServer -> prepareWalledStorage(),
+                        ignoredServer -> clearFixtures(),
+                        DevAutoTest::walledStorageInvariant),
                 new Scenario("withdraw_partial",
                         ignored -> Goals.withdraw(companion, storagePos, Items.DIRT, 4),
                         outcome -> outcome.status() == OutcomeStatus.BLOCKED
@@ -601,6 +622,40 @@ public final class DevAutoTest {
             MineMate.LOGGER.error("[autotest] withdraw postcondition stored={} held={}", stored, held);
         }
         return accepted;
+    }
+
+    private static String walledStorageInvariant() {
+        if (!sawStorageReach
+                && CompanionReachability.canReachBlock(companion.getController(), storagePos)) {
+            sawStorageReach = true;
+        }
+        if (!sawStorageReach
+                && (storageCount(Items.DIRT) != 2 || inventoryCount(Items.DIRT) != 0)) {
+            return "storage contents changed before the companion had an unobstructed reach";
+        }
+        return null;
+    }
+
+    private static String walledFurnaceInvariant() {
+        if (!sawFurnaceReach
+                && CompanionReachability.canReachBlock(companion.getController(), furnacePos)) {
+            sawFurnaceReach = true;
+        }
+        if (sawFurnaceReach) {
+            return null;
+        }
+
+        Container furnace = furnaceContainer();
+        for (int slot = 0; slot < furnace.getContainerSize(); slot++) {
+            if (!furnace.getItem(slot).isEmpty()) {
+                return "furnace contents changed before the companion had an unobstructed reach";
+            }
+        }
+        if (inventoryCount(Items.COBBLESTONE) != 1 || inventoryCount(Items.COAL) != 1
+                || inventoryCount(Items.STONE) != 0) {
+            return "companion inventory changed before the furnace was reachable";
+        }
+        return null;
     }
 
     private static boolean acceptMobDefenseReflex(TaskOutcome outcome) {
@@ -1008,6 +1063,12 @@ public final class DevAutoTest {
         ((ServerLevel) companion.level()).setBlockAndUpdate(furnacePos, Blocks.FURNACE.defaultBlockState());
     }
 
+    private static void prepareWalledFurnace() {
+        prepareFurnace(new ItemStack(Items.COBBLESTONE, 1), new ItemStack(Items.COAL, 1));
+        sawFurnaceReach = false;
+        placeReachWall(furnacePos);
+    }
+
     private static void prepareStorage(int dirtCount) {
         prepareInventory();
         ServerLevel level = (ServerLevel) companion.level();
@@ -1018,6 +1079,26 @@ public final class DevAutoTest {
             container.setItem(0, new ItemStack(Items.DIRT, dirtCount));
         }
         container.setChanged();
+    }
+
+    private static void prepareWalledStorage() {
+        prepareStorage(2);
+        sawStorageReach = false;
+        placeReachWall(storagePos);
+    }
+
+    /** Places a two-high screen directly west of the target, with a route around either edge. */
+    private static void placeReachWall(BlockPos target) {
+        ServerLevel level = (ServerLevel) companion.level();
+        for (int zOffset = -1; zOffset <= 1; zOffset++) {
+            for (int yOffset = 0; yOffset <= 1; yOffset++) {
+                BlockPos wallPos = target.offset(-1, yOffset, zOffset);
+                level.setBlockAndUpdate(wallPos, Blocks.BEDROCK.defaultBlockState());
+                worldMaterialPositions.add(wallPos);
+            }
+        }
+        BlockPos blockedSide = target.offset(-2, 0, 0);
+        companion.teleportTo(blockedSide.getX() + 0.5, blockedSide.getY(), blockedSide.getZ() + 0.5);
     }
 
     private static void prepareFullStorage() {
@@ -1150,6 +1231,14 @@ public final class DevAutoTest {
         BlockEntity blockEntity = companion.level().getBlockEntity(storagePos);
         if (!(blockEntity instanceof Container container)) {
             throw new IllegalStateException("Storage fixture is not a container at " + storagePos);
+        }
+        return container;
+    }
+
+    private static Container furnaceContainer() {
+        BlockEntity blockEntity = companion.level().getBlockEntity(furnacePos);
+        if (!(blockEntity instanceof Container container)) {
+            throw new IllegalStateException("Furnace fixture is not a container at " + furnacePos);
         }
         return container;
     }

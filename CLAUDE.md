@@ -14,6 +14,9 @@ Build with `gradlew build`; launch a client with `gradlew runClient`. The projec
 
 ## Development lessons
 
+- Keep verification proportional to the change. Small, low-risk changes such as command
+  arguments or simple entity metadata should use build and manual verification rather than
+  expanding the headless integration suite.
 - A timed-out terminal/tool invocation does not necessarily stop the Gradle wrapper or the Minecraft JVM it launched. Before rerunning a timed-out headless test, inspect Java command lines and stop only the exact stale wrapper and `KnotServer` processes. Never kill every Java process; Gradle daemons, the IDE, and other tools may also be using Java. Stale-test symptoms include `Unable to delete run/logs/latest.log`, `Unable to delete run/logs/debug.log`, inconsistent scenario results, and port conflicts. A regenerated world cannot isolate two servers that are running concurrently.
 - Prefer a focused scenario while changing one capability and the smoke profile for normal local verification. CI runs the complete `full` profile, including slow world-acquisition coverage. `runServer` can report `BUILD SUCCESSFUL` after an autotest failure because the test shuts the server down normally; the authoritative result is `[autotest] AUTOTEST PASS` or `AUTOTEST FAIL` in the log.
 - PlayerEngine's craft macro used 300- and 1,200-tick collection cutoffs around a nested gather search that can run for 90 seconds. Compatibility patches must preserve the overall MineMate timeout, be guarded by the exact PlayerEngine dependency version, and use Mixin `require = 1` so upstream bytecode changes fail fast.

@@ -21,6 +21,7 @@ import io.github.thomas16.minemate.task.TaskSupervisor;
 import net.minecraft.core.Vec3i;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.Mth;
 import net.minecraft.world.damagesource.DamageSource;
@@ -37,6 +38,7 @@ import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -47,6 +49,8 @@ import java.util.UUID;
  */
 public class CompanionEntity extends LivingEntity
         implements IAutomatone, IInventoryProvider, IInteractionManagerProvider, IHungerManagerProvider {
+
+    public static final int MAX_NAME_LENGTH = 32;
 
     private static final String OWNER_NBT_KEY = "minemate_owner";
 
@@ -105,6 +109,27 @@ public class CompanionEntity extends LivingEntity
 
     public void setOwnerUuid(UUID ownerUuid) {
         this.ownerUuid = ownerUuid;
+    }
+
+    /** Plain-text identity intended for future planner and LLM context. */
+    public Optional<String> getCompanionName() {
+        return Optional.ofNullable(this.getCustomName()).map(Component::getString);
+    }
+
+    public void setCompanionName(String name) {
+        String normalized = normalizeCompanionName(name);
+        this.setCustomName(Component.literal(normalized));
+        this.setCustomNameVisible(true);
+    }
+
+    public static String normalizeCompanionName(String name) {
+        String normalized = Objects.requireNonNull(name, "name").strip();
+        int length = normalized.codePointCount(0, normalized.length());
+        if (length < 1 || length > MAX_NAME_LENGTH) {
+            throw new IllegalArgumentException(
+                    "Companion name must be between 1 and " + MAX_NAME_LENGTH + " characters");
+        }
+        return normalized;
     }
 
     @Override

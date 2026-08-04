@@ -10,11 +10,15 @@ Counts are desired destination totals and default to one. Item arguments below a
 Minecraft registry items such as `minecraft:oak_planks`.
 
 ```text
+/companion spawn <name>
 /companion craft <item> [count]
 /companion smelt <input> [count]
 /companion deposit <x y z> <item> [count]
 /companion withdraw <x y z> <item> [count]
 ```
+
+Spawning requires a name between 1 and 32 characters. Quote names containing spaces,
+for example `/companion spawn "Ada Stone"`. The name is displayed above the companion.
 
 `/companion status` reports the execution scope, elapsed/timeout tick budget, live
 PlayerEngine phase/task tree, preempting chain, and current reflex. Existing `mine` and

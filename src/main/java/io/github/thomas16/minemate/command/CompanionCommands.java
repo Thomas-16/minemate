@@ -1,6 +1,7 @@
 package io.github.thomas16.minemate.command;
 
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 
 import io.github.thomas16.minemate.entity.CompanionEntity;
@@ -33,7 +34,10 @@ public final class CompanionCommands {
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher,
             CommandBuildContext registryAccess) {
         LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("companion");
-        root.then(Commands.literal("spawn").executes(ctx -> spawn(ctx.getSource())));
+        root.then(Commands.literal("spawn")
+                .then(Commands.argument("name", StringArgumentType.string())
+                        .executes(ctx -> spawn(ctx.getSource(),
+                                StringArgumentType.getString(ctx, "name")))));
         root.then(Commands.literal("dismiss").executes(ctx -> dismiss(ctx.getSource())));
         root.then(Commands.literal("stop").executes(ctx -> stop(ctx.getSource())));
         root.then(Commands.literal("status").executes(ctx -> status(ctx.getSource())));
@@ -131,9 +135,16 @@ public final class CompanionCommands {
                 ? oneLine : oneLine.substring(0, Math.max(0, maximum - 3)) + "...";
     }
 
-    private static int spawn(CommandSourceStack source) {
+    private static int spawn(CommandSourceStack source, String requestedName) {
         ServerPlayer player = requirePlayer(source);
         if (player == null) {
+            return 0;
+        }
+        String companionName;
+        try {
+            companionName = CompanionEntity.normalizeCompanionName(requestedName);
+        } catch (IllegalArgumentException exception) {
+            source.sendFailure(Component.literal(exception.getMessage()));
             return 0;
         }
         ServerLevel level = player.serverLevel();
@@ -143,11 +154,12 @@ public final class CompanionCommands {
             return 0;
         }
         CompanionEntity companion = new CompanionEntity(MineMateEntities.COMPANION, level);
+        companion.setCompanionName(companionName);
         companion.setOwnerUuid(player.getUUID());
         BlockPos pos = player.blockPosition().offset(1, 0, 1);
         companion.moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, player.getYRot(), 0.0F);
         level.addFreshEntity(companion);
-        source.sendSuccess(() -> Component.literal("Companion spawned"), false);
+        source.sendSuccess(() -> Component.literal("Companion spawned: " + companionName), false);
         return 1;
     }
 

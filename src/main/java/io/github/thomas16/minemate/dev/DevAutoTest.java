@@ -114,6 +114,7 @@ public final class DevAutoTest {
     private static boolean sawEatingClear;
     private static boolean sawMobDefenseReflex;
     private static boolean sawMobDefenseClear;
+    private static boolean provokeHostileEachTick;
     private static boolean sawStorageReach;
     private static boolean sawFurnaceReach;
     private static boolean planSawForbiddenGoal;
@@ -493,6 +494,9 @@ public final class DevAutoTest {
             return;
         }
         if (companion.getReflexSnapshot() != null) {
+            if (hostile != null && provokeHostileEachTick && hostile.getTarget() != companion) {
+                hostile.setTarget(companion);
+            }
             if (companion.getReflexSnapshot().kind() == ReflexKind.EATING) {
                 sawEatingReflex = true;
             } else if (sawEatingReflex && companion.getReflexSnapshot().kind() == ReflexKind.NONE) {
@@ -650,6 +654,18 @@ public final class DevAutoTest {
             throw new IllegalStateException("Could not spawn the mob-defense fixture");
         }
         hostile.setPersistenceRequired();
+    }
+
+    /**
+     * EntityHelper.isAngryAtPlayer requires mob.getTarget() == the companion, and a vanilla zombie
+     * never targets a LivingEntity on its own. Relying on the kill aura to punch it into retaliating
+     * makes the fixture depend on PlayerEngine state that no scenario resets. Set the vanilla
+     * retaliation state directly: setLastHurtByMob lets HurtByTargetGoal re-acquire the companion if
+     * a target goal ever drops it, and setTarget makes it true on the very first tick.
+     */
+    private static void provokeHostile() {
+        hostile.setLastHurtByMob(companion);
+        hostile.setTarget(companion);
     }
 
     private static void disarmHostile(MinecraftServer server) {
@@ -1042,12 +1058,14 @@ public final class DevAutoTest {
         boolean accepted = succeeded(outcome) && sawMobDefenseReflex && sawMobDefenseClear;
         if (!accepted) {
             MineMate.LOGGER.error(
-                    "[autotest] mob defense postcondition seen={} cleared={} hostile={} difficulty={} suppressed={} priority={}",
+                    "[autotest] mob defense postcondition seen={} cleared={} hostile={} difficulty={} suppressed={} hostiles={} target={} reflex={}",
                     sawMobDefenseReflex, sawMobDefenseClear,
                     hostile == null ? "null" : "alive=" + hostile.isAlive() + ",removed=" + hostile.isRemoved(),
                     companion.level().getDifficulty(),
                     companion.getController().getShouldDefendFromHostiles(),
-                    companion.getController().getMobDefenseChain().getPriority());
+                    companion.getController().getEntityTracker().getHostiles().size(),
+                    hostile == null ? "null" : String.valueOf(hostile.getTarget()),
+                    companion.getReflexSnapshot().kind());
         }
         return accepted;
     }
@@ -1519,14 +1537,19 @@ public final class DevAutoTest {
         sawMobDefenseReflex = false;
         sawMobDefenseClear = false;
         armHostile(spawn, EntityType.ZOMBIE);
+        provokeHostileEachTick = true;
+        provokeHostile();
         companion.getController().getEntityTracker().setDirty();
         companion.getController().getEntityTracker().ensureUpdated();
+        // KillAura starts with an infinite force-field range, so this restores its default.
         companion.getController().getMobDefenseChain().resetForceField();
         companion.getController().getMobDefenseChain().setTargetEntity(hostile);
     }
 
     private static void clearMobDefenseReflex(MinecraftServer server) {
         System.clearProperty("minemate.autotest.unleashMobDefense");
+        provokeHostileEachTick = false;
+        companion.getController().getMobDefenseChain().resetTargetEntity();
         disarmHostile(server);
         clearFixtures();
     }

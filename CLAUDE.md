@@ -26,6 +26,7 @@ Build with `gradlew build`; launch a client with `gradlew runClient`. The projec
 - `LivingEntityInventory.insertStack` mutates the supplied stack. Item pickup accounting must compare the stack count before and after insertion, report only that delta, discard a fully consumed entity without restoring its stack, and leave the mutated remainder for a partial pickup.
 - `GiveItemToPlayerTask` considers delivery finished after throwing the items, not after the owner receives them. Fetch must treat acquisition and delivery as separate phases and remain active until the owner's inventory confirms the requested increase. Once delivery begins, do not re-enter acquisition merely because thrown items are no longer in the companion inventory.
 - A loaded Fabric `FakePlayer` is not necessarily in the connected-player list. Owner resolution should first check connected players and then loaded `ServerPlayer` entities. In delivery tests, vanilla `FakePlayer.playerTouch` may remove an item entity while its old stack object remains readable; phantom-drop assertions should cover entities collected by `CompanionEntity`, while delivery success is verified from the fake owner's inventory.
+- A headless mob fixture must set its vanilla retaliation state directly. `EntityHelper.isAngryAtPlayer` requires `mob.getTarget() == companion`, and letting the kill aura bootstrap that state makes the scenario depend on PlayerEngine state that is created once per companion and reset by nothing.
 - Replacing a chest or furnace fixture with air invokes vanilla container removal and drops its contents. Empty test containers before removing their blocks, or the companion can collect the drops in the next scenario and create misleading results such as `withdraw 6/4`; changing fixture coordinates or adding task-drain delays does not prevent those world item drops.
 - Keep player-visible status, progress, failure, truncation, and autotest-marker punctuation ASCII. The log files may be valid UTF-8 while a console or copy path still decodes em dashes and ellipses incorrectly; comments may retain Unicode.
 - `/companion stop` must cancel the plan before the supervisor. Cancelling only the supervisor lets `PlanExecutor` submit the next step on the following tick, so stop appears to do nothing.
@@ -42,13 +43,8 @@ Build with `gradlew build`; launch a client with `gradlew runClient`. The projec
 
 ## Known issue
 
-`mob_defense_reflex` fails whenever it runs after `owner_friendly_fire`, which is the order the
-`full` profile uses. It passes in isolation. Reproducible on a clean checkout of `411804c`, so it
-predates the stage-4 work; the diagnostic is `seen=false cleared=false ... suppressed=false
-priority=0.0`, meaning the leash released correctly but `MobDefenseChain` still declined the body.
-Because the harness halts on the first failure, this blocks every later scenario in `full` — use
-`smoke`, or an explicit scenario list, until it is fixed. `craft_iron_sword_world` is separately
-order-sensitive: it passes alone (~89s) but can exhaust its cap after a different preceding sequence.
+`craft_iron_sword_world` is order-sensitive: it passes alone (~89s) but can exhaust its cap after a
+different preceding sequence.
 
 ## Where this is going
 

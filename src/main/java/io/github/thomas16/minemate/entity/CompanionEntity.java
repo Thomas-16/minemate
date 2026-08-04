@@ -12,6 +12,9 @@ import com.player2.playerengine.automaton.api.entity.LivingEntityInventory;
 import com.player2.playerengine.player2api.Character;
 
 import io.github.thomas16.minemate.MineMate;
+import io.github.thomas16.minemate.context.CompanionContext;
+import io.github.thomas16.minemate.context.CompanionJournal;
+import io.github.thomas16.minemate.planner.PlanExecutor;
 import io.github.thomas16.minemate.integration.CompanionDefensePolicy;
 import io.github.thomas16.minemate.integration.CompanionReflexTelemetry;
 import io.github.thomas16.minemate.integration.ReflexSnapshot;
@@ -23,6 +26,7 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
@@ -32,6 +36,7 @@ import net.minecraft.world.entity.HumanoidArm;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.GameRules;
@@ -68,6 +73,8 @@ public class CompanionEntity extends LivingEntity
     private PlayerEngineController controller;
     private TaskSupervisor supervisor;
     private CompanionReflexTelemetry reflexTelemetry;
+    private CompanionContext context;
+    private PlanExecutor planExecutor;
 
     private UUID ownerUuid;
     private Vec3 lastVelocity = Vec3.ZERO;
@@ -85,6 +92,8 @@ public class CompanionEntity extends LivingEntity
             CompanionDefensePolicy.install(this.controller);
             this.supervisor = new TaskSupervisor(this);
             this.reflexTelemetry = new CompanionReflexTelemetry(this, this.controller);
+            this.context = new CompanionContext(this);
+            this.planExecutor = new PlanExecutor(this);
         }
     }
 
@@ -103,12 +112,62 @@ public class CompanionEntity extends LivingEntity
         return reflexTelemetry == null ? null : reflexTelemetry.snapshot();
     }
 
+    /**
+     * How long the current reflex has been running, in ticks; 0 when idle.
+     *
+     * <p>{@link ReflexSnapshot#startedAtTick()} is measured against the telemetry's own counter
+     * rather than game time, so this is the only correct way to turn it into a duration.
+     */
+    public int reflexActiveTicks() {
+        if (reflexTelemetry == null || !reflexTelemetry.snapshot().active()) {
+            return 0;
+        }
+        return (int) Math.max(0L, reflexTelemetry.observedTicks() - reflexTelemetry.snapshot().startedAtTick());
+    }
+
+    /** Server-side only; null on the client. Owns the journal and the replan triggers. */
+    public CompanionContext getContext() {
+        return context;
+    }
+
+    /** Convenience for the common case; null on the client. */
+    public CompanionJournal getJournal() {
+        return context == null ? null : context.journal();
+    }
+
+    /** Server-side only; null on the client. */
+    public PlanExecutor getPlanExecutor() {
+        return planExecutor;
+    }
+
     public Optional<UUID> getOwnerUuid() {
         return Optional.ofNullable(ownerUuid);
     }
 
     public void setOwnerUuid(UUID ownerUuid) {
         this.ownerUuid = ownerUuid;
+    }
+
+    /**
+     * Server-side owner lookup. A loaded Fabric {@code FakePlayer} is not necessarily in the
+     * connected-player list, so the loaded-entity fallback is required for headless tests and
+     * for any owner whose player entity outlives its connection.
+     */
+    public Optional<ServerPlayer> resolveOwner() {
+        if (ownerUuid == null || this.getServer() == null || !(this.level() instanceof ServerLevel serverLevel)) {
+            return Optional.empty();
+        }
+        ServerPlayer connected = this.getServer().getPlayerList().getPlayer(ownerUuid);
+        if (connected != null) {
+            return Optional.of(connected);
+        }
+        return serverLevel.getEntity(ownerUuid) instanceof ServerPlayer loaded
+                ? Optional.of(loaded) : Optional.empty();
+    }
+
+    /** The owner, only when they are in this companion's level. Empty otherwise. */
+    public Optional<ServerPlayer> resolveOwnerInLevel() {
+        return resolveOwner().filter(owner -> owner.level() == this.level());
     }
 
     /** Plain-text identity intended for future planner and LLM context. */
@@ -159,6 +218,10 @@ public class CompanionEntity extends LivingEntity
             this.controller.serverTick();
             this.reflexTelemetry.tick();
             this.supervisor.tick();
+            // After the supervisor: it has published this tick's outcome, which is what the
+            // executor polls to decide whether to advance. Context goes last, on settled state.
+            this.planExecutor.tick();
+            this.context.tick();
         }
         super.tick();
         this.updateSwingTime();
@@ -168,10 +231,27 @@ public class CompanionEntity extends LivingEntity
     @Override
     public void remove(RemovalReason reason) {
         if (!this.level().isClientSide && this.controller != null) {
+            // Before the supervisor, so the plan reports its own terminal outcome rather than
+            // having it misattributed to the goal cancellation the supervisor is about to emit.
+            this.planExecutor.shutdown(Reasons.COMPANION_REMOVED);
             this.supervisor.shutdown(Reasons.COMPANION_REMOVED);
             this.controller.stop();
         }
         super.remove(reason);
+    }
+
+    /**
+     * Journals damage here rather than by watching health, because this is the only point where the
+     * attacker is still known.
+     */
+    @Override
+    public boolean hurt(DamageSource source, float amount) {
+        float before = this.getHealth();
+        boolean hurt = super.hurt(source, amount);
+        if (hurt && !this.level().isClientSide && this.context != null) {
+            this.context.onDamaged(source, before - this.getHealth());
+        }
+        return hurt;
     }
 
     @Override
@@ -195,12 +275,18 @@ public class CompanionEntity extends LivingEntity
             if (!itemEntity.isRemoved() && !itemEntity.getItem().isEmpty() && !itemEntity.hasPickUpDelay()) {
                 ItemStack stack = itemEntity.getItem();
                 int countBefore = stack.getCount();
+                // insertStack mutates the stack; a fully consumed one reports AIR afterwards,
+                // so the item has to be read before the call, not after.
+                Item picked = stack.getItem();
                 if (this.inventory.insertStack(stack)) {
                     int collected = countBefore - stack.getCount();
                     if (collected <= 0) {
                         continue;
                     }
                     this.take(itemEntity, collected);
+                    if (this.context != null) {
+                        this.context.onItemPickedUp(picked, collected);
+                    }
                     if (stack.isEmpty()) {
                         itemEntity.discard();
                     } else {

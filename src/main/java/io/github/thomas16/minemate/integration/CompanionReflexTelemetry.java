@@ -13,8 +13,6 @@ import com.player2.playerengine.tasks.base.TaskChain;
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.entity.CompanionEntity;
 
-import net.minecraft.server.level.ServerPlayer;
-
 import java.util.Objects;
 
 /** Samples automatic PlayerEngine chain ownership once per server-side entity tick. */
@@ -52,6 +50,15 @@ public final class CompanionReflexTelemetry {
 
     public ReflexSnapshot snapshot() {
         return snapshot;
+    }
+
+    /**
+     * Server ticks observed since this telemetry was constructed. {@link ReflexSnapshot#startedAtTick()}
+     * is measured on this same counter, so subtracting it from this value is the only way to get a
+     * reflex duration; neither number is a game tick.
+     */
+    public long observedTicks() {
+        return observedTicks;
     }
 
     private ReflexKind classify(TaskChain chain) {
@@ -108,12 +115,8 @@ public final class CompanionReflexTelemetry {
     }
 
     private double ownerDistance() {
-        if (companion.getServer() == null) {
-            return -1.0;
-        }
-        ServerPlayer owner = companion.getOwnerUuid()
-                .map(uuid -> companion.getServer().getPlayerList().getPlayer(uuid))
-                .orElse(null);
-        return owner == null || owner.level() != companion.level() ? -1.0 : companion.distanceTo(owner);
+        return companion.resolveOwnerInLevel()
+                .map(owner -> (double) companion.distanceTo(owner))
+                .orElse(-1.0);
     }
 }

@@ -6,8 +6,6 @@ import com.player2.playerengine.PlayerEngineController;
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.entity.CompanionEntity;
 
-import net.minecraft.server.level.ServerPlayer;
-
 /**
  * Keeps PlayerEngine's own mob defense on a leash to the companion's owner.
  *
@@ -57,9 +55,9 @@ public final class CompanionDefensePolicy {
             return;
         }
         boolean suppressed = controller.getShouldDefendFromHostiles();
-        ServerPlayer owner = owner(companion);
-        double distance = owner == null || owner.level() != companion.level()
-                ? -1.0 : companion.distanceTo(owner);
+        double distance = companion.resolveOwnerInLevel()
+                .map(owner -> (double) companion.distanceTo(owner))
+                .orElse(-1.0);
 
         boolean decision = distance < 0.0                      // nothing to leash against
                 || distance >= LEASH_TRIP                      // too far to let it wander further
@@ -71,14 +69,5 @@ public final class CompanionDefensePolicy {
                     companion.getUUID(), decision ? "suppressed" : "restored",
                     distance < 0.0 ? "unknown" : "%.1f".formatted(distance));
         }
-    }
-
-    private static ServerPlayer owner(CompanionEntity companion) {
-        if (companion.getServer() == null) {
-            return null;
-        }
-        return companion.getOwnerUuid()
-                .map(uuid -> companion.getServer().getPlayerList().getPlayer(uuid))
-                .orElse(null);
     }
 }

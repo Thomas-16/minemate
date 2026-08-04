@@ -1,12 +1,15 @@
 package io.github.thomas16.minemate;
 
 import io.github.thomas16.minemate.command.CompanionCommands;
+import io.github.thomas16.minemate.context.ReplanTriggers;
 import io.github.thomas16.minemate.debug.CompanionDebugNetworking;
 import io.github.thomas16.minemate.dev.DevAutoTest;
 import io.github.thomas16.minemate.entity.MineMateEntities;
 import io.github.thomas16.minemate.integration.PlayerEngineQuiet;
+import io.github.thomas16.minemate.planner.ScriptedPlanner;
 import io.github.thomas16.minemate.task.TaskListeners;
 import io.github.thomas16.minemate.task.sink.ChatTaskListener;
+import io.github.thomas16.minemate.task.sink.JournalTaskListener;
 import io.github.thomas16.minemate.task.sink.LoggingTaskListener;
 
 import net.fabricmc.api.ModInitializer;
@@ -37,6 +40,13 @@ public class MineMate implements ModInitializer {
 				(dispatcher, registryAccess, environment) -> CompanionCommands.register(dispatcher, registryAccess));
 		TaskListeners.register(new LoggingTaskListener());
 		TaskListeners.register(new ChatTaskListener());
+		// Before DevAutoTest, so the journal has recorded an outcome by the time the harness
+		// evaluates it on the same fan-out.
+		TaskListeners.register(new JournalTaskListener());
+		ReplanTriggers.registerGlobal((companion, trigger) -> LOGGER.debug(
+				"Replan trigger {} for companion {}: {}",
+				trigger.reason(), companion.getUUID(), trigger.detail()));
+		ScriptedPlanner.installDemoScripts();
 		DevAutoTest.init();
 		PlayerEngineQuiet.init();
 		LOGGER.info("MineMate initialized");

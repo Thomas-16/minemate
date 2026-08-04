@@ -171,16 +171,7 @@ public final class Goals {
     }
 
     private static ServerPlayer owner(CompanionEntity companion) {
-        UUID ownerUuid = companion.getOwnerUuid().orElse(null);
-        if (ownerUuid == null) {
-            return null;
-        }
-        ServerPlayer connected = companion.getServer().getPlayerList().getPlayer(ownerUuid);
-        if (connected != null) {
-            return connected;
-        }
-        Entity loaded = ((ServerLevel) companion.level()).getEntity(ownerUuid);
-        return loaded instanceof ServerPlayer serverPlayer ? serverPlayer : null;
+        return companion.resolveOwner().orElse(null);
     }
 
     private static int playerInventoryCount(ServerPlayer player, Item[] matches) {

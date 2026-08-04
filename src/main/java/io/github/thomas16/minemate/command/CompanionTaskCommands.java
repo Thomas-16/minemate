@@ -8,7 +8,8 @@ import com.player2.playerengine.TaskCatalogue;
 
 import io.github.thomas16.minemate.entity.CompanionEntity;
 import io.github.thomas16.minemate.task.Goal;
-import io.github.thomas16.minemate.task.Goals;
+import io.github.thomas16.minemate.tool.ToolCall;
+import io.github.thomas16.minemate.tool.ToolRegistry;
 
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.CommandBuildContext;
@@ -18,21 +19,24 @@ import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.commands.arguments.coordinates.ColumnPosArgument;
 import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
 import net.minecraft.commands.arguments.item.ItemArgument;
-import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ColumnPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.item.Item;
 
 import java.util.Collection;
 import java.util.List;
-import java.util.function.Function;
 
-/** Attaches the five temporary hardcoded task verbs to /companion. */
+/**
+ * Attaches the temporary hardcoded task verbs to /companion.
+ *
+ * <p>Brigadier still owns argument parsing and tab completion, but every verb now re-encodes its
+ * resolved arguments into a {@link ToolCall} and goes through {@link ToolRegistry}. That is
+ * deliberate duplication of effort: it makes the typed chat path and the planner path the same
+ * path, so a tool cannot behave one way when typed and another way when planned.
+ */
 final class CompanionTaskCommands {
-    private static final double ARRIVAL_RADIUS = 2.5;
 
     private CompanionTaskCommands() {
     }
@@ -56,80 +60,71 @@ final class CompanionTaskCommands {
                         .executes(ctx -> kill(ctx.getSource(), EntityArgument.getEntity(ctx, "target")))));
     }
 
-    private static LiteralArgumentBuilder<CommandSourceStack> itemCommand(String kind,
+    private static LiteralArgumentBuilder<CommandSourceStack> itemCommand(String tool,
             CommandBuildContext registryAccess) {
         RequiredArgumentBuilder<CommandSourceStack, ?> item = Commands.argument("item",
                 ItemArgument.item(registryAccess))
-                .executes(ctx -> production(ctx.getSource(), kind,
-                        ItemArgument.getItem(ctx, "item").getItem(), 1));
+                .executes(ctx -> runTool(ctx.getSource(), ToolCall.of(tool)
+                        .with("item", ItemArgument.getItem(ctx, "item").getItem())));
         item.then(Commands.argument("count", IntegerArgumentType.integer(1, 2304))
-                .executes(ctx -> production(ctx.getSource(), kind,
-                        ItemArgument.getItem(ctx, "item").getItem(),
-                        IntegerArgumentType.getInteger(ctx, "count"))));
-        return Commands.literal(kind).then(item);
+                .executes(ctx -> runTool(ctx.getSource(), ToolCall.of(tool)
+                        .with("item", ItemArgument.getItem(ctx, "item").getItem())
+                        .with("count", IntegerArgumentType.getInteger(ctx, "count")))));
+        return Commands.literal(tool).then(item);
     }
 
-    private static LiteralArgumentBuilder<CommandSourceStack> storageCommand(String kind,
+    private static LiteralArgumentBuilder<CommandSourceStack> storageCommand(String tool,
             CommandBuildContext registryAccess) {
         RequiredArgumentBuilder<CommandSourceStack, ?> container = Commands.argument("container",
                 BlockPosArgument.blockPos());
         RequiredArgumentBuilder<CommandSourceStack, ?> item = Commands.argument("item",
                 ItemArgument.item(registryAccess))
-                .executes(ctx -> storage(ctx.getSource(), kind,
-                        BlockPosArgument.getLoadedBlockPos(ctx, "container"),
-                        ItemArgument.getItem(ctx, "item").getItem(), 1));
+                .executes(ctx -> runTool(ctx.getSource(), ToolCall.of(tool)
+                        .with("container", BlockPosArgument.getLoadedBlockPos(ctx, "container"))
+                        .with("item", ItemArgument.getItem(ctx, "item").getItem())));
         item.then(Commands.argument("count", IntegerArgumentType.integer(1, 2304))
-                .executes(ctx -> storage(ctx.getSource(), kind,
-                        BlockPosArgument.getLoadedBlockPos(ctx, "container"),
-                        ItemArgument.getItem(ctx, "item").getItem(),
-                        IntegerArgumentType.getInteger(ctx, "count"))));
+                .executes(ctx -> runTool(ctx.getSource(), ToolCall.of(tool)
+                        .with("container", BlockPosArgument.getLoadedBlockPos(ctx, "container"))
+                        .with("item", ItemArgument.getItem(ctx, "item").getItem())
+                        .with("count", IntegerArgumentType.getInteger(ctx, "count")))));
         container.then(item);
-        return Commands.literal(kind).then(container);
+        return Commands.literal(tool).then(container);
     }
 
-    private static LiteralArgumentBuilder<CommandSourceStack> resourceCommand(String kind) {
+    private static LiteralArgumentBuilder<CommandSourceStack> resourceCommand(String tool) {
         RequiredArgumentBuilder<CommandSourceStack, String> resource = Commands
                 .argument("resource", StringArgumentType.word())
                 .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ResourceNames.values(), builder))
-                .executes(ctx -> collect(ctx.getSource(), kind,
-                        StringArgumentType.getString(ctx, "resource"), 1));
+                .executes(ctx -> runTool(ctx.getSource(), ToolCall.of(tool)
+                        .with("resource", StringArgumentType.getString(ctx, "resource"))));
         resource.then(Commands.argument("count", IntegerArgumentType.integer(1, 2304))
-                .executes(ctx -> collect(ctx.getSource(), kind,
-                        StringArgumentType.getString(ctx, "resource"),
-                        IntegerArgumentType.getInteger(ctx, "count"))));
-        return Commands.literal(kind).then(resource);
+                .executes(ctx -> runTool(ctx.getSource(), ToolCall.of(tool)
+                        .with("resource", StringArgumentType.getString(ctx, "resource"))
+                        .with("count", IntegerArgumentType.getInteger(ctx, "count")))));
+        return Commands.literal(tool).then(resource);
     }
 
+    /**
+     * The sender's name is filled in explicitly so a bare {@code /companion follow} keeps following
+     * whoever typed it. The tool's owner fallback then only applies to planner-issued calls.
+     */
     private static int follow(CommandSourceStack source, ServerPlayer requestedTarget) {
         ServerPlayer sender = CompanionCommands.requirePlayer(source);
         if (sender == null) {
             return 0;
         }
         ServerPlayer target = requestedTarget == null ? sender : requestedTarget;
-        return executeGoal(source, companion -> Goals.follow(target, 3.0));
-    }
-
-    private static int collect(CommandSourceStack source, String kind, String resource, int count) {
-        return executeGoal(source, companion -> "mine".equals(kind)
-                ? Goals.mine(resource, count) : Goals.fetch(resource, count));
-    }
-
-    private static int production(CommandSourceStack source, String kind, Item item, int count) {
-        return executeGoal(source, companion -> "craft".equals(kind)
-                ? Goals.craft(companion, item, count) : Goals.smelt(companion, item, count));
-    }
-
-    private static int storage(CommandSourceStack source, String kind, BlockPos container,
-            Item item, int count) {
-        return executeGoal(source, companion -> "deposit".equals(kind)
-                ? Goals.deposit(companion, container, item, count)
-                : Goals.withdraw(companion, container, item, count));
+        return runTool(source, ToolCall.of("follow").with("player", target.getGameProfile().getName()));
     }
 
     private static int goTo(CommandSourceStack source, ColumnPos position) {
-        return executeGoal(source, companion -> Goals.goTo(position.x(), position.z(), ARRIVAL_RADIUS));
+        return runTool(source, ToolCall.of("goto").with("x", position.x()).with("z", position.z()));
     }
 
+    /**
+     * Authorization guards stay here — they are about who may be targeted from chat, not about the
+     * call's shape. The tool's own self/owner guard still protects planner-issued calls.
+     */
     private static int kill(CommandSourceStack source, Entity target) {
         ServerPlayer sender = CompanionCommands.requirePlayer(source);
         if (sender == null) {
@@ -144,15 +139,14 @@ final class CompanionTaskCommands {
             source.sendFailure(Component.literal("The companion cannot attack that target"));
             return 0;
         }
-        if (!(target.level() instanceof ServerLevel level)) {
+        if (!(target.level() instanceof ServerLevel)) {
             source.sendFailure(Component.literal("Target is not in a server world"));
             return 0;
         }
-        return submit(source, companion,
-                () -> Goals.killEntity(level, target.getUUID(), target.getName().getString()));
+        return runTool(source, ToolCall.of("kill").with("target", target.getUUID()));
     }
 
-    private static int executeGoal(CommandSourceStack source, Function<CompanionEntity, Goal> factory) {
+    private static int runTool(CommandSourceStack source, ToolCall call) {
         ServerPlayer player = CompanionCommands.requirePlayer(source);
         if (player == null) {
             return 0;
@@ -162,28 +156,13 @@ final class CompanionTaskCommands {
             source.sendFailure(Component.literal("No companion nearby - /companion spawn first"));
             return 0;
         }
-        return submit(source, companion, () -> factory.apply(companion));
-    }
-
-    private static int submit(CommandSourceStack source, CompanionEntity companion, GoalFactory factory) {
-        try {
-            Goal goal = factory.create();
-            companion.getSupervisor().replace(goal);
-            source.sendSuccess(() -> Component.literal("Ordered companion to " + goal.description()), false);
-            return 1;
-        } catch (IllegalArgumentException error) {
-            String message = error.getMessage() == null ? "Invalid companion task" : error.getMessage();
-            if (message.startsWith("unknown_resource:")) {
-                message = "Unknown resource: " + message.substring("unknown_resource:".length()).trim();
-            }
-            source.sendFailure(Component.literal(message));
+        Goal goal = CompanionCommands.buildTool(source, companion, call);
+        if (goal == null) {
             return 0;
         }
-    }
-
-    @FunctionalInterface
-    private interface GoalFactory {
-        Goal create();
+        companion.getSupervisor().replace(goal);
+        source.sendSuccess(() -> Component.literal("Ordered companion to " + goal.description()), false);
+        return 1;
     }
 
     /** Defers TaskCatalogue initialization until Brigadier actually requests suggestions. */

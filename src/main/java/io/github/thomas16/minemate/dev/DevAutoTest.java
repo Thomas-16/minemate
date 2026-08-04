@@ -46,6 +46,22 @@ import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import io.github.thomas16.minemate.context.CompanionJournal;
+import io.github.thomas16.minemate.context.JournalEntry;
+import io.github.thomas16.minemate.context.WorldSnapshot;
+import io.github.thomas16.minemate.planner.Plan;
+import io.github.thomas16.minemate.planner.PlanExecutor;
+import io.github.thomas16.minemate.planner.PlanOutcome;
+import io.github.thomas16.minemate.planner.PlanRequest;
+import io.github.thomas16.minemate.planner.PlanStatus;
+import io.github.thomas16.minemate.planner.PlanStep;
+import io.github.thomas16.minemate.planner.PlanStepOutcome;
+import io.github.thomas16.minemate.planner.PlannerDispatch;
+import io.github.thomas16.minemate.planner.ScriptedPlanner;
+import io.github.thomas16.minemate.tool.ToolCall;
+import io.github.thomas16.minemate.tool.ToolRegistry;
+import io.github.thomas16.minemate.tool.ToolValidation;
+
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -74,13 +90,17 @@ public final class DevAutoTest {
             "smelt_success",
             "smelt_wall_reach",
             "deposit_success",
-            "container_missing");
+            "container_missing",
+            "plan_multi_step",
+            "plan_step_failure_aborts");
     private static final UUID FAKE_OWNER_UUID =
             UUID.fromString("bbf6e9b1-075b-4d78-928d-a73cc6c6155f");
     private static final UUID FRIENDLY_FIRE_OWNER_UUID =
             UUID.fromString("5ec29e35-81d1-4c23-aef9-0e394daaf52d");
     private static final UUID DEBUG_VIEWER_UUID =
             UUID.fromString("e1cdca3b-20c4-4853-9352-474eb62406b7");
+    private static final UUID CONTEXT_OWNER_UUID =
+            UUID.fromString("3a0d9d64-6a5a-4f1e-8f2b-2b1f5c8c1a77");
 
     private static CompanionEntity companion;
     private static FakePlayer fakeOwner;
@@ -96,6 +116,7 @@ public final class DevAutoTest {
     private static boolean sawMobDefenseClear;
     private static boolean sawStorageReach;
     private static boolean sawFurnaceReach;
+    private static boolean planSawForbiddenGoal;
     private static boolean ownerDamageAccepted;
     private static boolean ownerDirectAttackBlocked;
     private static float companionHealthBeforeOwnerDamage;
@@ -108,6 +129,9 @@ public final class DevAutoTest {
     private static int globalTicks;
     private static Goal currentGoal;
     private static TaskOutcome currentOutcome;
+    private static Plan currentPlan;
+    private static PlanOutcome currentPlanOutcome;
+    private static String planOutcomeBaseline = "";
     private static boolean advanceRequested;
     private static int advanceNotBeforeTick = -1;
     private static String listenerFailure;
@@ -128,7 +152,9 @@ public final class DevAutoTest {
         TaskListeners.register(new TaskListener() {
             @Override
             public void onGoalFinished(CompanionEntity finishedCompanion, Goal goal, TaskOutcome outcome) {
-                if (done || finishedCompanion != companion) {
+                // A plan legitimately produces several goal outcomes that no currentGoal matches,
+                // so the goal-identity checks below only apply to goal-shaped scenarios.
+                if (done || finishedCompanion != companion || inPlanScenario()) {
                     return;
                 }
                 if (currentGoal == null || !currentGoal.id().equals(goal.id())) {
@@ -171,6 +197,13 @@ public final class DevAutoTest {
         } catch (IllegalArgumentException expected) {
             MineMate.LOGGER.info("[autotest] unknown_resource PASS");
         }
+
+        String registryViolation = toolRegistryViolation();
+        if (registryViolation != null) {
+            fail(server, "tool registry: " + registryViolation);
+            return;
+        }
+        MineMate.LOGGER.info("[autotest] tool_registry PASS");
 
         scenarios = List.of(
                 new Scenario("debug_snapshot",
@@ -363,6 +396,60 @@ public final class DevAutoTest {
                         1200,
                         ignoredServer -> prepareEatingReflex(),
                         ignoredServer -> clearFixtures(),
+                        () -> null),
+                new Scenario("context_journal",
+                        ignored -> reflexObservationGoal(),
+                        DevAutoTest::acceptContextJournal,
+                        400,
+                        ignoredServer -> prepareContextJournal(),
+                        DevAutoTest::clearContextJournal,
+                        DevAutoTest::contextJournalInvariant),
+                Scenario.plan("plan_multi_step",
+                        ignored -> planOf("stash and retrieve",
+                                ToolCall.of("deposit").with("container", storagePos)
+                                        .with("item", Items.DIRT).with("count", 4),
+                                ToolCall.of("withdraw").with("container", storagePos)
+                                        .with("item", Items.DIRT).with("count", 4),
+                                ToolCall.of("goto").with("x", spawn.getX() + 8)
+                                        .with("z", spawn.getZ())),
+                        DevAutoTest::acceptPlanMultiStep,
+                        1800,
+                        ignoredServer -> preparePlanMultiStep(),
+                        ignoredServer -> clearFixtures(),
+                        () -> null),
+                Scenario.plan("plan_step_failure_aborts",
+                        ignored -> planOf("smelt then keep working",
+                                ToolCall.of("smelt").with("item", Items.COBBLESTONE).with("count", 1),
+                                ToolCall.of("mine").with("resource", "dirt").with("count", 1),
+                                ToolCall.of("goto").with("x", spawn.getX() + 8)
+                                        .with("z", spawn.getZ())),
+                        DevAutoTest::acceptPlanStepFailureAborts,
+                        1200,
+                        ignoredServer -> {
+                            planSawForbiddenGoal = false;
+                            prepareFurnace(new ItemStack(Items.COBBLESTONE, 1));
+                        },
+                        ignoredServer -> clearFixtures(),
+                        DevAutoTest::planAbortInvariant),
+                Scenario.plan("plan_invalid_tool_rejected",
+                        ignored -> null,
+                        DevAutoTest::acceptPlanInvalidTool,
+                        200,
+                        DevAutoTest::preparePlanInvalidTool,
+                        ignoredServer -> {
+                            ScriptedPlanner.instance().clear();
+                            clearFixtures();
+                        },
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.plan("plan_owner_cancel",
+                        ignored -> planOf("go a very long way",
+                                ToolCall.of("goto").with("x", spawn.getX() + 100_000)
+                                        .with("z", spawn.getZ()),
+                                ToolCall.of("mine").with("resource", "dirt").with("count", 1)),
+                        DevAutoTest::acceptPlanOwnerCancel,
+                        400,
+                        ignoredServer -> prepareInventory(),
+                        ignoredServer -> clearFixtures(),
                         () -> null));
         String selectedScenario = System.getProperty("minemate.autotest.scenario", "").trim();
         if (!selectedScenario.isEmpty()) {
@@ -437,6 +524,21 @@ public final class DevAutoTest {
                 fail(server, "debug snapshot invalid: " + debugViolation);
                 return;
             }
+            String contextViolation = contextInvariant();
+            if (contextViolation != null) {
+                fail(server, "world context invalid: " + contextViolation);
+                return;
+            }
+        }
+        if (inPlanScenario() && currentPlanOutcome == null) {
+            PlanOutcome outcome = companion.getPlanExecutor().lastOutcome().orElse(null);
+            boolean mine = outcome != null && (currentPlan != null
+                    ? outcome.planId().equals(currentPlan.id())
+                    : !outcome.planId().equals(planOutcomeBaseline));
+            if (mine) {
+                currentPlanOutcome = outcome;
+                advanceRequested = true;
+            }
         }
         if (advanceRequested) {
             if (advanceNotBeforeTick < 0) {
@@ -459,6 +561,10 @@ public final class DevAutoTest {
         if ("cancel".equals(scenario.name()) && scenarioTicks == 40) {
             companion.getSupervisor().cancel(Reasons.CANCELLED_BY_OWNER);
         }
+        if ("plan_owner_cancel".equals(scenario.name()) && scenarioTicks == 40) {
+            // The same shape as /companion stop: cancel the plan, not just the running goal.
+            companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
+        }
         if (scenarioTicks > scenario.hardCapTicks()) {
             fail(server, scenario.name() + " exceeded its hard cap");
         }
@@ -467,29 +573,53 @@ public final class DevAutoTest {
     private static void startScenario(MinecraftServer server) {
         Scenario scenario = scenarios.get(scenarioIndex);
         scenarioTicks = 0;
+        currentGoal = null;
         currentOutcome = null;
+        currentPlan = null;
+        currentPlanOutcome = null;
         advanceRequested = false;
         advanceNotBeforeTick = -1;
+        planOutcomeBaseline = companion.getPlanExecutor().lastOutcome()
+                .map(PlanOutcome::planId).orElse("");
         scenario.setup().accept(server);
-        currentGoal = scenario.goal().apply(companion);
-        if (companion.getSupervisor().submit(currentGoal)
-                != io.github.thomas16.minemate.task.TaskSupervisor.SubmitResult.ACCEPTED) {
-            fail(server, scenario.name() + " was not accepted");
-            return;
+        if (scenario.isPlan()) {
+            currentPlan = scenario.plan().apply(companion);
+            if (currentPlan != null) {
+                // ACCEPTED and REJECTED are both legal starts: a rejected plan publishes its
+                // outcome immediately, which is exactly what the rejection scenario asserts on.
+                if (companion.getPlanExecutor().start(currentPlan) == PlanExecutor.StartResult.BUSY) {
+                    fail(server, scenario.name() + " plan was refused as busy");
+                    return;
+                }
+            }
+        } else {
+            currentGoal = scenario.goal().apply(companion);
+            if (companion.getSupervisor().submit(currentGoal)
+                    != io.github.thomas16.minemate.task.TaskSupervisor.SubmitResult.ACCEPTED) {
+                fail(server, scenario.name() + " was not accepted");
+                return;
+            }
         }
         MineMate.LOGGER.info("[autotest] {} START", scenario.name());
     }
 
     private static void finishScenario(MinecraftServer server) {
         Scenario scenario = scenarios.get(scenarioIndex);
-        boolean accepted = currentOutcome != null && scenario.accepts().test(currentOutcome);
+        boolean accepted;
+        String rendered;
+        if (scenario.isPlan()) {
+            accepted = currentPlanOutcome != null && scenario.acceptsPlan().test(currentPlanOutcome);
+            rendered = currentPlanOutcome == null ? "no outcome" : currentPlanOutcome.toCompactString();
+        } else {
+            accepted = currentOutcome != null && scenario.accepts().test(currentOutcome);
+            rendered = currentOutcome == null ? "no outcome" : currentOutcome.toCompactString();
+        }
         scenario.teardown().accept(server);
         if (!accepted) {
-            fail(server, scenario.name() + " returned "
-                    + (currentOutcome == null ? "no outcome" : currentOutcome.toCompactString()));
+            fail(server, scenario.name() + " returned " + rendered);
             return;
         }
-        MineMate.LOGGER.info("[autotest] {} PASS - {}", scenario.name(), currentOutcome.toCompactString());
+        MineMate.LOGGER.info("[autotest] {} PASS - {}", scenario.name(), rendered);
         scenarioIndex++;
         if (scenarioIndex >= scenarios.size()) {
             done = true;
@@ -593,6 +723,319 @@ public final class DevAutoTest {
             return "companion inventory changed before the furnace was reachable";
         }
         return null;
+    }
+
+    private static Plan planOf(String requestText, ToolCall... calls) {
+        List<PlanStep> steps = new ArrayList<>(calls.length);
+        for (ToolCall call : calls) {
+            steps.add(PlanStep.of(call));
+        }
+        return Plan.of(requestText, steps);
+    }
+
+    private static void preparePlanMultiStep() {
+        prepareStorage(0);
+        insert(new ItemStack(Items.DIRT, 4));
+    }
+
+    private static boolean acceptPlanMultiStep(PlanOutcome outcome) {
+        boolean accepted = outcome.status() == PlanStatus.SUCCEEDED
+                && outcome.completedSteps() == 3
+                && outcome.stepOutcomes().size() == 3
+                && outcome.stepOutcomes().stream().allMatch(PlanStepOutcome::succeeded)
+                && inventoryCount(Items.DIRT) == 4;
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] plan_multi_step postcondition {} held={}",
+                    outcome.toCompactString(), inventoryCount(Items.DIRT));
+        }
+        return accepted;
+    }
+
+    /**
+     * Proves the executor abandons a plan at the first failing step. The furnace fixture is the one
+     * {@code smelt_no_fuel} already relies on, so the failure itself is known-good.
+     */
+    private static boolean acceptPlanStepFailureAborts(PlanOutcome outcome) {
+        boolean accepted = outcome.status() == PlanStatus.BLOCKED
+                && (Reasons.NO_FUEL.equals(outcome.reason())
+                        || Reasons.SETUP_FAILED.equals(outcome.reason()))
+                && outcome.completedSteps() == 0
+                && outcome.stepOutcomes().size() == 1;
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] plan_step_failure_aborts postcondition {} steps={}",
+                    outcome.toCompactString(), outcome.stepOutcomes().size());
+        }
+        return accepted;
+    }
+
+    /** The steps after the failing one must never have been submitted at all. */
+    private static String planAbortInvariant() {
+        if (planSawForbiddenGoal) {
+            return "a step after the failing one was submitted";
+        }
+        companion.getSupervisor().currentGoal().ifPresent(goal -> {
+            if ("mine".equals(goal.kind()) || "goto".equals(goal.kind())) {
+                planSawForbiddenGoal = true;
+            }
+        });
+        return null;
+    }
+
+    private static void preparePlanInvalidTool(MinecraftServer server) {
+        prepareInventory();
+        ScriptedPlanner planner = ScriptedPlanner.instance();
+        planner.clear();
+        planner.bind(companion);
+        planner.setDelayMs(0L);
+        // Raw planner JSON on purpose: this is the exact parse and validation path a stage-5
+        // model's output takes, and the only headless coverage of it.
+        planner.scriptRaw("bad plan", "["
+                + "{\"tool\":\"mine\",\"arguments\":{\"resource\":\"dirt\",\"count\":1}},"
+                + "{\"tool\":\"mine\",\"arguments\":{\"resource\":\"unobtainium\",\"count\":1}},"
+                + "{\"tool\":\"goto\",\"arguments\":{\"x\":0,\"z\":0}}]");
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        PlannerDispatch.request(companion, planner, new PlanRequest("bad plan", snapshot,
+                snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
+    }
+
+    private static boolean acceptPlanInvalidTool(PlanOutcome outcome) {
+        boolean accepted = outcome.status() == PlanStatus.REJECTED
+                && Reasons.UNKNOWN_RESOURCE.equals(outcome.reason())
+                && outcome.stepOutcomes().isEmpty()
+                && outcome.completedSteps() == 0
+                && ScriptedPlanner.instance().requestCount() > 0;
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] plan_invalid_tool_rejected postcondition {} requests={}",
+                    outcome.toCompactString(), ScriptedPlanner.instance().requestCount());
+        }
+        return accepted;
+    }
+
+    /** A rejected plan must not have moved the companion: nothing may ever reach the supervisor. */
+    private static String planRejectionInvariant() {
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            planSawForbiddenGoal = true;
+            return "a rejected plan still submitted a goal";
+        }
+        return null;
+    }
+
+    private static boolean acceptPlanOwnerCancel(PlanOutcome outcome) {
+        boolean accepted = outcome.status() == PlanStatus.CANCELLED
+                && Reasons.CANCELLED_BY_OWNER.equals(outcome.reason())
+                && outcome.completedSteps() == 0
+                && !companion.getPlanExecutor().isActive();
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] plan_owner_cancel postcondition {} active={}",
+                    outcome.toCompactString(), companion.getPlanExecutor().isActive());
+        }
+        return accepted;
+    }
+
+    private static void prepareContextJournal() {
+        prepareInventory(new ItemStack(Items.DIRT, 3));
+        prepareFakeOwner(CONTEXT_OWNER_UUID, "MineMateContextOwner");
+        // Logged once per run so the text a planner actually receives is reviewable, not inferred.
+        MineMate.LOGGER.info("[autotest] world context sample:\n{}",
+                companion.getContext().snapshot().render());
+    }
+
+    /**
+     * Asserts the snapshot and journal describe a populated world, and — the point of the scenario
+     * — that replan triggers stay rare while the companion ticks at 20 Hz.
+     */
+    private static String contextJournalInvariant() {
+        String violation = contextInvariant();
+        if (violation != null) {
+            return violation;
+        }
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        if (!snapshot.owner().present()) {
+            return "the owner was missing from the snapshot";
+        }
+        if (snapshot.self().maxHealth() <= 0.0F) {
+            return "self state was not populated";
+        }
+        if (snapshot.dimension().isEmpty()) {
+            return "the dimension was missing";
+        }
+        // Five brakes gate firing; over a scenario this short the ceiling is a handful.
+        int fired = companion.getContext().triggers().firedCount();
+        if (fired > 4) {
+            return "replan triggers fired " + fired + " times in one short scenario";
+        }
+        return null;
+    }
+
+    private static boolean acceptContextJournal(TaskOutcome outcome) {
+        // A floor as well as the invariant's ceiling. The ceiling alone is satisfied by a trigger
+        // system that fires nothing at all, which is exactly how a broken global cooldown reads.
+        // The goal's own outcome arms TASK_OUTCOME, and the settle tick before this runs dispatches
+        // it, so anything less than one means the dispatch path is dead.
+        int fired = companion.getContext().triggers().firedCount();
+        boolean accepted = succeeded(outcome) && companion.getJournal().size() > 0 && fired >= 1;
+        if (!accepted) {
+            MineMate.LOGGER.error(
+                    "[autotest] context_journal postcondition entries={} triggers={} render=\n{}",
+                    companion.getJournal().size(), fired, companion.getContext().snapshot().render());
+        }
+        return accepted;
+    }
+
+    private static void clearContextJournal(MinecraftServer server) {
+        clearFakeOwner();
+        clearFixtures();
+    }
+
+    private static boolean inPlanScenario() {
+        return scenarioIndex < scenarios.size() && scenarios.get(scenarioIndex).isPlan();
+    }
+
+    /**
+     * Runs against every scenario, not just the context one: the snapshot is read by the planner on
+     * any tick, so it must never throw, blow its budget, or emit non-ASCII in any world state.
+     */
+    private static String contextInvariant() {
+        if (companion == null || companion.getContext() == null) {
+            return null;
+        }
+        WorldSnapshot snapshot;
+        String rendered;
+        try {
+            snapshot = companion.getContext().snapshot();
+            rendered = snapshot.render();
+        } catch (Throwable error) {
+            return "capture or render threw " + error;
+        }
+        if (rendered.isBlank()) {
+            return "render produced nothing";
+        }
+        if (rendered.length() > WorldSnapshot.RenderBudget.DEFAULT.maxChars()) {
+            return "render was " + rendered.length() + " chars, over budget";
+        }
+        for (int index = 0; index < rendered.length(); index++) {
+            char character = rendered.charAt(index);
+            if (character > 127) {
+                return "render emitted a non-ASCII character at " + index;
+            }
+        }
+        if (!rendered.startsWith("SELF ") || !rendered.contains("\nWORLD ")) {
+            return "render lost a mandatory section";
+        }
+        // Memoized per game tick: a second capture in the same tick must be the same instance.
+        if (companion.getContext().snapshot() != snapshot) {
+            return "snapshot was recaptured within a single tick";
+        }
+        if (companion.getJournal().size() > CompanionJournal.CAPACITY) {
+            return "journal grew past its capacity";
+        }
+        long previous = Long.MIN_VALUE;
+        for (JournalEntry entry : companion.getJournal().since(Long.MIN_VALUE)) {
+            if (entry.gameTime() < previous) {
+                return "journal entries are out of order";
+            }
+            previous = entry.gameTime();
+        }
+        return null;
+    }
+
+    /**
+     * Schema-level checks on the tool registry. These cost no ticks and cover the rejection paths a
+     * planner will hit constantly, which the goal scenarios cannot reach because they call
+     * {@code Goals.*} directly.
+     */
+    private static String toolRegistryViolation() {
+        ToolRegistry registry = ToolRegistry.defaults();
+        if (registry.tools().size() != 9) {
+            return "expected 9 tools, found " + registry.tools().size();
+        }
+        String rejected = expectRejected(registry, ToolCall.of("teleport"), Reasons.UNKNOWN_TOOL);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry, ToolCall.of("mine"), Reasons.MISSING_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                ToolCall.of("mine").with("resource", "dirt").with("count", 9999),
+                Reasons.ARGUMENT_OUT_OF_RANGE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                ToolCall.of("mine").with("resource", "unobtainium"), Reasons.UNKNOWN_RESOURCE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                ToolCall.of("mine").with("resource", "dirt").with("sideways", 1),
+                Reasons.UNKNOWN_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                ToolCall.of("craft").with("item", "minecraft:unobtainium"), Reasons.UNKNOWN_ITEM);
+        if (rejected != null) {
+            return rejected;
+        }
+        // NaN passes both range comparisons, so without an explicit finite check it would validate
+        // and reach pathfinding as a value nothing downstream can recognise.
+        rejected = expectRejected(registry,
+                ToolCall.of("goto").with("x", 0).with("z", 0).with("radius", "NaN"),
+                Reasons.INVALID_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                ToolCall.of("goto").with("x", 0).with("z", 0).with("radius", "Infinity"),
+                Reasons.INVALID_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+
+        // A count arriving as a JSON string is the most common real planner slip; coerce it.
+        ToolValidation coerced = registry.validate(
+                ToolCall.of("mine").with("resource", "dirt").with("count", "4"));
+        if (!(coerced instanceof ToolValidation.Accepted accepted)) {
+            return "a string count was not coerced: " + ((ToolValidation.Rejected) coerced).reason();
+        }
+        if (accepted.arguments().getInt("count") != 4) {
+            return "a string count coerced to " + accepted.arguments().getInt("count");
+        }
+
+        // An omitted optional argument must arrive as its declared default.
+        ToolValidation defaulted = registry.validate(ToolCall.of("mine").with("resource", "dirt"));
+        if (!(defaulted instanceof ToolValidation.Accepted withDefault)
+                || withDefault.arguments().getInt("count") != 1) {
+            return "the count default was not applied";
+        }
+
+        // The raw-JSON path a planner uses must survive malformed input rather than throwing.
+        if (ToolCall.parseList("{\"not\":\"an array\"}") != null
+                || ToolCall.parseList("[{\"missing\":\"tool\"}]") != null
+                || ToolCall.parseList("not json at all") != null) {
+            return "malformed planner JSON was accepted";
+        }
+        List<ToolCall> parsed = ToolCall.parseList(
+                "[{\"tool\":\"mine\",\"arguments\":{\"resource\":\"dirt\",\"count\":2}}]");
+        if (parsed == null || parsed.size() != 1
+                || !(registry.validate(parsed.get(0)) instanceof ToolValidation.Accepted)) {
+            return "a well formed planner call did not parse and validate";
+        }
+        if (registry.schemaJson().isBlank() || !registry.schemaJson().contains("input_schema")) {
+            return "the tool schema was not emitted";
+        }
+        return null;
+    }
+
+    private static String expectRejected(ToolRegistry registry, ToolCall call, String expectedReason) {
+        ToolValidation validation = registry.validate(call);
+        if (!(validation instanceof ToolValidation.Rejected rejected)) {
+            return call.toCompactString() + " was accepted; expected " + expectedReason;
+        }
+        return expectedReason.equals(rejected.reason()) ? null
+                : call.toCompactString() + " gave " + rejected.reason() + ", expected " + expectedReason;
     }
 
     private static boolean acceptMobDefenseReflex(TaskOutcome outcome) {
@@ -838,6 +1281,11 @@ public final class DevAutoTest {
         companion.getHungerManager().setSaturationLevel(5.0F);
         removeContainerFixtureWithoutDrops(level, storagePos);
         removeContainerFixtureWithoutDrops(level, furnacePos);
+        // Every scenario setup funnels through here, so this is the one place that stops one
+        // scenario's damage, pickups and triggers from being read as another's context.
+        if (companion.getContext() != null) {
+            companion.getContext().reset();
+        }
         for (ItemStack stack : stacks) {
             insert(stack.copy());
         }
@@ -1260,16 +1708,47 @@ public final class DevAutoTest {
      * @param teardown  undoes {@code setup}, on pass and on fail alike, so scenarios stay isolated
      * @param invariant checked every tick; a non-null return fails the scenario with that message
      */
-    private record Scenario(String name, Function<CompanionEntity, Goal> goal,
-            Predicate<TaskOutcome> accepts, int hardCapTicks,
+    /**
+     * A scenario is either goal-shaped (submit one goal, assert its {@link TaskOutcome}) or
+     * plan-shaped (run a plan, assert its {@link PlanOutcome}); the unused pair of fields is null.
+     *
+     * <p>The two goal-shaped convenience constructors keep every pre-existing scenario literal
+     * compiling unchanged, so adding plan support cannot perturb the goal suite.
+     *
+     * <p>A plan-shaped scenario whose {@code plan} factory returns null is one the setup dispatched
+     * asynchronously; the harness then watches for any plan outcome it has not already seen.
+     */
+    private record Scenario(String name,
+            Function<CompanionEntity, Goal> goal, Predicate<TaskOutcome> accepts,
+            Function<CompanionEntity, Plan> plan, Predicate<PlanOutcome> acceptsPlan,
+            int hardCapTicks,
             Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
             Supplier<String> invariant) {
 
         private Scenario(String name, Function<CompanionEntity, Goal> goal,
                 Predicate<TaskOutcome> accepts, int hardCapTicks) {
-            this(name, goal, accepts, hardCapTicks, server -> {
+            this(name, goal, accepts, null, null, hardCapTicks, server -> {
             }, server -> {
             }, () -> null);
+        }
+
+        private Scenario(String name, Function<CompanionEntity, Goal> goal,
+                Predicate<TaskOutcome> accepts, int hardCapTicks,
+                Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
+                Supplier<String> invariant) {
+            this(name, goal, accepts, null, null, hardCapTicks, setup, teardown, invariant);
+        }
+
+        private static Scenario plan(String name, Function<CompanionEntity, Plan> plan,
+                Predicate<PlanOutcome> acceptsPlan, int hardCapTicks,
+                Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
+                Supplier<String> invariant) {
+            return new Scenario(name, null, null, plan, acceptsPlan, hardCapTicks,
+                    setup, teardown, invariant);
+        }
+
+        private boolean isPlan() {
+            return acceptsPlan != null;
         }
     }
 

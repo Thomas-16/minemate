@@ -35,6 +35,19 @@ public final class Reasons {
     public static final String CONTAINER_UNSUPPORTED = "container_unsupported";
     public static final String CONTAINER_CHANGED = "container_changed";
 
+    // Stage 4: typed tool-call validation. These reject a request before any task is submitted.
+    public static final String UNKNOWN_TOOL = "unknown_tool";
+    public static final String UNKNOWN_ARGUMENT = "unknown_argument";
+    public static final String MISSING_ARGUMENT = "missing_argument";
+    public static final String INVALID_ARGUMENT = "invalid_argument";
+    public static final String ARGUMENT_OUT_OF_RANGE = "argument_out_of_range";
+    public static final String UNKNOWN_ITEM = "unknown_item";
+
+    // Stage 4: multi-step plan execution.
+    public static final String PLAN_EMPTY = "plan_empty";
+    public static final String PLAN_TOO_LONG = "plan_too_long";
+    public static final String PLANNER_UNAVAILABLE = "planner_unavailable";
+
     private Reasons() {
     }
 }

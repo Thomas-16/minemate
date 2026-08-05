@@ -289,6 +289,7 @@ public final class Goals {
         private String acquisitionFailure;
         private int ownerBaseline;
         private boolean acquisitionComplete;
+        private boolean acquisitionTicked;
         private boolean done;
 
         private OwnerGiveItemTask(String resource, int count, Item[] matches) {
@@ -301,6 +302,7 @@ public final class Goals {
         protected void onStart() {
             done = false;
             acquisitionComplete = false;
+            acquisitionTicked = false;
             acquisitionFailure = null;
             acquisition = null;
             delivery = null;
@@ -335,12 +337,19 @@ public final class Goals {
                 } else {
                     if (acquisition == null) {
                         acquisition = createAcquisitionTask();
+                        acquisitionTicked = false;
                     }
-                    if (acquisition.stopped() || acquisition.isFinished()) {
+                    // Only after the runner has had it. PlayerEngine assigns a task's controller
+                    // when it first ticks it, and ResourceTask.isFinished dereferences that
+                    // controller, so asking a freshly created task whether it is finished throws
+                    // and takes the server down with it. It never showed up for oak_boat because
+                    // that resolves to a craft macro, whose isFinished touches no controller.
+                    if (acquisitionTicked && (acquisition.stopped() || acquisition.isFinished())) {
                         acquisitionFailure = resourceFailureInTree().orElse(Reasons.RESOURCE_UNAVAILABLE);
                         fail(acquisitionFailure);
                         return null;
                     }
+                    acquisitionTicked = true;
                     setDebugState("Acquiring " + resource + " for owner");
                     return acquisition;
                 }

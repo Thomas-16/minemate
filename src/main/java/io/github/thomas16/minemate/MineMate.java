@@ -6,6 +6,10 @@ import io.github.thomas16.minemate.debug.CompanionDebugNetworking;
 import io.github.thomas16.minemate.dev.DevAutoTest;
 import io.github.thomas16.minemate.entity.MineMateEntities;
 import io.github.thomas16.minemate.integration.PlayerEngineQuiet;
+import io.github.thomas16.minemate.planner.HostedPlanner;
+import io.github.thomas16.minemate.planner.PlannerAutonomy;
+import io.github.thomas16.minemate.planner.PlannerConfig;
+import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
 import io.github.thomas16.minemate.task.TaskListeners;
 import io.github.thomas16.minemate.task.sink.ChatTaskListener;
@@ -14,6 +18,7 @@ import io.github.thomas16.minemate.task.sink.LoggingTaskListener;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 
 import net.minecraft.resources.ResourceLocation;
 
@@ -43,13 +48,36 @@ public class MineMate implements ModInitializer {
 		// Before DevAutoTest, so the journal has recorded an outcome by the time the harness
 		// evaluates it on the same fan-out.
 		TaskListeners.register(new JournalTaskListener());
-		ReplanTriggers.registerGlobal((companion, trigger) -> LOGGER.debug(
-				"Replan trigger {} for companion {}: {}",
-				trigger.reason(), companion.getUUID(), trigger.detail()));
+		ReplanTriggers.registerGlobal(PlannerAutonomy::onReplanTrigger);
 		ScriptedPlanner.installDemoScripts();
+		installPlanner();
 		DevAutoTest.init();
 		PlayerEngineQuiet.init();
 		LOGGER.info("MineMate initialized");
+	}
+
+	/**
+	 * Installs the hosted planner when one is configured, and otherwise leaves the scripted
+	 * stand-in in place. A missing key is an ordinary state, not an error: the mod stays fully
+	 * playable on chat commands, and nothing in the autonomy path fires without a hosted planner.
+	 */
+	private static void installPlanner() {
+		if (Boolean.getBoolean("minemate.autotest")) {
+			// The headless suite must never be able to reach the network, whatever the developer
+			// happens to have in OPENAI_API_KEY. Its planner scenarios install their own hosted
+			// planner over a fixture transport instead.
+			LOGGER.info("MineMate planner: scripted (autotest run)");
+			return;
+		}
+		PlannerConfig config = PlannerConfig.loadOrCreate();
+		if (!config.usable()) {
+			LOGGER.info("MineMate planner: scripted ({})",
+					config.enabled() ? "no API key configured" : "disabled in config");
+			return;
+		}
+		Planners.install(HostedPlanner.of(config));
+		LOGGER.info("MineMate planner: {}", config.describe());
+		ServerLifecycleEvents.SERVER_STOPPING.register(server -> Planners.active().close());
 	}
 
 	public static ResourceLocation id(String path) {

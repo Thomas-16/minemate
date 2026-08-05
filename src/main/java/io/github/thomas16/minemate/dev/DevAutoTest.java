@@ -46,9 +46,16 @@ import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
 import io.github.thomas16.minemate.context.CompanionJournal;
+import io.github.thomas16.minemate.context.EventKind;
 import io.github.thomas16.minemate.context.JournalEntry;
 import io.github.thomas16.minemate.context.WorldSnapshot;
+import io.github.thomas16.minemate.planner.HostedPlanner;
 import io.github.thomas16.minemate.planner.Plan;
 import io.github.thomas16.minemate.planner.PlanExecutor;
 import io.github.thomas16.minemate.planner.PlanOutcome;
@@ -56,12 +63,18 @@ import io.github.thomas16.minemate.planner.PlanRequest;
 import io.github.thomas16.minemate.planner.PlanStatus;
 import io.github.thomas16.minemate.planner.PlanStep;
 import io.github.thomas16.minemate.planner.PlanStepOutcome;
+import io.github.thomas16.minemate.planner.PlannerConfig;
 import io.github.thomas16.minemate.planner.PlannerDispatch;
+import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
+import io.github.thomas16.minemate.planner.llm.LlmReply;
+import io.github.thomas16.minemate.planner.llm.OpenAiResponsesBackend;
+import io.github.thomas16.minemate.planner.llm.OpenAiToolSchemas;
 import io.github.thomas16.minemate.tool.ToolCall;
 import io.github.thomas16.minemate.tool.ToolRegistry;
 import io.github.thomas16.minemate.tool.ToolValidation;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -87,14 +100,26 @@ public final class DevAutoTest {
             "cancel",
             "craft_success",
             "fetch_oak_boat_delivery",
+            "fetch_plain_resource",
             "smelt_success",
             "smelt_wall_reach",
             "deposit_success",
             "container_missing",
             "plan_multi_step",
-            "plan_step_failure_aborts");
+            "plan_step_failure_aborts",
+            // Offline and fast: the whole hosted-planner failure surface costs a few hundred ticks.
+            "llm_tool_schema",
+            "llm_unknown_tool",
+            "llm_malformed_output",
+            "llm_http_error",
+            "llm_talk_only");
+    /** Scenarios that make real network calls. Selectable by name, never included in a profile. */
+    private static final Set<String> LIVE_SCENARIOS = Set.of("llm_live");
     private static final UUID FAKE_OWNER_UUID =
             UUID.fromString("bbf6e9b1-075b-4d78-928d-a73cc6c6155f");
+    /** A distinct profile because Fabric caches discarded FakePlayer instances by profile. */
+    private static final UUID PLAIN_FETCH_OWNER_UUID =
+            UUID.fromString("8b06ad2a-c45e-4e71-89ef-870f7cf9614c");
     private static final UUID FRIENDLY_FIRE_OWNER_UUID =
             UUID.fromString("5ec29e35-81d1-4c23-aef9-0e394daaf52d");
     private static final UUID DEBUG_VIEWER_UUID =
@@ -118,6 +143,7 @@ public final class DevAutoTest {
     private static boolean sawStorageReach;
     private static boolean sawFurnaceReach;
     private static boolean planSawForbiddenGoal;
+    private static FixtureTransport llmTransport;
     private static boolean ownerDamageAccepted;
     private static boolean ownerDirectAttackBlocked;
     private static float companionHealthBeforeOwnerDamage;
@@ -154,8 +180,9 @@ public final class DevAutoTest {
             @Override
             public void onGoalFinished(CompanionEntity finishedCompanion, Goal goal, TaskOutcome outcome) {
                 // A plan legitimately produces several goal outcomes that no currentGoal matches,
-                // so the goal-identity checks below only apply to goal-shaped scenarios.
-                if (done || finishedCompanion != companion || inPlanScenario()) {
+                // and a probe may drive whole plans of its own, so the goal-identity checks below
+                // only apply to goal-shaped scenarios.
+                if (done || finishedCompanion != companion || inPlanScenario() || inProbeScenario()) {
                     return;
                 }
                 if (currentGoal == null || !currentGoal.id().equals(goal.id())) {
@@ -285,6 +312,15 @@ public final class DevAutoTest {
                         ignoredServer -> prepareFetchOakBoats(),
                         DevAutoTest::clearFetchOakBoats,
                         DevAutoTest::fetchDropInvariant),
+                // A plain catalogue resource, not a craftable one. It takes the TaskCatalogue branch
+                // of createAcquisitionTask rather than the craft-macro branch that oak_boat takes.
+                new Scenario("fetch_plain_resource",
+                        ignored -> Goals.fetch("oak_log", 2),
+                        outcome -> succeeded(outcome) && fakeOwnerInventoryCount(Items.OAK_LOG) >= 2,
+                        6200,
+                        ignoredServer -> prepareFetchPlainResource(),
+                        DevAutoTest::clearFetchPlainResource,
+                        () -> null),
                 new Scenario("craft_no_recipe",
                         ignored -> Goals.craft(companion, Items.BEDROCK, 1),
                         outcome -> outcome.status() == OutcomeStatus.BLOCKED
@@ -451,6 +487,111 @@ public final class DevAutoTest {
                         400,
                         ignoredServer -> prepareInventory(),
                         ignoredServer -> clearFixtures(),
+                        () -> null),
+                Scenario.probe("llm_tool_schema",
+                        () -> true,
+                        DevAutoTest::llmSchemaViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
+                Scenario.plan("llm_plan_multi_step",
+                        ignored -> null,
+                        DevAutoTest::acceptLlmMultiStep,
+                        2400,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
+                                llmResponse("Grabbing some dirt, then heading back.",
+                                        llmCall("mine", "{\"resource\":\"dirt\",\"count\":null}"),
+                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 3) + ",\"z\":"
+                                                + spawn.getZ() + ",\"radius\":null}")))),
+                                "get me some dirt"),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                Scenario.plan("llm_unknown_tool",
+                        ignored -> null,
+                        DevAutoTest::acceptLlmUnknownTool,
+                        200,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
+                                llmResponse("On it.",
+                                        llmCall("mine", "{\"resource\":\"dirt\",\"count\":1}"),
+                                        llmCall("teleport", "{\"x\":0,\"z\":0}")))),
+                                "take me home"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.plan("llm_http_retry",
+                        ignored -> null,
+                        DevAutoTest::acceptLlmHttpRetry,
+                        400,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(
+                                FixtureTransport.rateLimited("0"),
+                                FixtureTransport.ok(llmResponse("One moment.",
+                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
+                                                + spawn.getZ() + "}")))),
+                                "come here"),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                Scenario.probe("llm_malformed_output",
+                        () -> llmPlannerSettled(),
+                        () -> llmFailureVerdict("malformed arguments"),
+                        200,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
+                                llmResponse("Sure.", llmCall("mine", "{not json at all")))),
+                                "mine something"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_http_error",
+                        () -> llmPlannerSettled(),
+                        () -> llmHttpErrorVerdict(),
+                        200,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.error(
+                                401, "invalid_api_key", "Incorrect API key provided")),
+                                "mine something"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_timeout",
+                        () -> llmPlannerSettled(),
+                        () -> llmFailureVerdict("timeout"),
+                        200,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.hanging(), "mine something"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_talk_only",
+                        () -> llmPlannerSettled(),
+                        DevAutoTest::llmTalkOnlyVerdict,
+                        200,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
+                                llmResponse("You already have plenty of dirt."))),
+                                "get me some dirt"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_stale_request",
+                        () -> llmPlannerSettled() && scenarioTicks > 60,
+                        DevAutoTest::llmStaleVerdict,
+                        300,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.delayed(400L,
+                                FixtureTransport.ok(llmResponse("Coming.",
+                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 40_000)
+                                                + ",\"z\":" + spawn.getZ() + "}")))),
+                                "go a very long way"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_replan_budget",
+                        () -> scenarioTicks > 900,
+                        DevAutoTest::llmReplanBudgetVerdict,
+                        1400,
+                        ignoredServer -> prepareLlmReplanBudget(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // Never in a profile: the only scenario that leaves the machine, and the only one
+                // that costs money. Selected by name, and only with a key configured.
+                Scenario.probe("llm_live",
+                        DevAutoTest::llmLiveAnswered,
+                        DevAutoTest::llmLiveVerdict,
+                        1200,
+                        ignoredServer -> prepareLlmLive(),
+                        DevAutoTest::clearLlmPlanner,
                         () -> null));
         String selectedScenario = System.getProperty("minemate.autotest.scenario", "").trim();
         if (!selectedScenario.isEmpty()) {
@@ -483,6 +624,11 @@ public final class DevAutoTest {
                 fail(server, "unknown autotest profile: " + profile);
                 return;
             }
+            // No profile, not even "full", may spend money or leave the machine. llm_live is
+            // reachable by name only; in CI there is no key and it would fail on every run.
+            scenarios = scenarios.stream()
+                    .filter(scenario -> !LIVE_SCENARIOS.contains(scenario.name()))
+                    .toList();
             MineMate.LOGGER.info("[autotest] profile={} scenarios={}", profile, scenarios.size());
         }
         scenarioIndex = 0;
@@ -534,6 +680,12 @@ public final class DevAutoTest {
                 return;
             }
         }
+        if (!advanceRequested && scenarioIndex < scenarios.size()) {
+            Scenario probe = scenarios.get(scenarioIndex);
+            if (probe.isProbe() && Boolean.TRUE.equals(probe.ready().get())) {
+                advanceRequested = true;
+            }
+        }
         if (inPlanScenario() && currentPlanOutcome == null) {
             PlanOutcome outcome = companion.getPlanExecutor().lastOutcome().orElse(null);
             boolean mine = outcome != null && (currentPlan != null
@@ -569,6 +721,12 @@ public final class DevAutoTest {
             // The same shape as /companion stop: cancel the plan, not just the running goal.
             companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
         }
+        if ("llm_stale_request".equals(scenario.name()) && scenarioTicks == 2) {
+            // Well inside the fixture's 400ms delay: the request is genuinely in flight, which is
+            // the only window in which a stale answer can be created.
+            companion.getPlanExecutor().discardPendingPlannerRequests();
+            companion.closeStandingOrder();
+        }
         if (scenarioTicks > scenario.hardCapTicks()) {
             fail(server, scenario.name() + " exceeded its hard cap");
         }
@@ -586,6 +744,11 @@ public final class DevAutoTest {
         planOutcomeBaseline = companion.getPlanExecutor().lastOutcome()
                 .map(PlanOutcome::planId).orElse("");
         scenario.setup().accept(server);
+        if (scenario.isProbe()) {
+            // Setup did everything; nothing is submitted and nothing is expected to be.
+            MineMate.LOGGER.info("[autotest] {} START", scenario.name());
+            return;
+        }
         if (scenario.isPlan()) {
             currentPlan = scenario.plan().apply(companion);
             if (currentPlan != null) {
@@ -611,7 +774,11 @@ public final class DevAutoTest {
         Scenario scenario = scenarios.get(scenarioIndex);
         boolean accepted;
         String rendered;
-        if (scenario.isPlan()) {
+        if (scenario.isProbe()) {
+            String violation = scenario.verdict().get();
+            accepted = violation == null;
+            rendered = violation == null ? "ok" : violation;
+        } else if (scenario.isPlan()) {
             accepted = currentPlanOutcome != null && scenario.acceptsPlan().test(currentPlanOutcome);
             rendered = currentPlanOutcome == null ? "no outcome" : currentPlanOutcome.toCompactString();
         } else {
@@ -848,6 +1015,446 @@ public final class DevAutoTest {
         return accepted;
     }
 
+    // ---- stage 5: hosted planner over a fixture transport -----------------------------------
+    //
+    // Every scenario below runs the real OpenAI request builder and the real response parser; only
+    // the socket is replaced. None of them can reach the network, and MineMate.installPlanner
+    // refuses to install a hosted planner at all during an autotest run, so a developer's
+    // OPENAI_API_KEY cannot change what these assert.
+
+    /** Short, so llm_timeout resolves well inside its cap rather than at the end of one. */
+    private static final int LLM_TIMEOUT_SECONDS = 2;
+    /** Replans allowed in llm_replan_budget. Small on purpose: each one costs ~100 ticks to observe. */
+    private static final int LLM_REPLAN_BUDGET = 2;
+
+    private static void installLlmPlanner(FixtureTransport transport, int maxReplans) {
+        PlannerConfig config = PlannerConfig.of("http://fixture.invalid/v1", "fixture-model",
+                "fixture-key", LLM_TIMEOUT_SECONDS, maxReplans);
+        llmTransport = transport;
+        Planners.install(new HostedPlanner(new OpenAiResponsesBackend(transport, config.baseUrl(),
+                config.model(), config.apiKey().orElse(""), config.reasoningEffort(),
+                config.verbosity(), config.maxOutputTokens()), config));
+    }
+
+    /** Installs a planner with no replan budget, opens an order, and asks for a plan. */
+    private static void prepareLlmPlan(FixtureTransport transport, String requestText) {
+        prepareInventory();
+        installLlmPlanner(transport, 0);
+        requestLlmPlan(requestText);
+    }
+
+    private static void requestLlmPlan(String requestText) {
+        // Explicitly, not incidentally: several verdicts below turn on whether a PLANNER_FAILED
+        // event exists, and llm_timeout legitimately leaves one behind. Without this the meaning of
+        // "no planner failure" would depend on which scenario ran before, which is exactly the
+        // order-sensitivity this suite already has one known case of.
+        companion.getJournal().clear();
+        companion.openStandingOrder(requestText);
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(requestText, snapshot,
+                snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
+    }
+
+    private static void prepareLlmReplanBudget() {
+        prepareInventory();
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(llmResponse("Working on it.",
+                llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":" + spawn.getZ() + "}")))),
+                LLM_REPLAN_BUDGET);
+        requestLlmPlan("keep busy");
+    }
+
+    private static void clearLlmPlanner(MinecraftServer server) {
+        if (companion != null && companion.getPlanExecutor() != null) {
+            companion.getPlanExecutor().discardPendingPlannerRequests();
+            if (companion.getPlanExecutor().isActive()) {
+                companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
+            }
+            companion.closeStandingOrder();
+        }
+        Planners.install(ScriptedPlanner.instance());
+        llmTransport = null;
+        clearFakeOwner();
+        clearFixtures();
+    }
+
+    /** True once the planner has answered, one way or another, and left the executor idle. */
+    private static boolean llmPlannerSettled() {
+        PlanExecutor executor = companion.getPlanExecutor();
+        return !executor.isPlannerRequestPending() && !executor.isActive();
+    }
+
+    /**
+     * The one scenario that talks to the real endpoint, so that the model id, the strict schema and
+     * the reply shape are checked against the provider rather than against my assumptions about it.
+     * Opt-in by name only, and it charges a real account, so it is in no profile.
+     */
+    private static void prepareLlmLive() {
+        prepareInventory();
+        // With no owner present, anything the model plausibly plans for "bring me X" binds to
+        // owner_offline before it runs, and the test proves only that the JSON parsed.
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        PlannerConfig file = PlannerConfig.loadOrCreate();
+        // No replan budget: one order must cost exactly one request.
+        PlannerConfig config = PlannerConfig.of(file.baseUrl(), file.model(),
+                file.apiKey().orElse(""), 60, 0);
+        MineMate.LOGGER.info("[autotest] llm_live against {}", config.describe());
+        llmTransport = null;
+        Planners.install(HostedPlanner.of(config));
+        companion.getJournal().clear();
+        companion.openStandingOrder(LLM_LIVE_ORDER);
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(LLM_LIVE_ORDER,
+                snapshot, snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
+    }
+
+    private static final String LLM_LIVE_ORDER = "get me 2 dirt and then come stand next to me";
+
+    /** The model has answered once the request is no longer pending and something came of it. */
+    private static boolean llmLiveAnswered() {
+        PlanExecutor executor = companion.getPlanExecutor();
+        return !executor.isPlannerRequestPending()
+                && (executor.isActive() || sawNewPlanOutcome()
+                        || journalHas(EventKind.PLANNER_FAILED));
+    }
+
+    /**
+     * Scoped to the planner integration and nothing downstream of it: the model id and endpoint are
+     * right, the strict schema was accepted, the reply parsed, and the resulting calls survived
+     * validation and reached the supervisor.
+     *
+     * <p>It deliberately stops short of asserting that the plan then succeeds. Whether a given
+     * deterministic skill can finish in a headless superflat world is a stage-6 question, and tying
+     * a live API check to it would mean this test fails for reasons that have nothing to do with
+     * the planner. That is not hypothetical: the model reasonably chose {@code fetch}, which is
+     * currently unable to make progress on non-craftable resources.
+     */
+    private static String llmLiveVerdict() {
+        if (PlannerConfig.loadOrCreate().apiKey().isEmpty()) {
+            return "no API key configured; set OPENAI_API_KEY or -Dminemate.planner.apiKey";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "the live planner failed; the request and reply bodies are in logs/debug.log";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            MineMate.LOGGER.info("[autotest] llm_live plan accepted: {}",
+                    companion.getPlanExecutor().currentPlan()
+                            .map(plan -> "\"" + plan.dialogue() + "\" / " + plan.steps().size()
+                                    + " steps: " + plan.steps().stream()
+                                            .map(step -> step.call().toCompactString()).toList())
+                            .orElse("?"));
+            return null;
+        }
+        Optional<PlanOutcome> outcome = companion.getPlanExecutor().lastOutcome()
+                .filter(published -> !published.planId().equals(planOutcomeBaseline));
+        if (outcome.isEmpty()) {
+            return "the model answered with no tool calls for: " + LLM_LIVE_ORDER;
+        }
+        MineMate.LOGGER.info("[autotest] llm_live outcome {}", outcome.get().toCompactString());
+        for (PlanStepOutcome step : outcome.get().stepOutcomes()) {
+            MineMate.LOGGER.info("[autotest] llm_live step {} {} -> {} {}", step.index(),
+                    step.call().toCompactString(), step.status(), step.reason());
+        }
+        if (outcome.get().status() == PlanStatus.REJECTED) {
+            return "the model produced a plan that failed validation: " + outcome.get().reason();
+        }
+        return null;
+    }
+
+    // ---- fixture bodies ----------------------------------------------------------------------
+
+    /**
+     * A Responses reply, built the way the real one arrives: a reasoning item first, so a parser
+     * that indexes {@code output[0]} instead of filtering by type fails here rather than in
+     * production.
+     */
+    private static String llmResponse(String text, JsonObject... calls) {
+        JsonArray output = new JsonArray();
+        JsonObject reasoning = new JsonObject();
+        reasoning.addProperty("type", "reasoning");
+        reasoning.addProperty("id", "rs_fixture");
+        reasoning.add("summary", new JsonArray());
+        output.add(reasoning);
+        if (text != null) {
+            JsonObject part = new JsonObject();
+            part.addProperty("type", "output_text");
+            part.addProperty("text", text);
+            JsonArray content = new JsonArray();
+            content.add(part);
+            JsonObject message = new JsonObject();
+            message.addProperty("type", "message");
+            message.addProperty("role", "assistant");
+            message.add("content", content);
+            output.add(message);
+        }
+        for (JsonObject call : calls) {
+            output.add(call);
+        }
+        JsonObject root = new JsonObject();
+        root.addProperty("id", "resp_fixture");
+        root.add("output", output);
+        return root.toString();
+    }
+
+    /** Arguments go on the wire as an escaped JSON string, not a nested object. */
+    private static JsonObject llmCall(String name, String argumentsJson) {
+        JsonObject call = new JsonObject();
+        call.addProperty("type", "function_call");
+        call.addProperty("call_id", "call_" + name);
+        call.addProperty("name", name);
+        call.addProperty("arguments", argumentsJson);
+        return call;
+    }
+
+    // ---- verdicts ----------------------------------------------------------------------------
+
+    /**
+     * The shared shape of every planner failure: the owner is told, and absolutely nothing else
+     * happened. A failed planner that still moved the companion would be far worse than one that
+     * simply did not answer.
+     */
+    private static String llmFailureVerdict(String label) {
+        if (companion.getPlanExecutor().isActive()) {
+            return label + ": a plan started anyway";
+        }
+        if (companion.getPlanExecutor().isPlannerRequestPending()) {
+            return label + ": the request is still pending";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return label + ": a goal was submitted";
+        }
+        if (!journalHas(EventKind.PLANNER_FAILED)) {
+            return label + ": no planner_failed event was recorded";
+        }
+        return null;
+    }
+
+    private static String llmHttpErrorVerdict() {
+        String failure = llmFailureVerdict("http error");
+        if (failure != null) {
+            return failure;
+        }
+        if (llmTransport.calls() != 1) {
+            return "a 401 was retried: " + llmTransport.calls() + " requests";
+        }
+        return null;
+    }
+
+    /** Speech with no tool calls must be spoken, not rejected as an empty plan. */
+    private static String llmTalkOnlyVerdict() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "speech alone started a plan";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "speech alone submitted a goal";
+        }
+        if (sawNewPlanOutcome()) {
+            return "speech alone published a plan outcome";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "speech alone was treated as a planner failure";
+        }
+        if (companion.getStandingOrder() != null) {
+            return "the standing order stayed open after the planner said it was done";
+        }
+        return null;
+    }
+
+    private static String llmStaleVerdict() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "a discarded request still started a plan";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "a discarded request still submitted a goal";
+        }
+        if (sawNewPlanOutcome()) {
+            return "a discarded request still published a plan outcome";
+        }
+        if (llmTransport.calls() != 1) {
+            return "expected one request, saw " + llmTransport.calls();
+        }
+        return null;
+    }
+
+    private static String llmReplanBudgetVerdict() {
+        int expected = 1 + LLM_REPLAN_BUDGET;
+        if (llmTransport.calls() != expected) {
+            return "expected " + expected + " planner requests, saw " + llmTransport.calls();
+        }
+        if (companion.getStandingOrder() != null) {
+            return "the standing order outlived its replan budget";
+        }
+        return null;
+    }
+
+    private static boolean sawNewPlanOutcome() {
+        return companion.getPlanExecutor().lastOutcome()
+                .filter(outcome -> !outcome.planId().equals(planOutcomeBaseline))
+                .isPresent();
+    }
+
+    private static boolean journalHas(EventKind kind) {
+        for (JournalEntry entry : companion.getJournal().recent(CompanionJournal.CAPACITY)) {
+            if (entry.kind() == kind) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ---- plan-shaped acceptors ---------------------------------------------------------------
+
+    private static boolean acceptLlmMultiStep(PlanOutcome outcome) {
+        String body = llmTransport == null ? "" : llmTransport.lastRequestBody();
+        boolean accepted = outcome.status() == PlanStatus.SUCCEEDED
+                && outcome.completedSteps() == 2
+                && outcome.totalSteps() == 2
+                // Several tool calls in one reply is what a multi-step plan is made of.
+                && body.contains("\"parallel_tool_calls\":true")
+                // The nested Chat Completions wrapper here would be rejected by the real endpoint.
+                && !body.contains("\"function\":{");
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] llm_plan_multi_step postcondition {}",
+                    outcome.toCompactString());
+        }
+        return accepted;
+    }
+
+    private static boolean acceptLlmUnknownTool(PlanOutcome outcome) {
+        boolean accepted = outcome.status() == PlanStatus.REJECTED
+                && Reasons.UNKNOWN_TOOL.equals(outcome.reason())
+                && outcome.stepOutcomes().isEmpty()
+                && outcome.completedSteps() == 0;
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] llm_unknown_tool postcondition {}",
+                    outcome.toCompactString());
+        }
+        return accepted;
+    }
+
+    private static boolean acceptLlmHttpRetry(PlanOutcome outcome) {
+        boolean accepted = outcome.status() == PlanStatus.SUCCEEDED
+                && llmTransport.calls() == 2;
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] llm_http_retry postcondition {} requests={}",
+                    outcome.toCompactString(), llmTransport.calls());
+        }
+        return accepted;
+    }
+
+    // ---- schema and parse ---------------------------------------------------------------------
+
+    /**
+     * Checks the two translations that stand between the registry and the model, without a round
+     * trip: the strict tool schema going out, and the null-stripping coming back. Both are pure
+     * functions, and both fail in ways that would otherwise only show up as an opaque 400 or as
+     * every defaulted parameter being rejected.
+     */
+    private static String llmSchemaViolation() {
+        String registrySchema = ToolRegistry.defaults().schemaJson();
+        JsonArray tools;
+        try {
+            tools = OpenAiToolSchemas.toOpenAiTools(registrySchema);
+        } catch (RuntimeException error) {
+            return "the strict transform threw " + error;
+        }
+        if (tools.size() != ToolRegistry.defaults().tools().size()) {
+            return "the transform produced " + tools.size() + " of "
+                    + ToolRegistry.defaults().tools().size() + " tools";
+        }
+        for (JsonElement element : tools) {
+            String violation = strictToolViolation(element.getAsJsonObject(), registrySchema);
+            if (violation != null) {
+                return violation;
+            }
+        }
+        return nullStrippingViolation();
+    }
+
+    private static String strictToolViolation(JsonObject tool, String registrySchema) {
+        String name = tool.get("name").getAsString();
+        if (!"function".equals(tool.get("type").getAsString())) {
+            return name + " lost its function type";
+        }
+        if (tool.has("function")) {
+            return name + " used the nested chat-completions shape";
+        }
+        if (!tool.get("strict").getAsBoolean()) {
+            return name + " was not marked strict";
+        }
+        JsonObject parameters = tool.getAsJsonObject("parameters");
+        JsonElement additional = parameters.get("additionalProperties");
+        if (additional == null || additional.getAsBoolean()) {
+            return name + " did not forbid additional properties";
+        }
+        JsonObject properties = parameters.getAsJsonObject("properties");
+        Set<String> required = new HashSet<>();
+        for (JsonElement entry : parameters.getAsJsonArray("required")) {
+            required.add(entry.getAsString());
+        }
+        if (!required.equals(properties.keySet())) {
+            return name + " did not list every property as required";
+        }
+        Set<String> originallyRequired = registryRequired(registrySchema, name);
+        for (String property : properties.keySet()) {
+            JsonElement type = properties.getAsJsonObject(property).get("type");
+            boolean nullable = type.isJsonArray() && type.getAsJsonArray().contains(
+                    JsonParser.parseString("\"null\""));
+            if (originallyRequired.contains(property) && nullable) {
+                return name + "." + property + " was made optional";
+            }
+            if (!originallyRequired.contains(property) && !nullable) {
+                // Without the null union, strict mode makes an optional parameter mandatory and the
+                // model can no longer decline to supply it.
+                return name + "." + property + " lost its optionality";
+            }
+        }
+        // The bounds are honoured under strict mode, so losing them would be a silent downgrade.
+        if ("mine".equals(name) && !properties.getAsJsonObject("count").has("maximum")) {
+            return "mine.count lost its range";
+        }
+        if ("deposit".equals(name) && !properties.getAsJsonObject("container").has("minItems")) {
+            return "deposit.container lost its length constraint";
+        }
+        return null;
+    }
+
+    private static Set<String> registryRequired(String registrySchema, String toolName) {
+        Set<String> required = new HashSet<>();
+        for (JsonElement element : JsonParser.parseString(registrySchema).getAsJsonArray()) {
+            JsonObject tool = element.getAsJsonObject();
+            if (!toolName.equals(tool.get("name").getAsString())) {
+                continue;
+            }
+            for (JsonElement entry : tool.getAsJsonObject("input_schema").getAsJsonArray("required")) {
+                required.add(entry.getAsString());
+            }
+        }
+        return required;
+    }
+
+    private static String nullStrippingViolation() {
+        LlmReply reply = OpenAiResponsesBackend.parseReply(llmResponse("Reading you.",
+                llmCall("mine", "{\"resource\":\"dirt\",\"count\":null}")));
+        if (!"Reading you.".equals(reply.dialogue())) {
+            return "the parser lost the dialogue behind the reasoning item";
+        }
+        if (reply.calls().size() != 1) {
+            return "the parser produced " + reply.calls().size() + " calls";
+        }
+        ToolCall call = reply.calls().get(0);
+        if (call.arguments().has("count")) {
+            return "a null argument was not stripped";
+        }
+        // The point of stripping: an absent optional argument is what the registry defaults.
+        if (!(ToolRegistry.defaults().validate(call) instanceof ToolValidation.Accepted)) {
+            return "a stripped null did not validate";
+        }
+        if (!OpenAiResponsesBackend.parseReply(llmResponse("Done.")).talkOnly()) {
+            return "a reply with no calls was not read as talk-only";
+        }
+        return null;
+    }
+
     private static void prepareContextJournal() {
         prepareInventory(new ItemStack(Items.DIRT, 3));
         prepareFakeOwner(CONTEXT_OWNER_UUID, "MineMateContextOwner");
@@ -905,6 +1512,10 @@ public final class DevAutoTest {
 
     private static boolean inPlanScenario() {
         return scenarioIndex < scenarios.size() && scenarios.get(scenarioIndex).isPlan();
+    }
+
+    private static boolean inProbeScenario() {
+        return scenarioIndex < scenarios.size() && scenarios.get(scenarioIndex).isProbe();
     }
 
     /**
@@ -1111,6 +1722,23 @@ public final class DevAutoTest {
         }
     }
 
+    private static void prepareFetchPlainResource() {
+        prepareInventory();
+        prepareFakeOwner(PLAIN_FETCH_OWNER_UUID, "MineMatePlainFetchOwner");
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        for (int offset = 0; offset < 5; offset++) {
+            placeFixtureBlock(spawn.offset(3 + offset, 0, 6), Blocks.OAK_LOG);
+        }
+    }
+
+    private static void clearFetchPlainResource(MinecraftServer server) {
+        clearFakeOwner();
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        clearFixtures();
+    }
+
     private static void prepareFakeOwner(UUID ownerUuid, String ownerName) {
         ServerLevel level = (ServerLevel) companion.level();
         fakeOwner = FakePlayer.get(level, new GameProfile(ownerUuid, ownerName));
@@ -1186,6 +1814,9 @@ public final class DevAutoTest {
         if (fakeOwner == null || fakeOwner.isRemoved() || companion == null) {
             return;
         }
+        boolean fetchActive = companion.getSupervisor().currentGoal()
+                .map(goal -> "fetch".equals(goal.kind()))
+                .orElse(false);
         ServerLevel level = (ServerLevel) companion.level();
         for (ItemEntity drop : level.getEntitiesOfClass(
                 ItemEntity.class, companion.getBoundingBox().inflate(24.0))) {
@@ -1208,7 +1839,10 @@ public final class DevAutoTest {
                             drop.getDeltaMovement(), new Vec3(towardOwner.x, 0.0, towardOwner.z)));
                 }
             }
-            if (drop.getItem().is(Items.OAK_BOAT)) {
+            // A loaded FakePlayer does not run the ordinary player collision/pickup loop. Simulate
+            // that loop for delivery drops close enough to touch the owner; otherwise non-boat
+            // fetches wait forever after correctly acquiring and throwing their items.
+            if (fetchActive) {
                 drop.playerTouch(fakeOwner);
             }
         }
@@ -1744,13 +2378,14 @@ public final class DevAutoTest {
     private record Scenario(String name,
             Function<CompanionEntity, Goal> goal, Predicate<TaskOutcome> accepts,
             Function<CompanionEntity, Plan> plan, Predicate<PlanOutcome> acceptsPlan,
+            Supplier<Boolean> ready, Supplier<String> verdict,
             int hardCapTicks,
             Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
             Supplier<String> invariant) {
 
         private Scenario(String name, Function<CompanionEntity, Goal> goal,
                 Predicate<TaskOutcome> accepts, int hardCapTicks) {
-            this(name, goal, accepts, null, null, hardCapTicks, server -> {
+            this(name, goal, accepts, null, null, null, null, hardCapTicks, server -> {
             }, server -> {
             }, () -> null);
         }
@@ -1759,19 +2394,39 @@ public final class DevAutoTest {
                 Predicate<TaskOutcome> accepts, int hardCapTicks,
                 Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
                 Supplier<String> invariant) {
-            this(name, goal, accepts, null, null, hardCapTicks, setup, teardown, invariant);
+            this(name, goal, accepts, null, null, null, null, hardCapTicks, setup, teardown, invariant);
         }
 
         private static Scenario plan(String name, Function<CompanionEntity, Plan> plan,
                 Predicate<PlanOutcome> acceptsPlan, int hardCapTicks,
                 Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
                 Supplier<String> invariant) {
-            return new Scenario(name, null, null, plan, acceptsPlan, hardCapTicks,
+            return new Scenario(name, null, null, plan, acceptsPlan, null, null, hardCapTicks,
+                    setup, teardown, invariant);
+        }
+
+        /**
+         * A scenario that asserts on something other than an outcome.
+         *
+         * <p>Half of what stage 5 has to get right produces no outcome at all: a planner that fails,
+         * times out, answers with speech alone, or is stopped mid-flight must leave the companion
+         * idle and quiet, and "nothing happened" is not something the goal or plan watchers can
+         * observe. {@code ready} says when to look and {@code verdict} returns null for pass or the
+         * failure text, the same idiom the invariants already use.
+         */
+        private static Scenario probe(String name, Supplier<Boolean> ready, Supplier<String> verdict,
+                int hardCapTicks, Consumer<MinecraftServer> setup, Consumer<MinecraftServer> teardown,
+                Supplier<String> invariant) {
+            return new Scenario(name, null, null, null, null, ready, verdict, hardCapTicks,
                     setup, teardown, invariant);
         }
 
         private boolean isPlan() {
             return acceptsPlan != null;
+        }
+
+        private boolean isProbe() {
+            return verdict != null;
         }
     }
 

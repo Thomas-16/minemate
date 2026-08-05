@@ -7,11 +7,13 @@
 - `task.sink` — chat, logging, journal, TTS, planner, and test consumers of task lifecycle events.
 - `tool` — the typed, schema'd capability surface over `Goals`: descriptors, parameters, JSON `ToolCall`s, pure validation, and world binding. The single source of truth for what the companion can be asked to do; both `command` and `planner` go through it, so a tool cannot behave one way when typed and another way when planned.
 - `context` — world snapshots, the recent-event journal, and replan triggers. Depends on `task`/`entity`, never on `planner`.
-- `planner` — plans, the multi-step plan executor, the async `Planner` interface, and the scripted stand-in. Stage 5 adds a hosted LLM behind the same interface.
+- `planner` — plans, the multi-step plan executor, the async `Planner` interface, the scripted stand-in, and the hosted LLM planner behind that same interface. `PlannerConfig` reads `config/minemate.json`, generated on first launch; `PlannerAutonomy` is the only thing that turns a replan trigger into a request, and it charges every one against a `StandingOrder` budget.
+- `planner.llm` — the wire layer, in two stacked seams. `LlmBackend` is one provider's request/response mapping (OpenAI Responses today, another later); `HttpTransport` sits under it so the headless suite can drive the real request builder and response parser with canned bytes. Nothing above `LlmBackend` knows which provider is installed.
 - `command` — temporary hardcoded task input; the planner replaces it.
 - `integration` — isolated PlayerEngine configuration and compatibility quirks.
 - `dev` — sequential headless integration test. On PowerShell, use `.\gradlew.bat "-Dminemate.autotest=true" runServer --console=plain` for the default smoke profile, or add `"-Dminemate.autotest.profile=full"` for all scenarios. Put quoted system properties before the task name. The task provisions `run/` and regenerates the world each time, preventing save-state contamination between clean sequential runs. It halts the server cleanly whether or not scenarios pass, so CI asserts on the `AUTOTEST PASS` log line rather than the Gradle exit code.
   Pass `"-Dminemate.autotest.scenario=<name>"` as well to run one or more comma-separated scenarios while debugging; explicit scenario selection overrides the profile.
+  Every scenario is offline except `llm_live`, which is in no profile and runs only when named. It spends one real API call to check the planner integration against the provider — model id, endpoint, strict schema, reply parsing — and deliberately asserts nothing about whether the resulting plan then succeeds, since that would make a live check hostage to skill bugs. It needs a key in `run/config/minemate.json` or the environment.
 
 Build with `gradlew build`; launch a client with `gradlew runClient`. The project is pinned to Minecraft 1.21.1, Java 21, and Mojang mappings.
 
@@ -39,12 +41,28 @@ Build with `gradlew build`; launch a client with `gradlew runClient`. The projec
 - Never use `Long.MIN_VALUE` as a "never happened" sentinel for a tick timestamp that gets subtracted. `observedTicks - Long.MIN_VALUE` overflows to a negative difference, so a cooldown guard reads as permanently unexpired; `ReplanTriggers` silently fired nothing at all. Use an explicit sentinel and branch on it before subtracting.
 - Assert a floor, not only a ceiling, on anything whose job is to be rare. `context_journal` capped replan triggers at 4 per scenario, which a system firing zero triggers satisfies perfectly. The suite passed while the feature was dead.
 - Numeric tool arguments must be checked for finiteness before range. Both `value < min` and `value > max` are false for NaN, so `"NaN"` — which `Double.parseDouble` accepts — validates against every bound and reaches pathfinding as a value no later check recognises.
+- OpenAI's Responses API declares tools **flat** — `{type, name, description, parameters}`. The nested `{type, function: {...}}` form belongs to Chat Completions and is rejected here for a missing name. The reply's `output` is a heterogeneous array whose order is not guaranteed and which normally leads with a `reasoning` item, so filter it by `type` and never index `output[0]`. `function_call.arguments` arrives as a JSON *string* that needs a second parse.
+- OpenAI strict mode has no way to mark a tool parameter optional. Every optional one must be listed in `required` and typed as a null union, so the model correctly sends `"count": null` — which `ToolRegistry` rejects, while treating an *absent* key as the parameter's default. The backend must strip null-valued arguments before building a `ToolCall`; without it every plan touching a defaulted parameter is rejected as `invalid_argument`. `minimum`/`maximum`/`minItems` are honoured under strict mode, so keep them.
+- Resolve an API key most-specific-first — system property, then `config/minemate.json`, then `MINEMATE_OPENAI_API_KEY`, then `OPENAI_API_KEY` — and log which source won. Ambient variables are set once and forgotten; letting one beat the file someone just edited produces a 401 naming a key they do not recognise. Never log the key itself, and keep it out of `describe()`.
+- `MineMate.installPlanner()` refuses to install a hosted planner during an autotest run, whatever the environment holds. The suite must not be able to reach the network or bill an account; its planner scenarios install their own hosted planner over a `FixtureTransport` instead.
+- `HostedPlanner` applies its own `orTimeout` rather than trusting the transport's. A request that never completes leaves `isPlannerRequestPending()` true forever, which silently disables replanning for that companion for the rest of the session.
+- Half of what a planner must get right produces no outcome to assert on: a failure, a timeout, speech with no tool calls, or a request cancelled mid-flight must all leave the companion idle. `Scenario.probe(name, ready, verdict, ...)` covers that shape — `ready` says when to look, `verdict` returns null for pass. Goal-identity checks in the harness skip probe scenarios, because a probe may drive whole plans of its own.
+- Scenarios that assert on the presence *or absence* of a journal event must clear the journal in setup. The 64-entry ring outlives a scenario, so `llm_timeout` legitimately leaving a `PLANNER_FAILED` behind would otherwise decide whether `llm_talk_only` passes.
+- PlayerEngine assigns a task's `controller` when it first *ticks* it, and `ResourceTask.isFinished()` dereferences that controller. Never ask a freshly created child task whether it is finished — `OwnerGiveItemTask` did, and crashed the server on the first tick of any `fetch` whose resource is not craftable. It went unnoticed because `oak_boat` resolves to a craft macro, whose `isFinished` touches no controller.
+- A loaded Fabric `FakePlayer` does not run vanilla's player collision/pickup loop, so thrown items never reach it on their own. Delivery scenarios must simulate `playerTouch` for drops that actually touch the owner. Without it a fetch looks like it stalled during acquisition when in fact it had already acquired and thrown.
 - Planner results are asynchronous, so every completion carries a generation claimed on the server thread by `PlanExecutor.beginPlannerRequest()`. Without it a plan requested before `/companion stop` still arrives and starts seconds later, and two concurrent requests race. `stop` invalidates pending requests unconditionally, not inside the `isActive()` branch: a request can be in flight while the supervisor is busy with a manual order.
 
-## Known issue
+## Known issues
 
 `craft_iron_sword_world` is order-sensitive: it passes alone (~89s) but can exhaust its cap after a
 different preceding sequence.
+
+`withdraw_wall_reach` fails on `master`, independently of any planner work: `withdraw TIMED_OUT
+no_progress 0/2 14s`. It fails identically in isolation and on a clean checkout with every local
+change stashed, so it is not order-sensitivity and not a regression — the full profile, and
+therefore CI, is red until it is fixed. Its sibling `smelt_wall_reach` passes, so the reach rule
+itself works for furnaces; suspect the withdraw path added in "Prevent container access through
+walls".
 
 ## Where this is going
 

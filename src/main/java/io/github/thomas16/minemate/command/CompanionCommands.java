@@ -14,10 +14,13 @@ import io.github.thomas16.minemate.task.TaskOutcome;
 import io.github.thomas16.minemate.task.TaskActivitySnapshot;
 import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.integration.ReflexSnapshot;
+import io.github.thomas16.minemate.planner.HostedPlanner;
 import io.github.thomas16.minemate.planner.PlanRequest;
+import io.github.thomas16.minemate.planner.Planner;
 import io.github.thomas16.minemate.planner.PlannerDispatch;
 import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
+import io.github.thomas16.minemate.planner.StandingOrder;
 import io.github.thomas16.minemate.tool.ToolBindException;
 import io.github.thomas16.minemate.tool.ToolCall;
 import io.github.thomas16.minemate.tool.ToolContext;
@@ -55,6 +58,7 @@ public final class CompanionCommands {
         root.then(Commands.literal("debugUI").executes(ctx -> debugUi(ctx.getSource())));
         root.then(Commands.literal("context").executes(ctx -> context(ctx.getSource())));
         root.then(Commands.literal("tools").executes(ctx -> tools(ctx.getSource())));
+        root.then(Commands.literal("planner").executes(ctx -> planner(ctx.getSource())));
         root.then(Commands.literal("plan")
                 .then(Commands.literal("cancel").executes(ctx -> planCancel(ctx.getSource())))
                 .then(Commands.argument("request", StringArgumentType.greedyString())
@@ -78,6 +82,8 @@ public final class CompanionCommands {
         // flight while the supervisor is busy with a manual order. Without this, a plan requested
         // moments ago would arrive and start seconds after the owner said stop.
         companion.getPlanExecutor().discardPendingPlannerRequests();
+        // Stop means stop: no later event may revive this order through the replan path.
+        companion.closeStandingOrder();
         // The plan must be cancelled first. Cancelling only the supervisor lets the executor start
         // the very next step on the following tick, so "stop" would appear to do nothing.
         if (companion.getPlanExecutor().isActive()) {
@@ -120,6 +126,29 @@ public final class CompanionCommands {
         return 1;
     }
 
+    /** Reports which brain is installed and how much budget the open order has left. Never the key. */
+    private static int planner(CommandSourceStack source) {
+        Planner active = Planners.active();
+        String line = active instanceof HostedPlanner hosted
+                ? hosted.config().describe()
+                : active.name() + " (no hosted planner configured)";
+        source.sendSuccess(() -> Component.literal(line), false);
+
+        ServerPlayer player = requirePlayer(source);
+        CompanionEntity companion = player == null ? null : findCompanion(player);
+        if (companion == null) {
+            return 1;
+        }
+        StandingOrder order = companion.getStandingOrder();
+        int budget = active instanceof HostedPlanner hosted ? hosted.config().maxReplansPerOrder() : 0;
+        String orderLine = order == null
+                ? "order: none"
+                : "order: \"%s\" replans %d/%d".formatted(
+                        order.requestText(), order.replansUsed(), budget);
+        source.sendSuccess(() -> Component.literal(orderLine), false);
+        return 1;
+    }
+
     private static int plan(CommandSourceStack source, String requestText) {
         ServerPlayer player = requirePlayer(source);
         if (player == null) {
@@ -134,7 +163,11 @@ public final class CompanionCommands {
         if (companion.getPlanExecutor().isActive()) {
             companion.getPlanExecutor().cancel(Reasons.SUPERSEDED);
         }
-        ScriptedPlanner.instance().bind(companion);
+        // A fresh order, with a fresh replan budget. This is the only place one is opened.
+        companion.openStandingOrder(requestText);
+        if (Planners.active() instanceof ScriptedPlanner scripted) {
+            scripted.bind(companion);
+        }
         WorldSnapshot snapshot = companion.getContext().snapshot();
         PlanRequest request = new PlanRequest(requestText, snapshot, snapshot.render(), null,
                 ToolRegistry.defaults().schemaJson());
@@ -153,6 +186,7 @@ public final class CompanionCommands {
             source.sendFailure(Component.literal("No companion nearby"));
             return 0;
         }
+        companion.closeStandingOrder();
         if (companion.getPlanExecutor().isActive()) {
             companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
             source.sendSuccess(() -> Component.literal("Plan cancelled"), false);

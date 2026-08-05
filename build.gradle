@@ -36,6 +36,11 @@ loom {
 		client {
 			programArg "--username"
 			programArg "Player67"
+			// Same passthrough as the server: handy for a live planner test without editing
+			// config/minemate.json. The key is more usually left to OPENAI_API_KEY.
+			vmArg "-Dminemate.planner.apiKey=${System.getProperty('minemate.planner.apiKey', '')}"
+			vmArg "-Dminemate.planner.model=${System.getProperty('minemate.planner.model', '')}"
+			vmArg "-Dminemate.planner.enabled=${System.getProperty('minemate.planner.enabled', 'true')}"
 		}
 
 		server {
@@ -43,6 +48,9 @@ loom {
 			vmArg "-Dminemate.autotest=${System.getProperty('minemate.autotest', 'false')}"
 			vmArg "-Dminemate.autotest.profile=${System.getProperty('minemate.autotest.profile', 'smoke')}"
 			vmArg "-Dminemate.autotest.scenario=${System.getProperty('minemate.autotest.scenario', '')}"
+			vmArg "-Dminemate.planner.apiKey=${System.getProperty('minemate.planner.apiKey', '')}"
+			vmArg "-Dminemate.planner.model=${System.getProperty('minemate.planner.model', '')}"
+			vmArg "-Dminemate.planner.enabled=${System.getProperty('minemate.planner.enabled', 'true')}"
 		}
 	}
 

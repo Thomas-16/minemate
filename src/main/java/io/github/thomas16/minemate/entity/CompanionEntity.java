@@ -15,6 +15,7 @@ import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.context.CompanionContext;
 import io.github.thomas16.minemate.context.CompanionJournal;
 import io.github.thomas16.minemate.planner.PlanExecutor;
+import io.github.thomas16.minemate.planner.StandingOrder;
 import io.github.thomas16.minemate.integration.CompanionDefensePolicy;
 import io.github.thomas16.minemate.integration.CompanionReflexTelemetry;
 import io.github.thomas16.minemate.integration.ReflexSnapshot;
@@ -75,6 +76,7 @@ public class CompanionEntity extends LivingEntity
     private CompanionReflexTelemetry reflexTelemetry;
     private CompanionContext context;
     private PlanExecutor planExecutor;
+    private StandingOrder standingOrder;
 
     private UUID ownerUuid;
     private Vec3 lastVelocity = Vec3.ZERO;
@@ -138,6 +140,20 @@ public class CompanionEntity extends LivingEntity
     /** Server-side only; null on the client. */
     public PlanExecutor getPlanExecutor() {
         return planExecutor;
+    }
+
+    /** The owner order being worked on, or null when the companion has no standing instruction. */
+    public StandingOrder getStandingOrder() {
+        return standingOrder;
+    }
+
+    /** Opens a fresh order with a full replan budget, replacing any order still open. */
+    public void openStandingOrder(String requestText) {
+        this.standingOrder = new StandingOrder(requestText, this.level().getGameTime());
+    }
+
+    public void closeStandingOrder() {
+        this.standingOrder = null;
     }
 
     public Optional<UUID> getOwnerUuid() {
@@ -231,6 +247,9 @@ public class CompanionEntity extends LivingEntity
     @Override
     public void remove(RemovalReason reason) {
         if (!this.level().isClientSide && this.controller != null) {
+            // First: the shutdown below arms a replan trigger, and without this the autonomy
+            // listener would answer it by planning for a companion that is on its way out.
+            this.standingOrder = null;
             // Before the supervisor, so the plan reports its own terminal outcome rather than
             // having it misattributed to the goal cancellation the supervisor is about to emit.
             this.planExecutor.shutdown(Reasons.COMPANION_REMOVED);

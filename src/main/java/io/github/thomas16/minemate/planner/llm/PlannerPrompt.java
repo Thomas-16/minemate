@@ -93,9 +93,10 @@ public final class PlannerPrompt {
         if (request.repairNote() != null && !request.repairNote().isBlank()) {
             text.append("REPAIR: your previous reply for this order was rejected: ")
                     .append(request.repairNote())
-                    .append(". Send one corrected complete reply: call declare_order_contract for")
-                    .append(" this order and cover every deliverable with matching world-tool calls,")
-                    .append(" or report a terminal order status.\n");
+                    .append(". Send one corrected complete reply: speech plus the world-tool calls")
+                    .append(" that cover every deliverable, declaring the order contract in the")
+                    .append(" same reply only if it is not recorded yet, or report a terminal")
+                    .append(" order status. Never send declare_order_contract alone.\n");
         }
         return text.append("ORDER: ").append(request.requestText()).toString();
     }

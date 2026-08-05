@@ -189,10 +189,20 @@ public final class Goals {
     }
 
     private static final class CollectProbe implements GoalProbe {
+        /**
+         * An engine failure reason must persist this long, with no new items arriving, before it
+         * blocks the goal. Descendant ResourceTasks keep transient failure reasons while a parent
+         * is still working, so acting on first sight kills live pipelines.
+         */
+        private static final int FAILURE_CONFIRM_TICKS = 100;
+
         private final Item[] matches;
         private final String resource;
         private final int count;
         private int baseline;
+        private int lastSampledHave;
+        private int failurePresentTicks;
+        private int haveAtFailureStart;
 
         private CollectProbe(Item[] matches, String resource, int count) {
             this.matches = matches;
@@ -203,22 +213,33 @@ public final class Goals {
         @Override
         public void onStart(Context context) {
             baseline = inventoryCount(context, matches);
+            lastSampledHave = baseline;
         }
 
         @Override
         public GoalProgress sample(Context context) {
             int have = inventoryCount(context, matches);
+            lastSampledHave = have;
             return GoalProgress.counted(have, count,
                     "%d/%d %s (had %d to start)".formatted(have, count, resource, baseline));
         }
 
         @Override
         public String blockedReason(Context context) {
-            if (context.task() instanceof ResourceTask resourceTask
-                    && resourceTask.getAggregatedFailureReason().isPresent()) {
-                return Reasons.RESOURCE_UNAVAILABLE;
+            boolean failing = context.task() instanceof ResourceTask resourceTask
+                    && resourceTask.getAggregatedFailureReason().isPresent();
+            if (!failing) {
+                failurePresentTicks = 0;
+                return null;
             }
-            return null;
+            if (failurePresentTicks == 0) {
+                haveAtFailureStart = lastSampledHave;
+            } else if (lastSampledHave > haveAtFailureStart) {
+                failurePresentTicks = 0;
+                return null;
+            }
+            failurePresentTicks++;
+            return failurePresentTicks >= FAILURE_CONFIRM_TICKS ? Reasons.RESOURCE_UNAVAILABLE : null;
         }
     }
 
@@ -226,6 +247,7 @@ public final class Goals {
         private final Item[] matches;
         private final String resource;
         private final int count;
+        private final PipelineProgress pipeline;
         private int companionBaseline;
         private int ownerBaseline;
         private int maxHeld;
@@ -235,6 +257,7 @@ public final class Goals {
             this.matches = matches;
             this.resource = resource;
             this.count = count;
+            this.pipeline = new PipelineProgress(new ItemTarget(resource, count));
         }
 
         @Override
@@ -244,6 +267,7 @@ public final class Goals {
             ServerPlayer currentOwner = owner(context);
             ownerBaseline = currentOwner == null ? 0 : playerInventoryCount(currentOwner, matches);
             maxOwnerCount = ownerBaseline;
+            pipeline.onStart(context);
         }
 
         @Override
@@ -255,13 +279,20 @@ public final class Goals {
                 maxOwnerCount = Math.max(maxOwnerCount, playerInventoryCount(currentOwner, matches));
             }
             int delivered = Math.min(count, Math.max(0, maxOwnerCount - ownerBaseline));
-            double advance = delivered > 0
-                    ? count + delivered
-                    : Math.min(maxHeld, count);
-            String phase = delivered >= count ? "delivered" : delivered > 0 ? "delivering" : "collecting";
-            return new GoalProgress(delivered, count, advance,
-                    "%d/%d %s %s (companion had %d; owner had %d)".formatted(
-                            delivered, count, resource, phase, companionBaseline, ownerBaseline));
+            double advance = (delivered > 0 ? count + delivered : Math.min(maxHeld, count))
+                    + pipeline.subAdvance(context);
+            String text;
+            if (delivered >= count) {
+                text = "%d/%d %s delivered".formatted(delivered, count, resource);
+            } else if (delivered > 0) {
+                text = "%d/%d %s delivering".formatted(delivered, count, resource);
+            } else {
+                String materials = pipeline.materialsSummary();
+                text = "%d/%d %s - %s".formatted(delivered, count, resource,
+                        pipeline.phaseWord(context))
+                        + (materials == null ? "" : " (" + materials + ")");
+            }
+            return new GoalProgress(delivered, count, advance, text);
         }
 
         @Override
@@ -345,7 +376,11 @@ public final class Goals {
                     // and takes the server down with it. It never showed up for oak_boat because
                     // that resolves to a craft macro, whose isFinished touches no controller.
                     if (acquisitionTicked && (acquisition.stopped() || acquisition.isFinished())) {
-                        acquisitionFailure = resourceFailureInTree().orElse(Reasons.RESOURCE_UNAVAILABLE);
+                        // The wrapper only stops short of the target once its local re-plan
+                        // attempts are exhausted, so failing here is legitimate.
+                        acquisitionFailure = acquisition instanceof ResilientAcquisitionTask resilient
+                                ? resilient.terminalFailure().orElse(Reasons.RESOURCE_UNAVAILABLE)
+                                : Reasons.RESOURCE_UNAVAILABLE;
                         fail(acquisitionFailure);
                         return null;
                     }
@@ -379,12 +414,14 @@ public final class Goals {
         }
 
         private Task createAcquisitionTask() {
-            CraftMacroTasks.MacroProbe macro = CraftMacroTasks.macroOutcome(controller, target);
-            if (macro.outcome() == CraftMacroTasks.MacroOutcome.MACRO_CREATED
-                    && macro.taskOrNull() != null) {
-                return macro.taskOrNull();
-            }
-            return TaskCatalogue.getItemTask(resource, count);
+            return new ResilientAcquisitionTask(target, () -> {
+                CraftMacroTasks.MacroProbe macro = CraftMacroTasks.macroOutcome(controller, target);
+                if (macro.outcome() == CraftMacroTasks.MacroOutcome.MACRO_CREATED
+                        && macro.taskOrNull() != null) {
+                    return macro.taskOrNull();
+                }
+                return TaskCatalogue.getItemTask(resource, count);
+            }, resource);
         }
 
         @Override
@@ -408,24 +445,10 @@ public final class Goals {
         }
 
         private Optional<String> resourceFailure() {
-            if (acquisitionFailure != null) {
-                return Optional.of(acquisitionFailure);
-            }
-            if (!acquisitionComplete) {
-                return resourceFailureInTree();
-            }
-            return Optional.empty();
-        }
-
-        private Optional<String> resourceFailureInTree() {
-            String[] reason = new String[1];
-            thisOrChildSatisfies(task -> {
-                if (task instanceof ResourceTask resourceTask) {
-                    reason[0] = resourceTask.getAggregatedFailureReason().orElse(null);
-                }
-                return reason[0] != null;
-            });
-            return Optional.ofNullable(reason[0]);
+            // Only the latched terminal failure. A live scan of the sub-chain here turned any
+            // transient descendant failure reason into an instant BLOCKED for a working pipeline;
+            // ResilientAcquisitionTask now owns tree observation and retries.
+            return Optional.ofNullable(acquisitionFailure);
         }
     }
 }

@@ -83,9 +83,17 @@ public final class PlannerDispatch {
             if (order != null) {
                 String violation = null;
                 if (plan.steps().isEmpty()) {
-                    // A single-call-habit model declares the contract and stops. The reply is
-                    // honest about what the order needs, so ask once for the missing work rather
-                    // than failing the order over it.
+                    if (plan.contract() != null && order.contract() == null) {
+                        // The single-call habit: the model declares the contract and stops. Live
+                        // sessions show a repair prompt often just reproduces the habit, so do not
+                        // spend the repair on it. The contract itself is honest about what the
+                        // order needs: record it and ask for the world calls as a continuation.
+                        // Coverage is still enforced on that follow-up via awaitingCoverage.
+                        order.declareContract(plan.contract());
+                        order.markAwaitingCoverage();
+                        continueForCoverage(companion, planner, request, plan);
+                        return;
+                    }
                     violation = "the reply declared a contract but no world-tool calls";
                 } else if (order.contract() == null) {
                     // First accepted action reply not seen yet: this reply must declare the
@@ -93,6 +101,11 @@ public final class PlannerDispatch {
                     violation = plan.contract() == null
                             ? "the action reply did not declare the order contract"
                             : ContractCoverage.violation(plan.contract(), plan.steps());
+                } else if (order.awaitingCoverage()) {
+                    // The stored contract arrived alone and nothing has executed since, so this
+                    // first real plan is judged against the whole contract, exactly as if the
+                    // model had sent contract and calls together.
+                    violation = ContractCoverage.violation(order.contract(), plan.steps());
                 } else if (plan.contract() != null) {
                     // A replan re-declaring the contract is tolerated and ignored: the stored one
                     // is authoritative, and replans plan only the remaining work, which cannot be
@@ -107,6 +120,7 @@ public final class PlannerDispatch {
                 if (order.contract() == null) {
                     order.declareContract(plan.contract());
                 }
+                order.clearAwaitingCoverage();
             }
         }
         PlanExecutor.StartResult result = companion.getPlanExecutor().start(plan);
@@ -121,6 +135,28 @@ public final class PlannerDispatch {
                     .map(outcome -> ToolMessages.owner(outcome.reason(), ""))
                     .orElse("I could not use that plan"));
         }
+    }
+
+    /**
+     * The free follow-up for a contract-only first reply: the declared contract is stored, the
+     * model's speech reaches the owner, and one more request asks for the world-tool calls. Not
+     * charged against the repair, which stays reserved for a plan that violates the contract; a
+     * model that sends the contract alone again after this goes through the ordinary repair path
+     * and then closes.
+     */
+    private static void continueForCoverage(CompanionEntity companion, Planner planner,
+            PlanRequest request, Plan plan) {
+        MineMate.LOGGER.info(
+                "Planner {} declared the order contract without world calls; requesting the work",
+                planner.name());
+        if (!plan.dialogue().isBlank()) {
+            tell(companion, plan.dialogue());
+        }
+        String note = "it declared the order contract, which is now recorded, but contained no"
+                + " world-tool calls";
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        request(companion, planner, new PlanRequest(request.requestText(), snapshot,
+                snapshot.render(), request.trigger(), request.toolSchemaJson(), note));
     }
 
     /**

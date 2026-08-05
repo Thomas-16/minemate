@@ -121,7 +121,8 @@ public final class DevAutoTest {
             "llm_http_error",
             "llm_talk_only",
             "llm_contract_repair",
-            "llm_contract_only_repair",
+            "llm_contract_only_continuation",
+            "llm_contract_only_exhausted",
             "llm_contract_exhausted",
             "llm_answered");
     /** Scenarios that make real network calls. Selectable by name, never included in a profile. */
@@ -131,6 +132,10 @@ public final class DevAutoTest {
     /** A distinct profile because Fabric caches discarded FakePlayer instances by profile. */
     private static final UUID PLAIN_FETCH_OWNER_UUID =
             UUID.fromString("8b06ad2a-c45e-4e71-89ef-870f7cf9614c");
+    private static final UUID PIPELINE_FETCH_OWNER_UUID =
+            UUID.fromString("4d1af7d3-9c26-4b8e-b1d2-6f0e58c92a41");
+    private static final UUID UNAVAILABLE_FETCH_OWNER_UUID =
+            UUID.fromString("a92c33e5-1e74-4f0a-bd68-30c5f1de77b2");
     private static final UUID FRIENDLY_FIRE_OWNER_UUID =
             UUID.fromString("5ec29e35-81d1-4c23-aef9-0e394daaf52d");
     private static final UUID DEBUG_VIEWER_UUID =
@@ -179,6 +184,10 @@ public final class DevAutoTest {
     private static final List<BlockPos> worldMaterialPositions = new ArrayList<>();
     private static final List<ItemEntity> observedFetchDrops = new ArrayList<>();
     private static final List<FetchThrowObservation> observedFetchThrows = new ArrayList<>();
+    /** Composite phase words whose appearance in progress text the pipeline scenario asserts. */
+    private static final Set<String> PIPELINE_PHASE_WORDS = Set.of(
+            "mining", "smelting", "crafting", "searching", "approaching");
+    private static final Set<String> observedPipelinePhases = new HashSet<>();
 
     private DevAutoTest() {
     }
@@ -334,6 +343,28 @@ public final class DevAutoTest {
                         ignoredServer -> prepareFetchPlainResource(),
                         DevAutoTest::clearFetchPlainResource,
                         () -> null),
+                // The full mine -> smelt -> craft -> deliver pipeline behind one fetch. On the old
+                // probes this died as a false BLOCKED when a transient descendant failure surfaced
+                // mid-pipeline; it also asserts a floor on phase reporting: at least one progress
+                // sample must name a composite phase instead of an opaque "collecting".
+                new Scenario("fetch_composite_pipeline",
+                        ignored -> Goals.fetch("bucket", 1),
+                        DevAutoTest::acceptFetchCompositePipeline,
+                        6200,
+                        ignoredServer -> prepareFetchCompositePipeline(),
+                        DevAutoTest::clearFetchCompositePipeline,
+                        DevAutoTest::fetchCompositePipelineInvariant),
+                // A genuinely unavailable resource must still block promptly: no inventory change
+                // means no local re-plan attempt is funded, so the engine watchdog's failure
+                // surfaces as BLOCKED well inside this cap instead of the 6000-tick goal timeout.
+                new Scenario("fetch_unavailable_bounded",
+                        ignored -> Goals.fetch("bucket", 1),
+                        outcome -> outcome.status() == OutcomeStatus.BLOCKED
+                                && Reasons.RESOURCE_UNAVAILABLE.equals(outcome.reason()),
+                        3200,
+                        ignoredServer -> prepareFetchUnavailable(),
+                        DevAutoTest::clearFetchUnavailable,
+                        DevAutoTest::craftSearchWindowInvariant),
                 new Scenario("craft_no_recipe",
                         ignored -> Goals.craft(companion, Items.BEDROCK, 1),
                         outcome -> outcome.status() == OutcomeStatus.BLOCKED
@@ -637,14 +668,26 @@ public final class DevAutoTest {
                         ignoredServer -> prepareLlmContractRepair(),
                         DevAutoTest::clearLlmPlanner,
                         () -> null),
-                Scenario.probe("llm_contract_only_repair",
+                // The single-call habit is absorbed without spending the repair: a contract-only
+                // first reply stores its contract and gets a free continuation request, and the
+                // follow-up plan is still validated against the whole stored contract.
+                Scenario.probe("llm_contract_only_continuation",
                         () -> llmTransport != null && llmTransport.calls() == 2
                                 && !companion.getPlanExecutor().isPlannerRequestPending(),
-                        () -> llmContractRepairVerdict("declared a contract but no world-tool calls"),
+                        DevAutoTest::llmContractContinuationVerdict,
                         400,
-                        ignoredServer -> prepareLlmContractOnlyRepair(),
+                        ignoredServer -> prepareLlmContractOnlyContinuation(),
                         DevAutoTest::clearLlmPlanner,
                         () -> null),
+                // A model that keeps sending the contract alone gets the continuation, then the
+                // repair, then an honest close: three requests, nothing executed.
+                Scenario.probe("llm_contract_only_exhausted",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::llmContractOnlyExhaustedVerdict,
+                        300,
+                        ignoredServer -> prepareLlmContractOnlyExhausted(),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
                 Scenario.probe("llm_contract_exhausted",
                         () -> llmPlannerSettled() && companion.getStandingOrder() == null,
                         DevAutoTest::llmContractExhaustedVerdict,
@@ -1212,18 +1255,32 @@ public final class DevAutoTest {
 
     /**
      * The live bucket regression: a single-call-habit model declares the contract, says it is on
-     * the job, and plans nothing. The repair demands the contract and the work in one reply.
+     * the job, and plans nothing. The contract is stored and a free continuation asks for the
+     * work; the follow-up deliberately omits the contract, so its coverage is judged against the
+     * stored one through the awaiting-coverage window.
      */
-    private static void prepareLlmContractOnlyRepair() {
+    private static void prepareLlmContractOnlyContinuation() {
         prepareInventory();
         prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
         installLlmPlanner(FixtureTransport.of(
                 FixtureTransport.ok(llmResponse("I will get you an iron sword.",
                         llmContract("[{\"item\":\"iron_sword\",\"count\":1}]", true))),
                 FixtureTransport.ok(llmResponse("Forging the sword and bringing it over.",
-                        llmContract("[{\"item\":\"iron_sword\",\"count\":1}]", true),
                         llmCall("craft", "{\"item\":\"iron_sword\",\"count\":1}"),
                         llmCall("fetch", "{\"resource\":\"iron_sword\",\"count\":1}")))), 0);
+        requestLlmPlan("can u make me an iron sword");
+    }
+
+    /**
+     * A model that never gets past the habit: every reply is the same contract-only shape, so the
+     * order spends the continuation, then the repair, then closes honestly after three requests.
+     */
+    private static void prepareLlmContractOnlyExhausted() {
+        prepareInventory();
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I will get you an iron sword.",
+                        llmContract("[{\"item\":\"iron_sword\",\"count\":1}]", true)))), 0);
         requestLlmPlan("can u make me an iron sword");
     }
 
@@ -1611,6 +1668,67 @@ public final class DevAutoTest {
         }
         if (order.replansUsed() != 0) {
             return "the repair was charged against the replan budget";
+        }
+        return null;
+    }
+
+    private static String llmContractContinuationVerdict() {
+        if (llmTransport.calls() != 2) {
+            return "expected one contract-only reply and one continuation request, saw "
+                    + llmTransport.calls();
+        }
+        String body = llmTransport.lastRequestBody();
+        if (!body.contains("REPAIR:") || !body.contains("now recorded")) {
+            return "the continuation request did not say the contract was recorded";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "a contract-only first reply was recorded as a planner failure";
+        }
+        if (!companion.getPlanExecutor().isActive()) {
+            return "the continuation plan was not accepted and active";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null) {
+            return "the continuation closed the standing order";
+        }
+        OrderContract contract = order.contract();
+        if (contract == null || !contract.deliverToOwner()
+                || contract.deliverables().size() != 1
+                || !"iron_sword".equals(contract.deliverables().get(0).item())) {
+            return "the contract-only reply's contract was not stored: " + contract;
+        }
+        if (!order.repairAvailable()) {
+            return "the continuation consumed the repair";
+        }
+        if (order.awaitingCoverage()) {
+            return "an accepted covered plan left the order awaiting coverage";
+        }
+        if (order.replansUsed() != 0) {
+            return "the continuation was charged against the replan budget";
+        }
+        return null;
+    }
+
+    private static String llmContractOnlyExhaustedVerdict() {
+        if (llmTransport.calls() != 3) {
+            return "expected continuation, repair, then close, saw " + llmTransport.calls()
+                    + " requests";
+        }
+        if (!journalHasSummary(EventKind.PLANNER_FAILED,
+                "planning failed (the reply declared a contract but no world-tool calls)")) {
+            return "the exhausted continuation did not record the contract-only violation";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            return "a contract-only order executed anyway";
+        }
+        if (sawNewPlanOutcome()) {
+            return "a contract-only order reached PlanExecutor";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "a contract-only order submitted a goal";
+        }
+        if (companion.getStandingOrder() != null) {
+            return "the exhausted continuation left the standing order open";
         }
         return null;
     }
@@ -2325,6 +2443,61 @@ public final class DevAutoTest {
     }
 
     private static void clearFetchPlainResource(MinecraftServer server) {
+        clearFakeOwner();
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        clearFixtures();
+    }
+
+    private static void prepareFetchCompositePipeline() {
+        // The iron-sword fixture set supports the whole bucket pipeline too: logs for a crafting
+        // table, cobblestone for a furnace, three iron ore for the ingots, coal for fuel.
+        prepareIronSwordWorld();
+        prepareFakeOwner(PIPELINE_FETCH_OWNER_UUID, "MineMatePipelineOwner");
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        observedPipelinePhases.clear();
+    }
+
+    private static void clearFetchCompositePipeline(MinecraftServer server) {
+        clearFakeOwner();
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        clearFixtures();
+    }
+
+    private static boolean acceptFetchCompositePipeline(TaskOutcome outcome) {
+        int delivered = fakeOwnerInventoryCount(Items.BUCKET);
+        boolean accepted = succeeded(outcome) && delivered >= 1 && !observedPipelinePhases.isEmpty();
+        if (!accepted) {
+            MineMate.LOGGER.error(
+                    "[autotest] fetch_composite_pipeline postcondition delivered={} phases={} "
+                            + "ironIngots={} buckets={} engineState={} engineLog={}",
+                    delivered, observedPipelinePhases, inventoryCount(Items.IRON_INGOT),
+                    inventoryCount(Items.BUCKET), outcome.engineState(), outcome.engineLog());
+        }
+        return accepted;
+    }
+
+    private static String fetchCompositePipelineInvariant() {
+        companion.getSupervisor().currentProgress().ifPresent(progress -> {
+            for (String word : PIPELINE_PHASE_WORDS) {
+                if (progress.text().contains(word)) {
+                    observedPipelinePhases.add(word);
+                }
+            }
+        });
+        return compositeActivityInvariant();
+    }
+
+    private static void prepareFetchUnavailable() {
+        prepareInventory();
+        prepareFakeOwner(UNAVAILABLE_FETCH_OWNER_UUID, "MineMateUnavailableOwner");
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+    }
+
+    private static void clearFetchUnavailable(MinecraftServer server) {
         clearFakeOwner();
         observedFetchDrops.clear();
         observedFetchThrows.clear();

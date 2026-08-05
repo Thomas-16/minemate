@@ -4,7 +4,6 @@ import com.player2.playerengine.containeraccess.ContainerResolver;
 import com.player2.playerengine.containeraccess.ScanReportFormatter.TransferDirection;
 import com.player2.playerengine.containeraccess.StorageAccessCode;
 import com.player2.playerengine.containeraccess.StorageItemArgs.ItemQuery;
-import com.player2.playerengine.tasks.ResourceTask;
 import com.player2.playerengine.tasks.base.Task;
 import com.player2.playerengine.tasks.container.BoundedContainerTransferTask;
 import com.player2.playerengine.tasks.cooking.SmeltDeferredParams;
@@ -14,7 +13,6 @@ import com.player2.playerengine.tasks.cooking.resolver.CookingRecipeAccess;
 import com.player2.playerengine.tasks.cooking.resolver.CookingRecipeAccess.CookKind;
 import com.player2.playerengine.tasks.cooking.resolver.CookingRecipeAccess.CookResolution;
 import com.player2.playerengine.tasks.cooking.resolver.CookingRecipeAccessImpl;
-import com.player2.playerengine.tasks.crafting.CraftMacroResourceTask;
 import com.player2.playerengine.tasks.crafting.CraftMacroTasks;
 import com.player2.playerengine.util.ItemTarget;
 
@@ -43,22 +41,7 @@ final class CertifiedGoals {
         Objects.requireNonNull(companion, "companion");
         Objects.requireNonNull(output, "output");
         String outputId = itemId(output);
-        GoalProbe probe = new ExactInventoryProbe(output, desiredTotal,
-                "crafting " + outputId) {
-            @Override
-            public TaskTerminalResult terminalResult(Context context) {
-                if (!(context.task() instanceof ResourceTask resourceTask)
-                        || (!context.task().stopped() && !context.task().isFinished())) {
-                    return null;
-                }
-                if (context.task() instanceof CraftMacroResourceTask macro
-                        && macro.getFailureReason() != null && !macro.getFailureReason().isBlank()) {
-                    return TaskTerminalResult.blocked(Reasons.MATERIALS_UNAVAILABLE);
-                }
-                return resourceTask.getAggregatedFailureReason().isPresent()
-                        ? TaskTerminalResult.blocked(Reasons.MATERIALS_UNAVAILABLE) : null;
-            }
-        };
+        GoalProbe probe = new CraftPipelineProbe(output, desiredTotal, outputId);
         return new Goal(Goal.nextId(), "craft", "craft " + desiredTotal + " " + outputId,
                 GoalExecutionProfile.composite(
                         "May acquire recipe ingredients and craft or use a crafting table"),
@@ -66,13 +49,27 @@ final class CertifiedGoals {
                     if (inventoryCount(companion, output) >= desiredTotal) {
                         return new AlreadySatisfiedTask();
                     }
+                    ItemTarget target = new ItemTarget(output, desiredTotal);
                     CraftMacroTasks.MacroProbe macro = CraftMacroTasks.macroOutcome(
-                            companion.getController(), new ItemTarget(output, desiredTotal));
+                            companion.getController(), target);
                     if (macro.outcome() != CraftMacroTasks.MacroOutcome.MACRO_CREATED
                             || macro.taskOrNull() == null) {
                         throw new GoalStartException(TaskTerminalResult.blocked(Reasons.NO_CRAFTING_RECIPE));
                     }
-                    return macro.taskOrNull();
+                    // First attempt reuses the macro created above; retries re-plan against the
+                    // inventory as it stands, where a null re-plan is terminal.
+                    Task[] first = { macro.taskOrNull() };
+                    return new ResilientAcquisitionTask(target, () -> {
+                        if (first[0] != null) {
+                            Task initial = first[0];
+                            first[0] = null;
+                            return initial;
+                        }
+                        CraftMacroTasks.MacroProbe replan = CraftMacroTasks.macroOutcome(
+                                companion.getController(), target);
+                        return replan.outcome() == CraftMacroTasks.MacroOutcome.MACRO_CREATED
+                                ? replan.taskOrNull() : null;
+                    }, outputId);
                 }, probe, 6000, 0);
     }
 
@@ -226,6 +223,49 @@ final class CertifiedGoals {
 
     private static String reason(StorageAccessCode code) {
         return code == null || code == StorageAccessCode.OK ? Reasons.ENGINE_BLOCKED : code.token();
+    }
+
+    /** Ingredient-aware probe for the craft pipeline; see {@link PipelineProgress}. */
+    private static final class CraftPipelineProbe implements GoalProbe {
+        private final Item output;
+        private final int desiredTotal;
+        private final String activity;
+        private final PipelineProgress pipeline;
+
+        private CraftPipelineProbe(Item output, int desiredTotal, String outputId) {
+            this.output = output;
+            this.desiredTotal = desiredTotal;
+            this.activity = "crafting " + outputId;
+            this.pipeline = new PipelineProgress(new ItemTarget(output, desiredTotal));
+        }
+
+        @Override
+        public void onStart(Context context) {
+            pipeline.onStart(context);
+        }
+
+        @Override
+        public GoalProgress sample(Context context) {
+            int have = inventoryCount(context.companion(), output);
+            if (!(context.task() instanceof ResilientAcquisitionTask)) {
+                return GoalProgress.counted(have, desiredTotal,
+                        activity + ": " + have + "/" + desiredTotal);
+            }
+            String materials = pipeline.materialsSummary();
+            String text = activity + ": " + have + "/" + desiredTotal
+                    + " - " + pipeline.phaseWord(context)
+                    + (materials == null ? "" : " (" + materials + ")");
+            return new GoalProgress(have, desiredTotal, have + pipeline.subAdvance(context), text);
+        }
+
+        @Override
+        public TaskTerminalResult terminalResult(Context context) {
+            if (context.task() instanceof ResilientAcquisitionTask wrapper
+                    && wrapper.terminalFailure().isPresent()) {
+                return TaskTerminalResult.blocked(Reasons.MATERIALS_UNAVAILABLE);
+            }
+            return null;
+        }
     }
 
     private abstract static class ExactInventoryProbe implements GoalProbe {

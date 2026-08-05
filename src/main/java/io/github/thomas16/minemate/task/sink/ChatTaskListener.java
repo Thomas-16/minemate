@@ -38,10 +38,12 @@ public final class ChatTaskListener implements TaskListener {
         long now = System.currentTimeMillis();
         ProgressState previous = progressStates.get(companion.getUUID());
         if (previous != null && previous.goalId().equals(goal.id()) && previous.have() == progress.have()
+                && previous.text().equals(progress.text())
                 && now - previous.sentAtMs() < REPEAT_AFTER_MS) {
             return;
         }
-        progressStates.put(companion.getUUID(), new ProgressState(goal.id(), progress.have(), now));
+        progressStates.put(companion.getUUID(), new ProgressState(goal.id(), progress.have(),
+                progress.text(), now));
         owner.sendSystemMessage(message(progress.text(), ChatFormatting.GRAY));
     }
 
@@ -76,6 +78,6 @@ public final class ChatTaskListener implements TaskListener {
         return Component.literal("[MineMate] " + text).withStyle(color);
     }
 
-    private record ProgressState(String goalId, int have, long sentAtMs) {
+    private record ProgressState(String goalId, int have, String text, long sentAtMs) {
     }
 }

@@ -15,6 +15,7 @@ public final class StandingOrder {
     private int replansUsed;
     private OrderContract contract;
     private boolean repairUsed;
+    private boolean awaitingCoverage;
 
     public StandingOrder(String requestText, long openedAtGameTime) {
         this.requestText = requestText == null ? "" : requestText;
@@ -62,6 +63,24 @@ public final class StandingOrder {
 
     public void consumeRepair() {
         repairUsed = true;
+    }
+
+    /**
+     * True while the stored contract came from a contract-only reply and no covered plan has been
+     * accepted yet. Nothing has executed in that window, so the full contract is still judgeable
+     * and the next action reply must satisfy coverage as a whole; replans after an accepted
+     * covered plan are exempt as usual.
+     */
+    public boolean awaitingCoverage() {
+        return awaitingCoverage;
+    }
+
+    public void markAwaitingCoverage() {
+        awaitingCoverage = true;
+    }
+
+    public void clearAwaitingCoverage() {
+        awaitingCoverage = false;
     }
 
     @Override

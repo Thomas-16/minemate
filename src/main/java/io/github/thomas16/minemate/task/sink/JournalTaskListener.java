@@ -9,7 +9,7 @@ import io.github.thomas16.minemate.task.TaskListener;
 import io.github.thomas16.minemate.task.TaskOutcome;
 
 /**
- * Feeds goal lifecycle into each companion's journal, and arms a replan trigger on every outcome.
+ * Feeds goal lifecycle into each companion's journal, and arms replanning for standalone outcomes.
  *
  * <p>One stateless global instance serves every companion. {@code TaskListeners} fans out
  * unfiltered, but each callback is handed the companion it concerns, so writing to that companion's
@@ -38,7 +38,11 @@ public final class JournalTaskListener implements TaskListener {
         context.record(EventKind.GOAL_FINISHED,
                 "%s %s (%s)".formatted(goal.description(), outcome.status(), outcome.reason()),
                 outcome.toCompactString());
-        context.triggers().arm(ReplanReason.TASK_OUTCOME,
-                goal.kind() + " " + outcome.status() + " " + outcome.reason());
+        // PlanExecutor publishes one PLAN_FINISHED boundary after consuming all step outcomes.
+        // Arming TASK_OUTCOME for its private step goals would request once per step as well.
+        if (companion.getPlanExecutor() == null || !companion.getPlanExecutor().ownsGoal(goal.id())) {
+            context.triggers().arm(ReplanReason.TASK_OUTCOME,
+                    goal.kind() + " " + outcome.status() + " " + outcome.reason());
+        }
     }
 }

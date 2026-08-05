@@ -1,12 +1,13 @@
 package io.github.thomas16.minemate.planner;
 
-import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.planner.llm.JdkHttpTransport;
 import io.github.thomas16.minemate.planner.llm.LlmBackend;
+import io.github.thomas16.minemate.planner.llm.LlmException;
 import io.github.thomas16.minemate.planner.llm.LlmPrompt;
 import io.github.thomas16.minemate.planner.llm.LlmReply;
 import io.github.thomas16.minemate.planner.llm.OpenAiResponsesBackend;
 import io.github.thomas16.minemate.planner.llm.PlannerPrompt;
+import io.github.thomas16.minemate.planner.llm.PlannerProtocol;
 import io.github.thomas16.minemate.tool.ToolCall;
 
 import java.util.ArrayList;
@@ -57,8 +58,9 @@ public final class HostedPlanner implements Planner {
 
     @Override
     public CompletableFuture<Plan> plan(PlanRequest request) {
+        String hostedSchema = PlannerProtocol.hostedSchema(request.toolSchemaJson());
         LlmPrompt prompt = new LlmPrompt(PlannerPrompt.SYSTEM, PlannerPrompt.user(request),
-                request.toolSchemaJson(), cacheKeyFor(request.toolSchemaJson()));
+                hostedSchema, cacheKeyFor(hostedSchema));
         // The backend returns immediately; the mapping below runs on whatever thread completes it,
         // and touches nothing but the reply. PlannerDispatch owns the hop back to the server.
         //
@@ -79,18 +81,23 @@ public final class HostedPlanner implements Planner {
     private Plan toPlan(PlanRequest request, LlmReply reply) {
         List<ToolCall> calls = reply.calls();
         if (calls.size() > Plan.MAX_STEPS) {
-            // Trimming from the end keeps the plan valid: a continuous tool can only have been last,
-            // so dropping the tail can never strand one in the middle.
-            MineMate.LOGGER.warn("Planner returned {} calls; keeping the first {}",
-                    calls.size(), Plan.MAX_STEPS);
-            calls = calls.subList(0, Plan.MAX_STEPS);
+            throw LlmException.malformed("planner returned more than " + Plan.MAX_STEPS
+                    + " world-tool calls");
+        }
+        if (reply.disposition() == PlanDisposition.ACTION
+                && (calls.isEmpty() || reply.dialogue().isBlank())) {
+            throw LlmException.malformed("action reply requires speech and at least one world-tool call");
+        }
+        if (reply.disposition().terminal()
+                && (!calls.isEmpty() || reply.dialogue().isBlank())) {
+            throw LlmException.malformed("terminal reply requires one status message and no world-tool calls");
         }
         List<PlanStep> steps = new ArrayList<>(calls.size());
         for (ToolCall call : calls) {
             steps.add(PlanStep.of(call));
         }
-        // Zero steps with dialogue is the model reporting it is done; dispatch treats that as speech.
-        return new Plan(Plan.nextId(), request.requestText(), steps, reply.dialogue());
+        return new Plan(Plan.nextId(), request.requestText(), steps, reply.dialogue(),
+                reply.disposition());
     }
 
     private String cacheKeyFor(String schemaJson) {

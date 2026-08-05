@@ -57,19 +57,24 @@ import io.github.thomas16.minemate.context.JournalEntry;
 import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.planner.HostedPlanner;
 import io.github.thomas16.minemate.planner.Plan;
+import io.github.thomas16.minemate.planner.PlanDisposition;
 import io.github.thomas16.minemate.planner.PlanExecutor;
 import io.github.thomas16.minemate.planner.PlanOutcome;
 import io.github.thomas16.minemate.planner.PlanRequest;
 import io.github.thomas16.minemate.planner.PlanStatus;
 import io.github.thomas16.minemate.planner.PlanStep;
 import io.github.thomas16.minemate.planner.PlanStepOutcome;
+import io.github.thomas16.minemate.planner.PlannerAutonomy;
 import io.github.thomas16.minemate.planner.PlannerConfig;
 import io.github.thomas16.minemate.planner.PlannerDispatch;
 import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
+import io.github.thomas16.minemate.planner.StandingOrder;
+import io.github.thomas16.minemate.planner.llm.LlmException;
 import io.github.thomas16.minemate.planner.llm.LlmReply;
 import io.github.thomas16.minemate.planner.llm.OpenAiResponsesBackend;
 import io.github.thomas16.minemate.planner.llm.OpenAiToolSchemas;
+import io.github.thomas16.minemate.planner.llm.PlannerProtocol;
 import io.github.thomas16.minemate.tool.ToolCall;
 import io.github.thomas16.minemate.tool.ToolRegistry;
 import io.github.thomas16.minemate.tool.ToolValidation;
@@ -109,12 +114,13 @@ public final class DevAutoTest {
             "plan_step_failure_aborts",
             // Offline and fast: the whole hosted-planner failure surface costs a few hundred ticks.
             "llm_tool_schema",
+            "llm_protocol",
             "llm_unknown_tool",
             "llm_malformed_output",
             "llm_http_error",
             "llm_talk_only");
     /** Scenarios that make real network calls. Selectable by name, never included in a profile. */
-    private static final Set<String> LIVE_SCENARIOS = Set.of("llm_live");
+    private static final Set<String> LIVE_SCENARIOS = Set.of("llm_live", "llm_live_multi_step");
     private static final UUID FAKE_OWNER_UUID =
             UUID.fromString("bbf6e9b1-075b-4d78-928d-a73cc6c6155f");
     /** A distinct profile because Fabric caches discarded FakePlayer instances by profile. */
@@ -144,6 +150,8 @@ public final class DevAutoTest {
     private static boolean sawFurnaceReach;
     private static boolean planSawForbiddenGoal;
     private static FixtureTransport llmTransport;
+    private static boolean llmBudgetSawFinalPlanOpen;
+    private static Plan llmObservedLivePlan;
     private static boolean ownerDamageAccepted;
     private static boolean ownerDirectAttackBlocked;
     private static float companionHealthBeforeOwnerDamage;
@@ -497,16 +505,20 @@ public final class DevAutoTest {
                         ignoredServer -> {
                         },
                         () -> null),
+                Scenario.probe("llm_protocol",
+                        () -> true,
+                        DevAutoTest::llmProtocolViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
                 Scenario.plan("llm_plan_multi_step",
                         ignored -> null,
                         DevAutoTest::acceptLlmMultiStep,
                         2400,
-                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
-                                llmResponse("Grabbing some dirt, then heading back.",
-                                        llmCall("mine", "{\"resource\":\"dirt\",\"count\":null}"),
-                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 3) + ",\"z\":"
-                                                + spawn.getZ() + ",\"radius\":null}")))),
-                                "get me some dirt"),
+                        ignoredServer -> prepareLlmMultiStep(),
                         DevAutoTest::clearLlmPlanner,
                         () -> null),
                 Scenario.plan("llm_unknown_tool",
@@ -559,11 +571,20 @@ public final class DevAutoTest {
                         DevAutoTest::planRejectionInvariant),
                 Scenario.probe("llm_talk_only",
                         () -> llmPlannerSettled(),
-                        DevAutoTest::llmTalkOnlyVerdict,
+                        () -> llmFailureVerdict("missing status"),
                         200,
                         ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
                                 llmResponse("You already have plenty of dirt."))),
                                 "get me some dirt"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_oversized_reply",
+                        () -> llmPlannerSettled(),
+                        DevAutoTest::llmOversizedVerdict,
+                        200,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
+                                llmResponse("I have a very long route.", nineGotoCalls()))),
+                                "walk the long route"),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
                 Scenario.probe("llm_stale_request",
@@ -577,20 +598,41 @@ public final class DevAutoTest {
                                 "go a very long way"),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_plan_boundary",
+                        () -> scenarioTicks > 250,
+                        DevAutoTest::llmPlanBoundaryVerdict,
+                        400,
+                        ignoredServer -> prepareLlmPlanBoundary(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                Scenario.probe("llm_action_then_completed",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::llmActionThenCompletedVerdict,
+                        500,
+                        ignoredServer -> prepareLlmActionThenCompleted(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
                 Scenario.probe("llm_replan_budget",
-                        () -> scenarioTicks > 900,
+                        () -> journalHas(EventKind.PLANNER_BUDGET_EXHAUSTED),
                         DevAutoTest::llmReplanBudgetVerdict,
                         1400,
                         ignoredServer -> prepareLlmReplanBudget(),
                         DevAutoTest::clearLlmPlanner,
-                        () -> null),
-                // Never in a profile: the only scenario that leaves the machine, and the only one
-                // that costs money. Selected by name, and only with a key configured.
+                        DevAutoTest::llmReplanBudgetInvariant),
+                // Never in a profile: these are the only scenarios that leave the machine or cost
+                // money. Select them by name, and only with a key configured.
                 Scenario.probe("llm_live",
                         DevAutoTest::llmLiveAnswered,
                         DevAutoTest::llmLiveVerdict,
                         1200,
                         ignoredServer -> prepareLlmLive(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                Scenario.probe("llm_live_multi_step",
+                        DevAutoTest::llmLiveMultiStepAnswered,
+                        DevAutoTest::llmLiveMultiStepVerdict,
+                        1200,
+                        ignoredServer -> prepareLlmLiveMultiStep(),
                         DevAutoTest::clearLlmPlanner,
                         () -> null));
         String selectedScenario = System.getProperty("minemate.autotest.scenario", "").trim();
@@ -624,8 +666,8 @@ public final class DevAutoTest {
                 fail(server, "unknown autotest profile: " + profile);
                 return;
             }
-            // No profile, not even "full", may spend money or leave the machine. llm_live is
-            // reachable by name only; in CI there is no key and it would fail on every run.
+            // No profile, not even "full", may spend money or leave the machine. Live scenarios
+            // are reachable by name only; in CI there is no key and they would fail on every run.
             scenarios = scenarios.stream()
                     .filter(scenario -> !LIVE_SCENARIOS.contains(scenario.name()))
                     .toList();
@@ -1043,6 +1085,17 @@ public final class DevAutoTest {
         requestLlmPlan(requestText);
     }
 
+    /** Craft leaves the output with the companion; the dependent fetch then delivers that output. */
+    private static void prepareLlmMultiStep() {
+        prepareInventory(new ItemStack(Items.OAK_LOG, 1));
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("I will make the planks, then bring them to you.",
+                        llmCall("craft", "{\"item\":\"oak_planks\",\"count\":4}"),
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":4}")))), 0);
+        requestLlmPlan("make 4 oak planks for me");
+    }
+
     private static void requestLlmPlan(String requestText) {
         // Explicitly, not incidentally: several verdicts below turn on whether a PLANNER_FAILED
         // event exists, and llm_timeout legitimately leaves one behind. Without this the meaning of
@@ -1057,10 +1110,35 @@ public final class DevAutoTest {
 
     private static void prepareLlmReplanBudget() {
         prepareInventory();
+        llmBudgetSawFinalPlanOpen = false;
         installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(llmResponse("Working on it.",
                 llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":" + spawn.getZ() + "}")))),
                 LLM_REPLAN_BUDGET);
         requestLlmPlan("keep busy");
+    }
+
+    private static void prepareLlmPlanBoundary() {
+        prepareInventory();
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I am moving into position.",
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
+                                + spawn.getZ() + "}"))),
+                FixtureTransport.ok(llmResponse("I am continuing to the distant checkpoint.",
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 40_000) + ",\"z\":"
+                                + spawn.getZ() + "}")))), 3);
+        requestLlmPlan("move through both checkpoints");
+    }
+
+    private static void prepareLlmActionThenCompleted() {
+        prepareInventory();
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I am coming over.",
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
+                                + spawn.getZ() + "}"))),
+                FixtureTransport.ok(llmResponse(null,
+                        llmStatus("COMPLETED", "I am here.")))), 3);
+        requestLlmPlan("come here");
     }
 
     private static void clearLlmPlanner(MinecraftServer server) {
@@ -1084,11 +1162,19 @@ public final class DevAutoTest {
     }
 
     /**
-     * The one scenario that talks to the real endpoint, so that the model id, the strict schema and
-     * the reply shape are checked against the provider rather than against my assumptions about it.
-     * Opt-in by name only, and it charges a real account, so it is in no profile.
+     * Shared setup for opt-in scenarios that talk to the real endpoint, so the model id, strict
+     * schema and reply shape are checked against the provider. They charge a real account and are
+     * therefore in no profile.
      */
     private static void prepareLlmLive() {
+        prepareLlmLive(LLM_LIVE_ORDER, "llm_live");
+    }
+
+    private static void prepareLlmLiveMultiStep() {
+        prepareLlmLive(LLM_LIVE_MULTI_STEP_ORDER, "llm_live_multi_step");
+    }
+
+    private static void prepareLlmLive(String order, String scenarioName) {
         prepareInventory();
         // With no owner present, anything the model plausibly plans for "bring me X" binds to
         // owner_offline before it runs, and the test proves only that the JSON parsed.
@@ -1097,24 +1183,39 @@ public final class DevAutoTest {
         // No replan budget: one order must cost exactly one request.
         PlannerConfig config = PlannerConfig.of(file.baseUrl(), file.model(),
                 file.apiKey().orElse(""), 60, 0);
-        MineMate.LOGGER.info("[autotest] llm_live against {}", config.describe());
+        MineMate.LOGGER.info("[autotest] {} against {}", scenarioName, config.describe());
         llmTransport = null;
+        llmObservedLivePlan = null;
         Planners.install(HostedPlanner.of(config));
         companion.getJournal().clear();
-        companion.openStandingOrder(LLM_LIVE_ORDER);
+        companion.openStandingOrder(order);
         WorldSnapshot snapshot = companion.getContext().snapshot();
-        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(LLM_LIVE_ORDER,
+        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(order,
                 snapshot, snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
     }
 
     private static final String LLM_LIVE_ORDER = "get me 2 dirt and then come stand next to me";
+    private static final String LLM_LIVE_MULTI_STEP_ORDER =
+            "Make me an oak boat and then a chest, and bring both to me.";
 
     /** The model has answered once the request is no longer pending and something came of it. */
     private static boolean llmLiveAnswered() {
         PlanExecutor executor = companion.getPlanExecutor();
         return !executor.isPlannerRequestPending()
                 && (executor.isActive() || sawNewPlanOutcome()
-                        || journalHas(EventKind.PLANNER_FAILED));
+                        || journalHas(EventKind.PLANNER_FAILED)
+                        || companion.getStandingOrder() == null);
+    }
+
+    private static boolean llmLiveMultiStepAnswered() {
+        PlanExecutor executor = companion.getPlanExecutor();
+        if (executor.isPlannerRequestPending()) {
+            return false;
+        }
+        executor.currentPlan().ifPresent(plan -> llmObservedLivePlan = plan);
+        return llmObservedLivePlan != null || sawNewPlanOutcome()
+                || journalHas(EventKind.PLANNER_FAILED)
+                || companion.getStandingOrder() == null;
     }
 
     /**
@@ -1205,6 +1306,21 @@ public final class DevAutoTest {
         return call;
     }
 
+    private static JsonObject llmStatus(String status, String message) {
+        JsonObject arguments = new JsonObject();
+        arguments.addProperty("status", status);
+        arguments.addProperty("message", message);
+        return llmCall(PlannerProtocol.STATUS_TOOL, arguments.toString());
+    }
+
+    private static JsonObject[] nineGotoCalls() {
+        JsonObject[] calls = new JsonObject[Plan.MAX_STEPS + 1];
+        for (int index = 0; index < calls.length; index++) {
+            calls[index] = llmCall("goto", "{\"x\":" + (index + 1) + ",\"z\":0}");
+        }
+        return calls;
+    }
+
     // ---- verdicts ----------------------------------------------------------------------------
 
     /**
@@ -1225,6 +1341,9 @@ public final class DevAutoTest {
         if (!journalHas(EventKind.PLANNER_FAILED)) {
             return label + ": no planner_failed event was recorded";
         }
+        if (companion.getStandingOrder() != null) {
+            return label + ": the failed planner left an inert standing order open";
+        }
         return null;
     }
 
@@ -1235,26 +1354,6 @@ public final class DevAutoTest {
         }
         if (llmTransport.calls() != 1) {
             return "a 401 was retried: " + llmTransport.calls() + " requests";
-        }
-        return null;
-    }
-
-    /** Speech with no tool calls must be spoken, not rejected as an empty plan. */
-    private static String llmTalkOnlyVerdict() {
-        if (companion.getPlanExecutor().isActive()) {
-            return "speech alone started a plan";
-        }
-        if (companion.getSupervisor().currentGoal().isPresent()) {
-            return "speech alone submitted a goal";
-        }
-        if (sawNewPlanOutcome()) {
-            return "speech alone published a plan outcome";
-        }
-        if (journalHas(EventKind.PLANNER_FAILED)) {
-            return "speech alone was treated as a planner failure";
-        }
-        if (companion.getStandingOrder() != null) {
-            return "the standing order stayed open after the planner said it was done";
         }
         return null;
     }
@@ -1275,6 +1374,109 @@ public final class DevAutoTest {
         return null;
     }
 
+    /** Checks only the first hosted reply, before PlayerEngine execution can affect acceptance. */
+    private static String llmLiveMultiStepVerdict() {
+        if (PlannerConfig.loadOrCreate().apiKey().isEmpty()) {
+            return "no API key configured; set OPENAI_API_KEY or -Dminemate.planner.apiKey";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "the live multi-step planner failed; inspect logs/debug.log";
+        }
+        Plan plan = llmObservedLivePlan;
+        if (plan == null) {
+            return "the live reply did not produce an inspectable action plan";
+        }
+        if (plan.disposition() != PlanDisposition.ACTION || plan.steps().size() != 2) {
+            return "expected one two-action reply, got " + plan.disposition() + " with "
+                    + plan.steps().size() + " actions";
+        }
+        ToolCall first = plan.steps().get(0).call();
+        ToolCall second = plan.steps().get(1).call();
+        if (!"fetch".equals(first.tool()) || !"oak_boat".equals(argument(first, "resource"))) {
+            return "first action was not fetch(oak_boat): " + first.toCompactString();
+        }
+        if (!"fetch".equals(second.tool()) || !"chest".equals(argument(second, "resource"))) {
+            return "second action was not fetch(chest): " + second.toCompactString();
+        }
+        MineMate.LOGGER.info("[autotest] llm_live_multi_step accepted first reply: {}",
+                plan.steps().stream().map(step -> step.call().toCompactString()).toList());
+        return null;
+    }
+
+    private static String argument(ToolCall call, String name) {
+        JsonElement value = call.arguments().get(name);
+        return value != null && value.isJsonPrimitive() ? value.getAsString() : "";
+    }
+
+    private static String llmOversizedVerdict() {
+        String failure = llmFailureVerdict("oversized reply");
+        if (failure != null) {
+            return failure;
+        }
+        if (sawNewPlanOutcome()) {
+            return "the oversized reply reached PlanExecutor";
+        }
+        if (llmTransport.calls() != 1) {
+            return "expected one oversized request, saw " + llmTransport.calls();
+        }
+        return null;
+    }
+
+    private static String llmPlanBoundaryVerdict() {
+        PlanExecutor executor = companion.getPlanExecutor();
+        if (llmTransport.calls() != 2) {
+            return "one plan boundary produced " + llmTransport.calls() + " requests instead of two";
+        }
+        if (!executor.isActive()) {
+            return "the follow-up plan was not still active";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null) {
+            return "a delayed trigger closed the order during its follow-up plan";
+        }
+        if (order.replansUsed() != 1) {
+            return "one plan boundary consumed " + order.replansUsed() + " replans";
+        }
+        if (journalHas(EventKind.PLANNER_BUDGET_EXHAUSTED)) {
+            return "a delayed trigger inspected the budget during an active plan";
+        }
+        return null;
+    }
+
+    private static String llmActionThenCompletedVerdict() {
+        if (llmTransport.calls() != 2) {
+            return "expected one action and one completion request, saw " + llmTransport.calls();
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "the action/completion exchange was treated as a planner failure";
+        }
+        Optional<PlanOutcome> outcome = companion.getPlanExecutor().lastOutcome()
+                .filter(published -> !published.planId().equals(planOutcomeBaseline));
+        if (outcome.isEmpty() || outcome.get().status() != PlanStatus.SUCCEEDED
+                || outcome.get().completedSteps() != 1) {
+            return "the initial action plan did not execute successfully";
+        }
+        if (companion.getStandingOrder() != null) {
+            return "COMPLETED did not close the standing order";
+        }
+        return null;
+    }
+
+    private static String llmReplanBudgetInvariant() {
+        int finalRequest = 1 + LLM_REPLAN_BUDGET;
+        PlanExecutor executor = companion.getPlanExecutor();
+        if (llmTransport != null && llmTransport.calls() == finalRequest && executor.isActive()) {
+            if (companion.getStandingOrder() == null) {
+                return "the standing order closed during the final active plan";
+            }
+            llmBudgetSawFinalPlanOpen = true;
+        }
+        if (executor.isActive() && companion.getStandingOrder() == null) {
+            return "an active plan lost its standing order";
+        }
+        return null;
+    }
+
     private static String llmReplanBudgetVerdict() {
         int expected = 1 + LLM_REPLAN_BUDGET;
         if (llmTransport.calls() != expected) {
@@ -1282,6 +1484,13 @@ public final class DevAutoTest {
         }
         if (companion.getStandingOrder() != null) {
             return "the standing order outlived its replan budget";
+        }
+        if (!llmBudgetSawFinalPlanOpen) {
+            return "the test never observed the order open during the final active plan";
+        }
+        if (!journalHasSummary(EventKind.PLANNER_BUDGET_EXHAUSTED,
+                PlannerAutonomy.BUDGET_EXHAUSTED_MESSAGE)) {
+            return "budget exhaustion did not record the owner message";
         }
         return null;
     }
@@ -1301,6 +1510,15 @@ public final class DevAutoTest {
         return false;
     }
 
+    private static boolean journalHasSummary(EventKind kind, String summary) {
+        for (JournalEntry entry : companion.getJournal().recent(CompanionJournal.CAPACITY)) {
+            if (entry.kind() == kind && summary.equals(entry.summary())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ---- plan-shaped acceptors ---------------------------------------------------------------
 
     private static boolean acceptLlmMultiStep(PlanOutcome outcome) {
@@ -1308,8 +1526,16 @@ public final class DevAutoTest {
         boolean accepted = outcome.status() == PlanStatus.SUCCEEDED
                 && outcome.completedSteps() == 2
                 && outcome.totalSteps() == 2
+                && outcome.stepOutcomes().size() == 2
+                && outcome.stepOutcomes().get(0).index() == 0
+                && "craft".equals(outcome.stepOutcomes().get(0).call().tool())
+                && outcome.stepOutcomes().get(1).index() == 1
+                && "fetch".equals(outcome.stepOutcomes().get(1).call().tool())
                 // Several tool calls in one reply is what a multi-step plan is made of.
                 && body.contains("\"parallel_tool_calls\":true")
+                && body.contains(PlannerProtocol.STATUS_TOOL)
+                && body.contains("Include every step that is currently known")
+                && !body.contains("do not try to plan the whole job")
                 // The nested Chat Completions wrapper here would be rejected by the real endpoint.
                 && !body.contains("\"function\":{");
         if (!accepted) {
@@ -1351,23 +1577,103 @@ public final class DevAutoTest {
      */
     private static String llmSchemaViolation() {
         String registrySchema = ToolRegistry.defaults().schemaJson();
+        if (registrySchema.contains(PlannerProtocol.STATUS_TOOL)) {
+            return "the reserved status function leaked into ToolRegistry";
+        }
+        String hostedSchema;
         JsonArray tools;
         try {
-            tools = OpenAiToolSchemas.toOpenAiTools(registrySchema);
+            hostedSchema = PlannerProtocol.hostedSchema(registrySchema);
+            tools = OpenAiToolSchemas.toOpenAiTools(hostedSchema);
         } catch (RuntimeException error) {
             return "the strict transform threw " + error;
         }
-        if (tools.size() != ToolRegistry.defaults().tools().size()) {
-            return "the transform produced " + tools.size() + " of "
-                    + ToolRegistry.defaults().tools().size() + " tools";
+        if (tools.size() != ToolRegistry.defaults().tools().size() + 1) {
+            return "the hosted transform produced " + tools.size() + " tools instead of "
+                    + (ToolRegistry.defaults().tools().size() + 1);
         }
         for (JsonElement element : tools) {
-            String violation = strictToolViolation(element.getAsJsonObject(), registrySchema);
+            String violation = strictToolViolation(element.getAsJsonObject(), hostedSchema);
             if (violation != null) {
                 return violation;
             }
         }
+        JsonObject statusTool = null;
+        for (JsonElement element : tools) {
+            JsonObject tool = element.getAsJsonObject();
+            if (PlannerProtocol.STATUS_TOOL.equals(tool.get("name").getAsString())) {
+                statusTool = tool;
+            }
+        }
+        if (statusTool == null) {
+            return "the hosted schema omitted the reserved status function";
+        }
+        JsonArray statuses = statusTool.getAsJsonObject("parameters")
+                .getAsJsonObject("properties").getAsJsonObject("status").getAsJsonArray("enum");
+        if (statuses.contains(JsonParser.parseString("\"ACTION\"")) || statuses.size() != 4) {
+            return "the status function exposed the wrong dispositions";
+        }
         return nullStrippingViolation();
+    }
+
+    private static String llmProtocolViolation() {
+        for (PlanDisposition expected : List.of(PlanDisposition.COMPLETED,
+                PlanDisposition.CLARIFICATION, PlanDisposition.UNSUPPORTED, PlanDisposition.BLOCKED)) {
+            LlmReply reply;
+            try {
+                reply = OpenAiResponsesBackend.parseReply(
+                        llmResponse(null, llmStatus(expected.name(), "Status message.")));
+            } catch (RuntimeException error) {
+                return expected + " terminal reply failed to parse: " + error.getMessage();
+            }
+            if (reply.disposition() != expected || !reply.calls().isEmpty()
+                    || !"Status message.".equals(reply.dialogue())) {
+                return expected + " terminal reply parsed incorrectly";
+            }
+        }
+
+        String violation = expectMalformed("missing status", llmResponse("Done."));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectMalformed("mixed status and action", llmResponse("Working.",
+                llmCall("goto", "{\"x\":1,\"z\":1}"),
+                llmStatus("BLOCKED", "I cannot continue.")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectMalformed("duplicate status", llmResponse(null,
+                llmStatus("COMPLETED", "Done."), llmStatus("BLOCKED", "Blocked.")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectMalformed("invalid ACTION status",
+                llmResponse(null, llmStatus("ACTION", "Working.")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectMalformed("terminal assistant message", llmResponse("Done.",
+                llmStatus("COMPLETED", "Done.")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectMalformed("nine-action reply",
+                llmResponse("This is too much.", nineGotoCalls()));
+        if (violation != null) {
+            return violation;
+        }
+        return null;
+    }
+
+    private static String expectMalformed(String label, String body) {
+        try {
+            OpenAiResponsesBackend.parseReply(body);
+            return label + " was accepted";
+        } catch (LlmException expected) {
+            return null;
+        } catch (RuntimeException error) {
+            return label + " threw the wrong error: " + error;
+        }
     }
 
     private static String strictToolViolation(JsonObject tool, String registrySchema) {
@@ -1448,9 +1754,6 @@ public final class DevAutoTest {
         // The point of stripping: an absent optional argument is what the registry defaults.
         if (!(ToolRegistry.defaults().validate(call) instanceof ToolValidation.Accepted)) {
             return "a stripped null did not validate";
-        }
-        if (!OpenAiResponsesBackend.parseReply(llmResponse("Done.")).talkOnly()) {
-            return "a reply with no calls was not read as talk-only";
         }
         return null;
     }

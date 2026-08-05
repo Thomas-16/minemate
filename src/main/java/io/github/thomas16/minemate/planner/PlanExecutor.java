@@ -294,6 +294,11 @@ public final class PlanExecutor {
         return plan != null;
     }
 
+    /** Whether the active plan owns the supervisor goal with this id. */
+    public boolean ownsGoal(String goalId) {
+        return plan != null && awaitingGoalId != null && awaitingGoalId.equals(goalId);
+    }
+
     public Optional<Plan> currentPlan() {
         return Optional.ofNullable(plan);
     }

@@ -15,8 +15,8 @@ import net.minecraft.server.MinecraftServer;
  * <p>Concentrating {@code server.execute(...)} here is deliberate: it is the one place the
  * "never block the tick thread" rule can be got wrong, so no planner implementation is given the
  * chance to get it wrong. The hosted planner added in stage 5 needed no change to any of that; the
- * one thing it did add is the talk-only branch in {@link #apply}, because a real model can answer
- * an order with speech and no work, which stage 4 had no way to express.
+ * one thing it did add is explicit terminal dispositions, because speech alone must never be
+ * mistaken for proof that an order is complete.
  */
 public final class PlannerDispatch {
 
@@ -55,12 +55,20 @@ public final class PlannerDispatch {
                         "planning failed (" + detail + ")", planner.name());
             }
             tell(companion, ToolMessages.owner(Reasons.PLANNER_UNAVAILABLE, ""));
+            companion.closeStandingOrder();
             return;
         }
-        if (plan.steps().isEmpty() && !plan.dialogue().isBlank()) {
-            // Speech and no tools is how a planner reports there is nothing left to do. Answering
-            // it with the PLAN_EMPTY rejection below would be wrong, and it would also leave the
-            // standing order open to spend its whole replan budget saying the same thing again.
+        if (plan.disposition().terminal()) {
+            if (!plan.steps().isEmpty() || plan.dialogue().isBlank()) {
+                MineMate.LOGGER.warn("Planner {} produced an invalid terminal plan", planner.name());
+                if (companion.getContext() != null) {
+                    companion.getContext().record(EventKind.PLANNER_FAILED,
+                            "planning failed (invalid terminal plan)", planner.name());
+                }
+                tell(companion, ToolMessages.owner(Reasons.PLANNER_UNAVAILABLE, ""));
+                companion.closeStandingOrder();
+                return;
+            }
             tell(companion, plan.dialogue());
             companion.closeStandingOrder();
             return;
@@ -84,7 +92,7 @@ public final class PlannerDispatch {
         return cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
     }
 
-    private static void tell(CompanionEntity companion, String message) {
+    static void tell(CompanionEntity companion, String message) {
         companion.resolveOwner().ifPresent(owner ->
                 owner.sendSystemMessage(Component.literal("[MineMate] " + message)));
     }

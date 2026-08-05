@@ -300,12 +300,15 @@ public final class ToolRegistry {
                                 "Resource name, e.g. 'dirt', 'iron_ore', 'oak_log'."), count),
                         (args, ctx) -> Goals.mine(args.getString("resource"), args.getInt("count"))),
 
-                new ToolDescriptor("fetch", "Gather a resource and then hand it to the owner.",
+                new ToolDescriptor("fetch", "Acquire a resource if necessary, then deliver it to the owner; "
+                        + "items already held are delivered too.",
                         ExecutionScope.COMPOSITE,
-                        List.of(ToolParam.resource("resource", "Resource name to acquire and deliver."), count),
+                        List.of(ToolParam.resource("resource", "Resource to acquire if needed and deliver, "
+                                + "including one already held."), count),
                         (args, ctx) -> Goals.fetch(args.getString("resource"), args.getInt("count"))),
 
-                new ToolDescriptor("craft", "Craft an item, gathering and crafting its ingredients as needed.",
+                new ToolDescriptor("craft", "Craft an item, gathering and crafting its ingredients as needed; "
+                        + "the output remains with the companion.",
                         ExecutionScope.COMPOSITE,
                         List.of(ToolParam.item("item", "Item id to craft, e.g. 'oak_planks'."), count),
                         (args, ctx) -> Goals.craft(ctx.companion(), args.getItem("item"), args.getInt("count"))),

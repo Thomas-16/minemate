@@ -7,10 +7,6 @@ import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
 
 import io.github.thomas16.minemate.MineMate;
-import io.github.thomas16.minemate.planner.OrderContract;
-import io.github.thomas16.minemate.planner.Plan;
-import io.github.thomas16.minemate.planner.PlanDisposition;
-import io.github.thomas16.minemate.tool.ToolCall;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -164,7 +160,7 @@ public final class OpenAiResponsesBackend implements LlmBackend {
         }
 
         StringBuilder dialogue = new StringBuilder();
-        List<JsonObject> functionCalls = new ArrayList<>();
+        List<PlannerProtocol.RawCall> calls = new ArrayList<>();
         boolean sawMessage = false;
         for (JsonElement element : output.getAsJsonArray()) {
             if (!element.isJsonObject()) {
@@ -176,64 +172,28 @@ public final class OpenAiResponsesBackend implements LlmBackend {
                     sawMessage = true;
                     appendText(item, dialogue);
                 }
-                case "function_call" -> functionCalls.add(item);
+                case "function_call" -> calls.add(rawCallOf(item));
                 // "reasoning" and anything OpenAI adds later: ignoring unknown item types keeps a
                 // future addition from breaking planning outright.
                 default -> {
                 }
             }
         }
+        return PlannerProtocol.assemble(dialogue.toString(), sawMessage, calls);
+    }
 
-        List<JsonObject> statuses = functionCalls.stream()
-                .filter(call -> PlannerProtocol.STATUS_TOOL.equals(string(call, "name")))
-                .toList();
-        List<JsonObject> contracts = functionCalls.stream()
-                .filter(call -> PlannerProtocol.CONTRACT_TOOL.equals(string(call, "name")))
-                .toList();
-        List<JsonObject> worldCalls = functionCalls.stream()
-                .filter(call -> !PlannerProtocol.STATUS_TOOL.equals(string(call, "name"))
-                        && !PlannerProtocol.CONTRACT_TOOL.equals(string(call, "name")))
-                .toList();
-
-        if (statuses.size() > 1) {
-            throw LlmException.malformed("reply contained multiple order-status calls");
-        }
-        if (contracts.size() > 1) {
-            throw LlmException.malformed("reply contained multiple order-contract calls");
-        }
-        if (statuses.size() == 1) {
-            if (!worldCalls.isEmpty()) {
-                throw LlmException.malformed("reply mixed an order status with world-tool calls");
-            }
-            if (!contracts.isEmpty()) {
-                throw LlmException.malformed("terminal reply included an order contract");
-            }
-            if (sawMessage) {
-                throw LlmException.malformed("terminal reply included a separate assistant message");
-            }
-            return statusReplyOf(statuses.get(0));
-        }
-
-        // The contract call is protocol, not work: it does not count toward the step bound, so a
-        // contract plus MAX_STEPS world calls is a legal reply. A contract with no world calls is
-        // parseable on purpose: single-call-habit models really send it, and dispatch turns it
-        // into a repairable violation rather than an opaque parse failure.
-        if (worldCalls.isEmpty() && contracts.isEmpty()) {
-            throw LlmException.malformed("reply had no world-tool calls or order status");
-        }
-        if (worldCalls.size() > Plan.MAX_STEPS) {
-            throw LlmException.malformed("reply contained more than " + Plan.MAX_STEPS
-                    + " world-tool calls");
-        }
-        if (dialogue.toString().isBlank()) {
-            throw LlmException.malformed("action reply had no assistant speech");
-        }
-        List<ToolCall> calls = new ArrayList<>(worldCalls.size());
-        for (JsonObject call : worldCalls) {
-            calls.add(toolCallOf(call));
-        }
-        OrderContract contract = contracts.isEmpty() ? null : contractOf(contracts.get(0));
-        return new LlmReply(dialogue.toString(), calls, PlanDisposition.ACTION, contract);
+    /**
+     * Unwraps one function call into the neutral shape: the arguments arrive as a JSON string to
+     * re-parse, and world-call arguments get their strict-mode nulls stripped. Protocol calls keep
+     * theirs, because their validators reject a null field with a more precise message than an
+     * absent one.
+     */
+    private static PlannerProtocol.RawCall rawCallOf(JsonObject call) {
+        String name = string(call, "name");
+        boolean protocol = PlannerProtocol.STATUS_TOOL.equals(name)
+                || PlannerProtocol.CONTRACT_TOOL.equals(name);
+        JsonObject arguments = argumentsOf(call, name.isBlank() ? "call" : name, !protocol);
+        return new PlannerProtocol.RawCall(name, protocol ? arguments : withoutNulls(arguments));
     }
 
     private static void appendText(JsonObject message, StringBuilder dialogue) {
@@ -255,71 +215,6 @@ public final class OpenAiResponsesBackend implements LlmBackend {
         }
     }
 
-    private static ToolCall toolCallOf(JsonObject call) {
-        String name = string(call, "name");
-        if (name.isBlank()) {
-            throw LlmException.malformed("function call had no name");
-        }
-        JsonObject arguments = argumentsOf(call, name, true);
-        if (arguments.size() == 0) {
-            return ToolCall.of(name);
-        }
-        return new ToolCall(name, withoutNulls(arguments));
-    }
-
-    private static LlmReply statusReplyOf(JsonObject call) {
-        JsonObject arguments = argumentsOf(call, PlannerProtocol.STATUS_TOOL, false);
-        if (arguments.size() != 2 || !arguments.has("status") || !arguments.has("message")) {
-            throw LlmException.malformed("order status required exactly status and message");
-        }
-        String rawStatus = stringArgument(arguments, "status");
-        PlanDisposition disposition;
-        try {
-            disposition = PlanDisposition.valueOf(rawStatus);
-        } catch (IllegalArgumentException error) {
-            throw LlmException.malformed("invalid order status: " + rawStatus);
-        }
-        if (!disposition.terminal()) {
-            throw LlmException.malformed("ACTION is not a terminal order status");
-        }
-        String message = stringArgument(arguments, "message").strip();
-        if (message.isBlank()) {
-            throw LlmException.malformed("order status message was blank");
-        }
-        return new LlmReply(message, List.of(), disposition);
-    }
-
-    private static OrderContract contractOf(JsonObject call) {
-        JsonObject arguments = argumentsOf(call, PlannerProtocol.CONTRACT_TOOL, false);
-        JsonElement deliverables = arguments.get("deliverables");
-        JsonElement deliverToOwner = arguments.get("deliver_to_owner");
-        if (arguments.size() != 2 || deliverables == null || !deliverables.isJsonArray()
-                || deliverToOwner == null || !deliverToOwner.isJsonPrimitive()
-                || !deliverToOwner.getAsJsonPrimitive().isBoolean()) {
-            throw LlmException.malformed(
-                    "order contract required exactly deliverables and deliver_to_owner");
-        }
-        List<OrderContract.Deliverable> parsed = new ArrayList<>();
-        for (JsonElement element : deliverables.getAsJsonArray()) {
-            if (!element.isJsonObject()) {
-                throw LlmException.malformed(
-                        "order contract deliverable required an item and a positive count");
-            }
-            JsonObject deliverable = element.getAsJsonObject();
-            String item = string(deliverable, "item");
-            JsonElement count = deliverable.get("count");
-            if (deliverable.size() != 2 || item.isBlank() || count == null
-                    || !count.isJsonPrimitive() || !count.getAsJsonPrimitive().isNumber()
-                    || count.getAsDouble() != Math.floor(count.getAsDouble())
-                    || count.getAsInt() < 1) {
-                throw LlmException.malformed(
-                        "order contract deliverable required an item and a positive count");
-            }
-            parsed.add(new OrderContract.Deliverable(item, count.getAsInt()));
-        }
-        return new OrderContract(parsed, deliverToOwner.getAsBoolean());
-    }
-
     private static JsonObject argumentsOf(JsonObject call, String name, boolean emptyAllowed) {
         String arguments = string(call, "arguments");
         if (arguments.isBlank()) {
@@ -339,15 +234,6 @@ public final class OpenAiResponsesBackend implements LlmBackend {
             throw LlmException.malformed("arguments for " + name + " were not an object");
         }
         return parsed.getAsJsonObject();
-    }
-
-    private static String stringArgument(JsonObject arguments, String name) {
-        JsonElement value = arguments.get(name);
-        if (value == null || !value.isJsonPrimitive()
-                || !value.getAsJsonPrimitive().isString()) {
-            throw LlmException.malformed("order status " + name + " was not a string");
-        }
-        return value.getAsString();
     }
 
     /**

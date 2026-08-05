@@ -44,7 +44,9 @@ public final class LlmException extends RuntimeException {
         if (TERMINAL_CODES.contains(code)) {
             return false;
         }
-        return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+        // 529 is Anthropic's overloaded_error; the rest are shared gateway vocabulary.
+        return status == 429 || status == 500 || status == 502 || status == 503 || status == 504
+                || status == 529;
     }
 
     @Override

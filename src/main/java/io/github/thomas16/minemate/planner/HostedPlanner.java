@@ -1,5 +1,6 @@
 package io.github.thomas16.minemate.planner;
 
+import io.github.thomas16.minemate.planner.llm.AnthropicMessagesBackend;
 import io.github.thomas16.minemate.planner.llm.JdkHttpTransport;
 import io.github.thomas16.minemate.planner.llm.LlmBackend;
 import io.github.thomas16.minemate.planner.llm.LlmException;
@@ -39,11 +40,25 @@ public final class HostedPlanner implements Planner {
         this.config = Objects.requireNonNull(config, "config");
     }
 
-    /** The ordinary construction path: a real HTTP transport wired from config. */
+    /**
+     * The ordinary construction path: a real HTTP transport wired from config. The provider switch
+     * lives here and nowhere else; everything above this line speaks {@link LlmBackend}.
+     */
     public static HostedPlanner of(PlannerConfig config) {
-        LlmBackend backend = new OpenAiResponsesBackend(new JdkHttpTransport(config.timeout()),
-                config.baseUrl(), config.model(), config.apiKey().orElse(""),
-                config.reasoningEffort(), config.verbosity(), config.maxOutputTokens());
+        LlmBackend backend = switch (config.provider()) {
+            case PlannerConfig.PROVIDER_OPENAI -> new OpenAiResponsesBackend(
+                    new JdkHttpTransport(config.timeout()), config.baseUrl(), config.model(),
+                    config.apiKey().orElse(""), config.reasoningEffort(), config.verbosity(),
+                    config.maxOutputTokens());
+            case PlannerConfig.PROVIDER_ANTHROPIC -> new AnthropicMessagesBackend(
+                    new JdkHttpTransport(config.timeout()), config.baseUrl(), config.model(),
+                    config.apiKey().orElse(""), config.reasoningEffort(),
+                    config.maxOutputTokens());
+            // Unreachable through installPlanner, which refuses an unusable config; loud for any
+            // future caller that skips that check.
+            default -> throw new IllegalArgumentException(
+                    "unknown planner provider: " + config.provider());
+        };
         return new HostedPlanner(backend, config);
     }
 

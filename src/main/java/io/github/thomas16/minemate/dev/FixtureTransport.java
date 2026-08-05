@@ -23,6 +23,7 @@ public final class FixtureTransport implements HttpTransport {
 
     private final List<HttpReply> replies;
     private final List<String> requestBodies = new ArrayList<>();
+    private final List<Map<String, String>> requestHeaders = new ArrayList<>();
     private final long delayMs;
     private final boolean neverCompletes;
 
@@ -55,6 +56,12 @@ public final class FixtureTransport implements HttpTransport {
                 + "\",\"type\":\"invalid_request_error\",\"code\":\"" + code + "\"}}");
     }
 
+    /** Anthropic's envelope differs from OpenAI's: the inner {@code type} doubles as the code. */
+    public static HttpReply anthropicError(int status, String type, String message) {
+        return new HttpReply(status, "{\"type\":\"error\",\"error\":{\"type\":\"" + type
+                + "\",\"message\":\"" + message + "\"}}");
+    }
+
     public static HttpReply rateLimited(String retryAfterSeconds) {
         return new HttpReply(429, "{\"error\":{\"message\":\"slow down\",\"code\":\"rate_limit_exceeded\"}}",
                 Map.of("Retry-After", retryAfterSeconds));
@@ -64,6 +71,7 @@ public final class FixtureTransport implements HttpTransport {
     public CompletableFuture<HttpReply> post(String url, Map<String, String> headers, String body) {
         synchronized (requestBodies) {
             requestBodies.add(body);
+            requestHeaders.add(headers == null ? Map.of() : Map.copyOf(headers));
         }
         if (neverCompletes) {
             return new CompletableFuture<>();
@@ -89,9 +97,16 @@ public final class FixtureTransport implements HttpTransport {
         }
     }
 
+    public Map<String, String> lastRequestHeaders() {
+        synchronized (requestBodies) {
+            return requestHeaders.isEmpty() ? Map.of() : requestHeaders.get(requestHeaders.size() - 1);
+        }
+    }
+
     public void reset() {
         synchronized (requestBodies) {
             requestBodies.clear();
+            requestHeaders.clear();
         }
     }
 }

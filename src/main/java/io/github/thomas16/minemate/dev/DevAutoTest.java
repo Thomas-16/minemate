@@ -71,10 +71,13 @@ import io.github.thomas16.minemate.planner.PlannerDispatch;
 import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
 import io.github.thomas16.minemate.planner.StandingOrder;
+import io.github.thomas16.minemate.planner.llm.AnthropicMessagesBackend;
 import io.github.thomas16.minemate.planner.llm.LlmException;
+import io.github.thomas16.minemate.planner.llm.LlmPrompt;
 import io.github.thomas16.minemate.planner.llm.LlmReply;
 import io.github.thomas16.minemate.planner.llm.OpenAiResponsesBackend;
 import io.github.thomas16.minemate.planner.llm.OpenAiToolSchemas;
+import io.github.thomas16.minemate.planner.llm.PlannerPrompt;
 import io.github.thomas16.minemate.planner.llm.PlannerProtocol;
 import io.github.thomas16.minemate.tool.ToolCall;
 import io.github.thomas16.minemate.tool.ToolRegistry;
@@ -83,6 +86,7 @@ import io.github.thomas16.minemate.tool.ToolValidation;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -116,6 +120,9 @@ public final class DevAutoTest {
             // Offline and fast: the whole hosted-planner failure surface costs a few hundred ticks.
             "llm_tool_schema",
             "llm_protocol",
+            "llm_claude_tool_schema",
+            "llm_claude_protocol",
+            "llm_claude_plan",
             "llm_unknown_tool",
             "llm_malformed_output",
             "llm_http_error",
@@ -136,6 +143,13 @@ public final class DevAutoTest {
             UUID.fromString("4d1af7d3-9c26-4b8e-b1d2-6f0e58c92a41");
     private static final UUID UNAVAILABLE_FETCH_OWNER_UUID =
             UUID.fromString("a92c33e5-1e74-4f0a-bd68-30c5f1de77b2");
+    /**
+     * llm_claude_plan completes a real delivery, and a FakePlayer that has been delivered to,
+     * discarded and re-added from Fabric's profile cache stops receiving deliveries. Every
+     * delivery-completing fixture therefore owns its profile outright.
+     */
+    private static final UUID CLAUDE_PLAN_OWNER_UUID =
+            UUID.fromString("7f2b8c14-5a63-4d97-9e08-c41d72ab6f35");
     private static final UUID FRIENDLY_FIRE_OWNER_UUID =
             UUID.fromString("5ec29e35-81d1-4c23-aef9-0e394daaf52d");
     private static final UUID DEBUG_VIEWER_UUID =
@@ -549,6 +563,31 @@ public final class DevAutoTest {
                         },
                         ignoredServer -> {
                         },
+                        () -> null),
+                Scenario.probe("llm_claude_tool_schema",
+                        () -> true,
+                        DevAutoTest::llmClaudeSchemaViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
+                Scenario.probe("llm_claude_protocol",
+                        () -> true,
+                        DevAutoTest::llmClaudeProtocolViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
+                Scenario.plan("llm_claude_plan",
+                        ignored -> null,
+                        DevAutoTest::acceptLlmClaudePlan,
+                        2400,
+                        ignoredServer -> prepareLlmClaudePlan(),
+                        DevAutoTest::clearLlmPlanner,
                         () -> null),
                 Scenario.plan("llm_plan_multi_step",
                         ignored -> null,
@@ -1145,10 +1184,11 @@ public final class DevAutoTest {
 
     // ---- stage 5: hosted planner over a fixture transport -----------------------------------
     //
-    // Every scenario below runs the real OpenAI request builder and the real response parser; only
-    // the socket is replaced. None of them can reach the network, and MineMate.installPlanner
-    // refuses to install a hosted planner at all during an autotest run, so a developer's
-    // OPENAI_API_KEY cannot change what these assert.
+    // Every scenario below runs a real request builder and a real response parser -- OpenAI for
+    // the llm_* family, Anthropic for the llm_claude_* family; only the socket is replaced. None
+    // of them can reach the network, and MineMate.installPlanner refuses to install a hosted
+    // planner at all during an autotest run, so a developer's ambient API keys cannot change what
+    // these assert.
 
     /** Short, so llm_timeout resolves well inside its cap rather than at the end of one. */
     private static final int LLM_TIMEOUT_SECONDS = 2;
@@ -1156,12 +1196,40 @@ public final class DevAutoTest {
     private static final int LLM_REPLAN_BUDGET = 2;
 
     private static void installLlmPlanner(FixtureTransport transport, int maxReplans) {
-        PlannerConfig config = PlannerConfig.of("http://fixture.invalid/v1", "fixture-model",
-                "fixture-key", LLM_TIMEOUT_SECONDS, maxReplans);
+        PlannerConfig config = PlannerConfig.of(PlannerConfig.PROVIDER_OPENAI,
+                "http://fixture.invalid/v1", "fixture-model", "fixture-key", LLM_TIMEOUT_SECONDS,
+                maxReplans);
         llmTransport = transport;
         Planners.install(new HostedPlanner(new OpenAiResponsesBackend(transport, config.baseUrl(),
                 config.model(), config.apiKey().orElse(""), config.reasoningEffort(),
                 config.verbosity(), config.maxOutputTokens()), config));
+    }
+
+    private static void installAnthropicLlmPlanner(FixtureTransport transport, int maxReplans) {
+        PlannerConfig config = PlannerConfig.of(PlannerConfig.PROVIDER_ANTHROPIC,
+                "http://fixture.invalid/v1", "fixture-model", "fixture-key", LLM_TIMEOUT_SECONDS,
+                maxReplans);
+        llmTransport = transport;
+        Planners.install(new HostedPlanner(new AnthropicMessagesBackend(transport, config.baseUrl(),
+                config.model(), config.apiKey().orElse(""), config.reasoningEffort(),
+                config.maxOutputTokens()), config));
+    }
+
+    /**
+     * The Anthropic mirror of llm_plan_multi_step, with a 529 in front: the request builder, the
+     * retry loop, the error envelope, and the block-array parser all get exercised through one
+     * end-to-end plan that then actually executes.
+     */
+    private static void prepareLlmClaudePlan() {
+        prepareInventory(new ItemStack(Items.OAK_LOG, 1));
+        prepareFakeOwner(CLAUDE_PLAN_OWNER_UUID, "MineMateClaudeOwner");
+        installAnthropicLlmPlanner(FixtureTransport.of(
+                FixtureTransport.anthropicError(529, "overloaded_error", "Overloaded"),
+                FixtureTransport.ok(claudeResponse("I will make the planks, then bring them to you.",
+                        claudeContract("[{\"item\":\"oak_planks\",\"count\":4}]", true),
+                        claudeCall("craft", "{\"item\":\"oak_planks\",\"count\":4}"),
+                        claudeCall("fetch", "{\"resource\":\"oak_planks\",\"count\":4}")))), 0);
+        requestLlmPlan("make 4 oak planks for me");
     }
 
     /** Installs a planner with no replan budget, opens an order, and asks for a plan. */
@@ -1343,8 +1411,9 @@ public final class DevAutoTest {
         // owner_offline before it runs, and the test proves only that the JSON parsed.
         prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
         PlannerConfig file = PlannerConfig.loadOrCreate();
-        // No replan budget: one order must cost exactly one request.
-        PlannerConfig config = PlannerConfig.of(file.baseUrl(), file.model(),
+        // No replan budget: one order must cost exactly one request. The provider comes from the
+        // config file, so the same pair of live scenarios checks whichever backend is configured.
+        PlannerConfig config = PlannerConfig.of(file.provider(), file.baseUrl(), file.model(),
                 file.apiKey().orElse(""), 60, 0);
         MineMate.LOGGER.info("[autotest] {} against {}", scenarioName, config.describe());
         llmTransport = null;
@@ -1360,6 +1429,17 @@ public final class DevAutoTest {
     private static final String LLM_LIVE_ORDER = "get me 2 dirt and then come stand next to me";
     private static final String LLM_LIVE_MULTI_STEP_ORDER =
             "Make me an oak boat and then a chest, and bring both to me.";
+
+    /** Names the environment variable that matches the configured provider, or null with a key. */
+    private static String llmLiveKeyMissing() {
+        PlannerConfig file = PlannerConfig.loadOrCreate();
+        if (file.apiKey().isPresent()) {
+            return null;
+        }
+        String env = PlannerConfig.PROVIDER_OPENAI.equals(file.provider())
+                ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+        return "no API key configured; set " + env + " or -Dminemate.planner.apiKey";
+    }
 
     /** The model has answered once the request is no longer pending and something came of it. */
     private static boolean llmLiveAnswered() {
@@ -1393,8 +1473,9 @@ public final class DevAutoTest {
      * currently unable to make progress on non-craftable resources.
      */
     private static String llmLiveVerdict() {
-        if (PlannerConfig.loadOrCreate().apiKey().isEmpty()) {
-            return "no API key configured; set OPENAI_API_KEY or -Dminemate.planner.apiKey";
+        String keyMissing = llmLiveKeyMissing();
+        if (keyMissing != null) {
+            return keyMissing;
         }
         if (journalHas(EventKind.PLANNER_FAILED)) {
             return "the live planner failed; the request and reply bodies are in logs/debug.log";
@@ -1490,6 +1571,65 @@ public final class DevAutoTest {
         return calls;
     }
 
+    /**
+     * An Anthropic Messages reply, built the way the real one arrives: a thinking block first, so
+     * a parser that indexes {@code content[0]} instead of filtering by type fails here rather than
+     * in production.
+     */
+    private static String claudeResponse(String text, JsonObject... blocks) {
+        return claudeResponse("tool_use", text, blocks);
+    }
+
+    private static String claudeResponse(String stopReason, String text, JsonObject... blocks) {
+        JsonArray content = new JsonArray();
+        JsonObject thinking = new JsonObject();
+        thinking.addProperty("type", "thinking");
+        thinking.addProperty("thinking", "Considering the order.");
+        thinking.addProperty("signature", "sig_fixture");
+        content.add(thinking);
+        if (text != null) {
+            content.add(claudeText(text));
+        }
+        for (JsonObject block : blocks) {
+            content.add(block);
+        }
+        JsonObject root = new JsonObject();
+        root.addProperty("id", "msg_fixture");
+        root.addProperty("type", "message");
+        root.addProperty("role", "assistant");
+        root.add("content", content);
+        root.addProperty("stop_reason", stopReason);
+        return root.toString();
+    }
+
+    private static JsonObject claudeText(String text) {
+        JsonObject block = new JsonObject();
+        block.addProperty("type", "text");
+        block.addProperty("text", text);
+        return block;
+    }
+
+    /** Unlike OpenAI, {@code input} goes on the wire as a real JSON object, not an escaped string. */
+    private static JsonObject claudeCall(String name, String inputJson) {
+        JsonObject call = new JsonObject();
+        call.addProperty("type", "tool_use");
+        call.addProperty("id", "toolu_" + name);
+        call.addProperty("name", name);
+        call.add("input", JsonParser.parseString(inputJson));
+        return call;
+    }
+
+    private static JsonObject claudeStatus(String status, String message) {
+        return claudeCall(PlannerProtocol.STATUS_TOOL,
+                "{\"status\":\"" + status + "\",\"message\":\"" + message + "\"}");
+    }
+
+    /** deliverablesJson is the raw array, e.g. {@code [{"item":"iron_sword","count":1}]}. */
+    private static JsonObject claudeContract(String deliverablesJson, boolean deliverToOwner) {
+        return claudeCall(PlannerProtocol.CONTRACT_TOOL, "{\"deliverables\":" + deliverablesJson
+                + ",\"deliver_to_owner\":" + deliverToOwner + "}");
+    }
+
     // ---- verdicts ----------------------------------------------------------------------------
 
     /**
@@ -1545,8 +1685,9 @@ public final class DevAutoTest {
 
     /** Checks only the first hosted reply, before PlayerEngine execution can affect acceptance. */
     private static String llmLiveMultiStepVerdict() {
-        if (PlannerConfig.loadOrCreate().apiKey().isEmpty()) {
-            return "no API key configured; set OPENAI_API_KEY or -Dminemate.planner.apiKey";
+        String keyMissing = llmLiveKeyMissing();
+        if (keyMissing != null) {
+            return keyMissing;
         }
         if (journalHas(EventKind.PLANNER_FAILED)) {
             return "the live multi-step planner failed; inspect logs/debug.log";
@@ -1869,6 +2010,41 @@ public final class DevAutoTest {
         return accepted;
     }
 
+    private static boolean acceptLlmClaudePlan(PlanOutcome outcome) {
+        String body = llmTransport == null ? "" : llmTransport.lastRequestBody();
+        Map<String, String> headers = llmTransport == null ? Map.of()
+                : llmTransport.lastRequestHeaders();
+        boolean accepted = outcome.status() == PlanStatus.SUCCEEDED
+                && outcome.completedSteps() == 2
+                && outcome.totalSteps() == 2
+                && outcome.stepOutcomes().size() == 2
+                && outcome.stepOutcomes().get(0).index() == 0
+                && "craft".equals(outcome.stepOutcomes().get(0).call().tool())
+                && outcome.stepOutcomes().get(1).index() == 1
+                && "fetch".equals(outcome.stepOutcomes().get(1).call().tool())
+                // The 529 in front was retried once rather than failing the order.
+                && llmTransport != null && llmTransport.calls() == 2
+                // "auto", never "any": forced tool use suppresses the assistant speech the
+                // protocol requires. Parallel tool use is Anthropic's default, so the OpenAI knob
+                // must not leak onto this wire.
+                && body.contains("\"tool_choice\":{\"type\":\"auto\"}")
+                && !body.contains("\"parallel_tool_calls\"")
+                // The explicit cache breakpoint on the system block, and the schema verbatim.
+                && body.contains("\"cache_control\":{\"type\":\"ephemeral\"}")
+                && body.contains("\"input_schema\"")
+                && body.contains(PlannerProtocol.STATUS_TOOL)
+                && body.contains(PlannerProtocol.CONTRACT_TOOL)
+                && body.contains("Include every step that is currently known")
+                && "2023-06-01".equals(headers.get("anthropic-version"))
+                && headers.containsKey("x-api-key")
+                && !headers.containsKey("Authorization");
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] llm_claude_plan postcondition {} requests={}",
+                    outcome.toCompactString(), llmTransport == null ? -1 : llmTransport.calls());
+        }
+        return accepted;
+    }
+
     private static boolean acceptLlmUnknownTool(PlanOutcome outcome) {
         boolean accepted = outcome.status() == PlanStatus.REJECTED
                 && Reasons.UNKNOWN_TOOL.equals(outcome.reason())
@@ -2075,6 +2251,248 @@ public final class DevAutoTest {
     private static String expectMalformed(String label, String body) {
         try {
             OpenAiResponsesBackend.parseReply(body);
+            return label + " was accepted";
+        } catch (LlmException expected) {
+            return null;
+        } catch (RuntimeException error) {
+            return label + " threw the wrong error: " + error;
+        }
+    }
+
+    /**
+     * Checks the Anthropic request builder without a round trip: the neutral schema must land on
+     * the wire verbatim -- no strict transform, no null unions, no OpenAI keys -- with the cache
+     * breakpoint on the system block and the forced-tool choice spelled as an object. Driven
+     * through {@code complete()} over a fixture transport because the builder itself is package
+     * private to the llm package.
+     */
+    private static String llmClaudeSchemaViolation() {
+        String registrySchema = ToolRegistry.defaults().schemaJson();
+        String hostedSchema = PlannerProtocol.hostedSchema(registrySchema);
+        FixtureTransport transport = FixtureTransport.of(FixtureTransport.ok(
+                claudeResponse(null, claudeStatus("ANSWERED", "Schema probe."))));
+        AnthropicMessagesBackend backend = new AnthropicMessagesBackend(transport,
+                "http://fixture.invalid/v1", "fixture-model", "fixture-key",
+                PlannerConfig.DEFAULT_EFFORT, PlannerConfig.DEFAULT_MAX_OUTPUT_TOKENS);
+        backend.complete(new LlmPrompt(PlannerPrompt.SYSTEM, "ORDER: schema probe", hostedSchema, ""));
+        JsonObject body;
+        try {
+            body = JsonParser.parseString(transport.lastRequestBody()).getAsJsonObject();
+        } catch (RuntimeException error) {
+            return "the request builder produced unparseable JSON: " + error;
+        }
+        JsonArray sentTools = body.getAsJsonArray("tools");
+        JsonArray neutralTools = JsonParser.parseString(hostedSchema).getAsJsonArray();
+        if (sentTools == null || sentTools.size() != ToolRegistry.defaults().tools().size() + 2) {
+            return "the request carried " + (sentTools == null ? 0 : sentTools.size())
+                    + " tools instead of " + (ToolRegistry.defaults().tools().size() + 2);
+        }
+        for (int index = 0; index < sentTools.size(); index++) {
+            JsonObject sent = sentTools.get(index).getAsJsonObject();
+            String name = sent.has("name") ? sent.get("name").getAsString() : "tool[" + index + "]";
+            if (sent.has("parameters") || sent.has("strict") || sent.has("type")) {
+                return name + " leaked an OpenAI tool-shape key onto the Anthropic wire";
+            }
+            if (!sent.equals(neutralTools.get(index).getAsJsonObject())) {
+                return name + " was not the neutral registry schema verbatim";
+            }
+        }
+        // The bounds Anthropic strict mode could not express are exactly why strict is off; they
+        // must still ride along as ordinary schema for the model to read.
+        JsonObject mine = toolByName(sentTools, "mine");
+        if (mine == null || !mine.getAsJsonObject("input_schema").getAsJsonObject("properties")
+                .getAsJsonObject("count").has("maximum")) {
+            return "mine.count lost its range";
+        }
+        JsonObject deposit = toolByName(sentTools, "deposit");
+        if (deposit == null || !deposit.getAsJsonObject("input_schema").getAsJsonObject("properties")
+                .getAsJsonObject("container").has("minItems")) {
+            return "deposit.container lost its length constraint";
+        }
+        JsonArray system = body.getAsJsonArray("system");
+        if (system == null || system.size() != 1) {
+            return "the system prompt was not a single block";
+        }
+        JsonObject systemBlock = system.get(0).getAsJsonObject();
+        if (!PlannerPrompt.SYSTEM.equals(systemBlock.get("text").getAsString())) {
+            return "the system block did not carry PlannerPrompt.SYSTEM byte-identical";
+        }
+        if (!systemBlock.has("cache_control") || !"ephemeral".equals(
+                systemBlock.getAsJsonObject("cache_control").get("type").getAsString())) {
+            return "the system block lost its cache_control breakpoint";
+        }
+        if (!body.has("tool_choice")
+                || !"auto".equals(body.getAsJsonObject("tool_choice").get("type").getAsString())) {
+            return "tool_choice was not the {type: auto} object";
+        }
+        if (!body.has("max_tokens")) {
+            return "max_tokens was missing, which this endpoint rejects";
+        }
+        if (!body.has("output_config") || !PlannerConfig.DEFAULT_EFFORT.equals(
+                body.getAsJsonObject("output_config").get("effort").getAsString())) {
+            return "output_config.effort did not carry the configured reasoning effort";
+        }
+        if (body.has("temperature") || body.has("top_p") || body.has("parallel_tool_calls")
+                || body.has("thinking")) {
+            return "the request carried a parameter this backend must omit";
+        }
+        JsonArray messages = body.getAsJsonArray("messages");
+        if (messages == null || messages.size() != 1 || !"ORDER: schema probe".equals(
+                messages.get(0).getAsJsonObject().get("content").getAsString())) {
+            return "the user message did not carry the prompt verbatim";
+        }
+        return null;
+    }
+
+    private static JsonObject toolByName(JsonArray tools, String name) {
+        for (JsonElement element : tools) {
+            JsonObject tool = element.getAsJsonObject();
+            if (name.equals(tool.get("name").getAsString())) {
+                return tool;
+            }
+        }
+        return null;
+    }
+
+    private static String llmClaudeProtocolViolation() {
+        for (PlanDisposition expected : List.of(PlanDisposition.COMPLETED, PlanDisposition.ANSWERED,
+                PlanDisposition.CLARIFICATION, PlanDisposition.UNSUPPORTED, PlanDisposition.BLOCKED)) {
+            LlmReply reply;
+            try {
+                reply = AnthropicMessagesBackend.parseReply(
+                        claudeResponse(null, claudeStatus(expected.name(), "Status message.")));
+            } catch (RuntimeException error) {
+                return expected + " terminal reply failed to parse: " + error.getMessage();
+            }
+            if (reply.disposition() != expected || !reply.calls().isEmpty()
+                    || !"Status message.".equals(reply.dialogue())) {
+                return expected + " terminal reply parsed incorrectly";
+            }
+        }
+
+        String violation = expectClaudeMalformed("missing status",
+                claudeResponse("end_turn", "Done."));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("mixed status and action", claudeResponse("Working.",
+                claudeCall("goto", "{\"x\":1,\"z\":1}"),
+                claudeStatus("BLOCKED", "I cannot continue.")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("duplicate status", claudeResponse(null,
+                claudeStatus("COMPLETED", "Done."), claudeStatus("BLOCKED", "Blocked.")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("invalid ACTION status",
+                claudeResponse(null, claudeStatus("ACTION", "Working.")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("terminal assistant message", claudeResponse("Done.",
+                claudeStatus("COMPLETED", "Done.")));
+        if (violation != null) {
+            return violation;
+        }
+        JsonObject[] nine = new JsonObject[Plan.MAX_STEPS + 1];
+        for (int index = 0; index < nine.length; index++) {
+            nine[index] = claudeCall("goto", "{\"x\":" + (index + 1) + ",\"z\":0}");
+        }
+        violation = expectClaudeMalformed("nine-action reply",
+                claudeResponse("This is too much.", nine));
+        if (violation != null) {
+            return violation;
+        }
+
+        // The happy path also proves the block-array handling: dialogue split across two text
+        // blocks, behind a thinking block, with the contract kept out of the world calls.
+        LlmReply contractReply;
+        try {
+            contractReply = AnthropicMessagesBackend.parseReply(claudeResponse("On",
+                    claudeText("it."),
+                    claudeContract("[{\"item\":\"minecraft:Iron_Sword\",\"count\":1}]", true),
+                    claudeCall("fetch", "{\"resource\":\"iron_sword\",\"count\":1}")));
+        } catch (RuntimeException error) {
+            return "a contract-bearing action reply failed to parse: " + error.getMessage();
+        }
+        if (!"On it.".equals(contractReply.dialogue())) {
+            return "the parser lost or mangled the split text blocks: " + contractReply.dialogue();
+        }
+        if (contractReply.calls().size() != 1
+                || !"fetch".equals(contractReply.calls().get(0).tool())) {
+            return "the contract call leaked into the world calls";
+        }
+        if (contractReply.contract() == null || !contractReply.contract().deliverToOwner()
+                || contractReply.contract().deliverables().size() != 1
+                || !"iron_sword".equals(contractReply.contract().deliverables().get(0).item())) {
+            return "the contract did not parse and normalize";
+        }
+        violation = expectClaudeMalformed("duplicate contract", claudeResponse("On it.",
+                claudeContract("[]", false), claudeContract("[]", false),
+                claudeCall("goto", "{\"x\":1,\"z\":1}")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("contract on a terminal reply", claudeResponse(null,
+                claudeContract("[]", false), claudeStatus("COMPLETED", "Done.")));
+        if (violation != null) {
+            return violation;
+        }
+        // Parseable on purpose: single-call-habit models send exactly this, and dispatch must get
+        // the chance to continue it instead of the parser failing the order.
+        LlmReply contractOnly;
+        try {
+            contractOnly = AnthropicMessagesBackend.parseReply(claudeResponse(
+                    "On it, I will get you a bucket.",
+                    claudeContract("[{\"item\":\"bucket\",\"count\":1}]", true)));
+        } catch (RuntimeException error) {
+            return "a contract-only reply failed to parse: " + error.getMessage();
+        }
+        if (!contractOnly.calls().isEmpty() || contractOnly.contract() == null
+                || contractOnly.disposition() != PlanDisposition.ACTION) {
+            return "a contract-only reply did not parse into an empty action reply";
+        }
+        violation = expectClaudeMalformed("contract with a zero count", claudeResponse("On it.",
+                claudeContract("[{\"item\":\"stick\",\"count\":0}]", true),
+                claudeCall("fetch", "{\"resource\":\"stick\",\"count\":1}")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("contract missing deliver_to_owner", claudeResponse("On it.",
+                claudeCall(PlannerProtocol.CONTRACT_TOOL, "{\"deliverables\":[]}"),
+                claudeCall("goto", "{\"x\":1,\"z\":1}")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("action reply without speech",
+                claudeResponse(null, claudeCall("goto", "{\"x\":1,\"z\":1}")));
+        if (violation != null) {
+            return violation;
+        }
+        // Truncation announces itself only through stop_reason; the blocks may look complete.
+        violation = expectClaudeMalformed("truncated reply", claudeResponse("max_tokens",
+                "Partial plan.", claudeCall("goto", "{\"x\":1,\"z\":1}")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("string tool input",
+                claudeResponse("Sure.", claudeCall("mine", "\"oops\"")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectClaudeMalformed("reply without content",
+                "{\"id\":\"msg_fixture\",\"type\":\"message\",\"stop_reason\":\"end_turn\"}");
+        if (violation != null) {
+            return violation;
+        }
+        return null;
+    }
+
+    private static String expectClaudeMalformed(String label, String body) {
+        try {
+            AnthropicMessagesBackend.parseReply(body);
             return label + " was accepted";
         } catch (LlmException expected) {
             return null;

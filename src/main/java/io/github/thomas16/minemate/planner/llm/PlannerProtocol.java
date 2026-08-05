@@ -6,6 +6,14 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
 
+import io.github.thomas16.minemate.planner.OrderContract;
+import io.github.thomas16.minemate.planner.Plan;
+import io.github.thomas16.minemate.planner.PlanDisposition;
+import io.github.thomas16.minemate.tool.ToolCall;
+
+import java.util.ArrayList;
+import java.util.List;
+
 /** Hosted-planner-only protocol additions that must never become executable world tools. */
 public final class PlannerProtocol {
 
@@ -13,6 +21,158 @@ public final class PlannerProtocol {
     public static final String CONTRACT_TOOL = "declare_order_contract";
 
     private PlannerProtocol() {
+    }
+
+    /**
+     * A provider-parsed call: the name and its arguments as a plain JSON object. Each backend gets
+     * there its own way -- OpenAI re-parses an arguments <em>string</em> and strips strict-mode
+     * nulls, Anthropic hands the object over directly -- and everything after that point is
+     * protocol, not wire format.
+     */
+    public record RawCall(String name, JsonObject arguments) {
+    }
+
+    /**
+     * Turns a provider's parsed reply into an {@link LlmReply}, enforcing every protocol rule in
+     * one place so two backends cannot drift apart: at most one status and one contract, a status
+     * never mixes with world calls, a contract, or a separate assistant message, an action reply
+     * needs speech and at most {@link Plan#MAX_STEPS} world calls, and the contract-only shape
+     * stays parseable so dispatch can repair it.
+     *
+     * @param dialogue   the concatenated assistant text, possibly blank
+     * @param sawMessage whether any assistant text item existed at all, even an empty one; a
+     *                   terminal reply must not carry one
+     */
+    public static LlmReply assemble(String dialogue, boolean sawMessage, List<RawCall> calls) {
+        List<RawCall> statuses = new ArrayList<>();
+        List<RawCall> contracts = new ArrayList<>();
+        List<RawCall> worldCalls = new ArrayList<>();
+        for (RawCall call : calls) {
+            if (STATUS_TOOL.equals(call.name())) {
+                statuses.add(call);
+            } else if (CONTRACT_TOOL.equals(call.name())) {
+                contracts.add(call);
+            } else {
+                worldCalls.add(call);
+            }
+        }
+
+        if (statuses.size() > 1) {
+            throw LlmException.malformed("reply contained multiple order-status calls");
+        }
+        if (contracts.size() > 1) {
+            throw LlmException.malformed("reply contained multiple order-contract calls");
+        }
+        if (statuses.size() == 1) {
+            if (!worldCalls.isEmpty()) {
+                throw LlmException.malformed("reply mixed an order status with world-tool calls");
+            }
+            if (!contracts.isEmpty()) {
+                throw LlmException.malformed("terminal reply included an order contract");
+            }
+            if (sawMessage) {
+                throw LlmException.malformed("terminal reply included a separate assistant message");
+            }
+            return statusReplyOf(statuses.get(0));
+        }
+
+        // The contract call is protocol, not work: it does not count toward the step bound, so a
+        // contract plus MAX_STEPS world calls is a legal reply. A contract with no world calls is
+        // parseable on purpose: single-call-habit models really send it, and dispatch turns it
+        // into a repairable violation rather than an opaque parse failure.
+        if (worldCalls.isEmpty() && contracts.isEmpty()) {
+            throw LlmException.malformed("reply had no world-tool calls or order status");
+        }
+        if (worldCalls.size() > Plan.MAX_STEPS) {
+            throw LlmException.malformed("reply contained more than " + Plan.MAX_STEPS
+                    + " world-tool calls");
+        }
+        if (dialogue == null || dialogue.isBlank()) {
+            throw LlmException.malformed("action reply had no assistant speech");
+        }
+        List<ToolCall> toolCalls = new ArrayList<>(worldCalls.size());
+        for (RawCall call : worldCalls) {
+            toolCalls.add(toolCallOf(call));
+        }
+        OrderContract contract = contracts.isEmpty() ? null : contractOf(contracts.get(0));
+        return new LlmReply(dialogue, toolCalls, PlanDisposition.ACTION, contract);
+    }
+
+    private static ToolCall toolCallOf(RawCall call) {
+        if (call.name() == null || call.name().isBlank()) {
+            throw LlmException.malformed("function call had no name");
+        }
+        if (call.arguments() == null || call.arguments().size() == 0) {
+            return ToolCall.of(call.name());
+        }
+        return new ToolCall(call.name(), call.arguments());
+    }
+
+    private static LlmReply statusReplyOf(RawCall call) {
+        JsonObject arguments = call.arguments() == null ? new JsonObject() : call.arguments();
+        if (arguments.size() != 2 || !arguments.has("status") || !arguments.has("message")) {
+            throw LlmException.malformed("order status required exactly status and message");
+        }
+        String rawStatus = stringArgument(arguments, "status");
+        PlanDisposition disposition;
+        try {
+            disposition = PlanDisposition.valueOf(rawStatus);
+        } catch (IllegalArgumentException error) {
+            throw LlmException.malformed("invalid order status: " + rawStatus);
+        }
+        if (!disposition.terminal()) {
+            throw LlmException.malformed("ACTION is not a terminal order status");
+        }
+        String message = stringArgument(arguments, "message").strip();
+        if (message.isBlank()) {
+            throw LlmException.malformed("order status message was blank");
+        }
+        return new LlmReply(message, List.of(), disposition);
+    }
+
+    private static OrderContract contractOf(RawCall call) {
+        JsonObject arguments = call.arguments() == null ? new JsonObject() : call.arguments();
+        JsonElement deliverables = arguments.get("deliverables");
+        JsonElement deliverToOwner = arguments.get("deliver_to_owner");
+        if (arguments.size() != 2 || deliverables == null || !deliverables.isJsonArray()
+                || deliverToOwner == null || !deliverToOwner.isJsonPrimitive()
+                || !deliverToOwner.getAsJsonPrimitive().isBoolean()) {
+            throw LlmException.malformed(
+                    "order contract required exactly deliverables and deliver_to_owner");
+        }
+        List<OrderContract.Deliverable> parsed = new ArrayList<>();
+        for (JsonElement element : deliverables.getAsJsonArray()) {
+            if (!element.isJsonObject()) {
+                throw LlmException.malformed(
+                        "order contract deliverable required an item and a positive count");
+            }
+            JsonObject deliverable = element.getAsJsonObject();
+            String item = string(deliverable, "item");
+            JsonElement count = deliverable.get("count");
+            if (deliverable.size() != 2 || item.isBlank() || count == null
+                    || !count.isJsonPrimitive() || !count.getAsJsonPrimitive().isNumber()
+                    || count.getAsDouble() != Math.floor(count.getAsDouble())
+                    || count.getAsInt() < 1) {
+                throw LlmException.malformed(
+                        "order contract deliverable required an item and a positive count");
+            }
+            parsed.add(new OrderContract.Deliverable(item, count.getAsInt()));
+        }
+        return new OrderContract(parsed, deliverToOwner.getAsBoolean());
+    }
+
+    private static String stringArgument(JsonObject arguments, String name) {
+        JsonElement value = arguments.get(name);
+        if (value == null || !value.isJsonPrimitive()
+                || !value.getAsJsonPrimitive().isString()) {
+            throw LlmException.malformed("order status " + name + " was not a string");
+        }
+        return value.getAsString();
+    }
+
+    private static String string(JsonObject object, String member) {
+        JsonElement value = object.get(member);
+        return value != null && value.isJsonPrimitive() ? value.getAsString() : "";
     }
 
     /** Adds the reserved protocol functions to a registry schema without changing the registry. */

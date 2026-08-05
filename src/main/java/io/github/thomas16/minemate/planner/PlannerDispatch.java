@@ -2,6 +2,7 @@ package io.github.thomas16.minemate.planner;
 
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.context.EventKind;
+import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.entity.CompanionEntity;
 import io.github.thomas16.minemate.task.Reasons;
 import io.github.thomas16.minemate.tool.ToolMessages;
@@ -20,6 +21,10 @@ import net.minecraft.server.MinecraftServer;
  */
 public final class PlannerDispatch {
 
+    /** Owner-facing close message when a reply stays semantically incomplete after its repair. */
+    public static final String SEMANTIC_CLOSE_MESSAGE =
+            "I could not put together a complete plan for that order, so I am setting it aside.";
+
     private PlannerDispatch() {
     }
 
@@ -32,11 +37,11 @@ public final class PlannerDispatch {
         // Claimed now, on the server thread, so a later request or a cancel can disown this one.
         int generation = executor.beginPlannerRequest();
         planner.plan(request).whenComplete((plan, error) ->
-                server.execute(() -> apply(companion, planner, plan, error, generation)));
+                server.execute(() -> apply(companion, planner, request, plan, error, generation)));
     }
 
-    private static void apply(CompanionEntity companion, Planner planner, Plan plan, Throwable error,
-            int generation) {
+    private static void apply(CompanionEntity companion, Planner planner, PlanRequest request,
+            Plan plan, Throwable error, int generation) {
         if (companion.isRemoved() || companion.getPlanExecutor() == null) {
             return;
         }
@@ -73,6 +78,37 @@ public final class PlannerDispatch {
             companion.closeStandingOrder();
             return;
         }
+        if (planner.requiresContract()) {
+            StandingOrder order = companion.getStandingOrder();
+            if (order != null) {
+                String violation = null;
+                if (plan.steps().isEmpty()) {
+                    // A single-call-habit model declares the contract and stops. The reply is
+                    // honest about what the order needs, so ask once for the missing work rather
+                    // than failing the order over it.
+                    violation = "the reply declared a contract but no world-tool calls";
+                } else if (order.contract() == null) {
+                    // First accepted action reply not seen yet: this reply must declare the
+                    // contract, and its own steps must honor it.
+                    violation = plan.contract() == null
+                            ? "the action reply did not declare the order contract"
+                            : ContractCoverage.violation(plan.contract(), plan.steps());
+                } else if (plan.contract() != null) {
+                    // A replan re-declaring the contract is tolerated and ignored: the stored one
+                    // is authoritative, and replans plan only the remaining work, which cannot be
+                    // judged against the full contract without delivery evidence.
+                    MineMate.LOGGER.debug("Planner {} re-declared the order contract on a replan",
+                            planner.name());
+                }
+                if (violation != null) {
+                    repairOrClose(companion, planner, request, plan, violation);
+                    return;
+                }
+                if (order.contract() == null) {
+                    order.declareContract(plan.contract());
+                }
+            }
+        }
         PlanExecutor.StartResult result = companion.getPlanExecutor().start(plan);
         switch (result) {
             case ACCEPTED -> {
@@ -85,6 +121,40 @@ public final class PlannerDispatch {
                     .map(outcome -> ToolMessages.owner(outcome.reason(), ""))
                     .orElse("I could not use that plan"));
         }
+    }
+
+    /**
+     * One bounded repair per order: quote the violation and the rejected reply back to the model,
+     * or close the order once that chance is spent. The rejected plan never reaches the executor
+     * either way, so a semantically incomplete plan cannot half-execute.
+     */
+    private static void repairOrClose(CompanionEntity companion, Planner planner,
+            PlanRequest request, Plan plan, String violation) {
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || !order.repairAvailable()) {
+            MineMate.LOGGER.warn("Planner {} reply rejected after repair: {}", planner.name(),
+                    violation);
+            if (companion.getContext() != null) {
+                companion.getContext().record(EventKind.PLANNER_FAILED,
+                        "planning failed (" + violation + ")", planner.name());
+            }
+            tell(companion, SEMANTIC_CLOSE_MESSAGE);
+            companion.closeStandingOrder();
+            return;
+        }
+        order.consumeRepair();
+        MineMate.LOGGER.info("Planner {} reply rejected, requesting repair: {}", planner.name(),
+                violation);
+        String note = violation + "; the rejected reply said \"" + plan.dialogue()
+                + "\" and called " + plan.steps().stream()
+                        .map(step -> step.call().toCompactString()).toList();
+        // A fresh snapshot: seconds passed during the round trip, and snapshots memoize per tick.
+        // Requesting synchronously on this same server-thread slice re-raises the pending flag
+        // before PlannerAutonomy can interleave, and /companion stop still disowns the repair
+        // through the ordinary generation counter.
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        request(companion, planner, new PlanRequest(request.requestText(), snapshot,
+                snapshot.render(), request.trigger(), request.toolSchemaJson(), note));
     }
 
     private static String rootMessage(Throwable error) {

@@ -7,6 +7,7 @@ import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
 
 import io.github.thomas16.minemate.MineMate;
+import io.github.thomas16.minemate.planner.OrderContract;
 import io.github.thomas16.minemate.planner.Plan;
 import io.github.thomas16.minemate.planner.PlanDisposition;
 import io.github.thomas16.minemate.tool.ToolCall;
@@ -111,7 +112,10 @@ public final class OpenAiResponsesBackend implements LlmBackend {
         root.addProperty("model", model);
         root.addProperty("instructions", prompt.system());
         root.add("tools", OpenAiToolSchemas.toOpenAiTools(prompt.toolSchemaJson()));
-        root.addProperty("tool_choice", "auto");
+        // Required, not auto: every valid hosted reply carries at least one function call, whether
+        // a world action or report_order_status, so a zero-call speech reply is stopped at the
+        // provider boundary instead of burning tokens on something the parser must reject.
+        root.addProperty("tool_choice", "required");
         // True on purpose: several function calls in one reply are what a multi-step plan is.
         root.addProperty("parallel_tool_calls", true);
 
@@ -183,16 +187,26 @@ public final class OpenAiResponsesBackend implements LlmBackend {
         List<JsonObject> statuses = functionCalls.stream()
                 .filter(call -> PlannerProtocol.STATUS_TOOL.equals(string(call, "name")))
                 .toList();
+        List<JsonObject> contracts = functionCalls.stream()
+                .filter(call -> PlannerProtocol.CONTRACT_TOOL.equals(string(call, "name")))
+                .toList();
         List<JsonObject> worldCalls = functionCalls.stream()
-                .filter(call -> !PlannerProtocol.STATUS_TOOL.equals(string(call, "name")))
+                .filter(call -> !PlannerProtocol.STATUS_TOOL.equals(string(call, "name"))
+                        && !PlannerProtocol.CONTRACT_TOOL.equals(string(call, "name")))
                 .toList();
 
         if (statuses.size() > 1) {
             throw LlmException.malformed("reply contained multiple order-status calls");
         }
+        if (contracts.size() > 1) {
+            throw LlmException.malformed("reply contained multiple order-contract calls");
+        }
         if (statuses.size() == 1) {
             if (!worldCalls.isEmpty()) {
                 throw LlmException.malformed("reply mixed an order status with world-tool calls");
+            }
+            if (!contracts.isEmpty()) {
+                throw LlmException.malformed("terminal reply included an order contract");
             }
             if (sawMessage) {
                 throw LlmException.malformed("terminal reply included a separate assistant message");
@@ -200,7 +214,11 @@ public final class OpenAiResponsesBackend implements LlmBackend {
             return statusReplyOf(statuses.get(0));
         }
 
-        if (worldCalls.isEmpty()) {
+        // The contract call is protocol, not work: it does not count toward the step bound, so a
+        // contract plus MAX_STEPS world calls is a legal reply. A contract with no world calls is
+        // parseable on purpose: single-call-habit models really send it, and dispatch turns it
+        // into a repairable violation rather than an opaque parse failure.
+        if (worldCalls.isEmpty() && contracts.isEmpty()) {
             throw LlmException.malformed("reply had no world-tool calls or order status");
         }
         if (worldCalls.size() > Plan.MAX_STEPS) {
@@ -214,7 +232,8 @@ public final class OpenAiResponsesBackend implements LlmBackend {
         for (JsonObject call : worldCalls) {
             calls.add(toolCallOf(call));
         }
-        return new LlmReply(dialogue.toString(), calls, PlanDisposition.ACTION);
+        OrderContract contract = contracts.isEmpty() ? null : contractOf(contracts.get(0));
+        return new LlmReply(dialogue.toString(), calls, PlanDisposition.ACTION, contract);
     }
 
     private static void appendText(JsonObject message, StringBuilder dialogue) {
@@ -268,6 +287,37 @@ public final class OpenAiResponsesBackend implements LlmBackend {
             throw LlmException.malformed("order status message was blank");
         }
         return new LlmReply(message, List.of(), disposition);
+    }
+
+    private static OrderContract contractOf(JsonObject call) {
+        JsonObject arguments = argumentsOf(call, PlannerProtocol.CONTRACT_TOOL, false);
+        JsonElement deliverables = arguments.get("deliverables");
+        JsonElement deliverToOwner = arguments.get("deliver_to_owner");
+        if (arguments.size() != 2 || deliverables == null || !deliverables.isJsonArray()
+                || deliverToOwner == null || !deliverToOwner.isJsonPrimitive()
+                || !deliverToOwner.getAsJsonPrimitive().isBoolean()) {
+            throw LlmException.malformed(
+                    "order contract required exactly deliverables and deliver_to_owner");
+        }
+        List<OrderContract.Deliverable> parsed = new ArrayList<>();
+        for (JsonElement element : deliverables.getAsJsonArray()) {
+            if (!element.isJsonObject()) {
+                throw LlmException.malformed(
+                        "order contract deliverable required an item and a positive count");
+            }
+            JsonObject deliverable = element.getAsJsonObject();
+            String item = string(deliverable, "item");
+            JsonElement count = deliverable.get("count");
+            if (deliverable.size() != 2 || item.isBlank() || count == null
+                    || !count.isJsonPrimitive() || !count.getAsJsonPrimitive().isNumber()
+                    || count.getAsDouble() != Math.floor(count.getAsDouble())
+                    || count.getAsInt() < 1) {
+                throw LlmException.malformed(
+                        "order contract deliverable required an item and a positive count");
+            }
+            parsed.add(new OrderContract.Deliverable(item, count.getAsInt()));
+        }
+        return new OrderContract(parsed, deliverToOwner.getAsBoolean());
     }
 
     private static JsonObject argumentsOf(JsonObject call, String name, boolean emptyAllowed) {

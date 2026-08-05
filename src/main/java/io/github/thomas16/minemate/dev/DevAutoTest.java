@@ -56,6 +56,7 @@ import io.github.thomas16.minemate.context.EventKind;
 import io.github.thomas16.minemate.context.JournalEntry;
 import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.planner.HostedPlanner;
+import io.github.thomas16.minemate.planner.OrderContract;
 import io.github.thomas16.minemate.planner.Plan;
 import io.github.thomas16.minemate.planner.PlanDisposition;
 import io.github.thomas16.minemate.planner.PlanExecutor;
@@ -118,7 +119,11 @@ public final class DevAutoTest {
             "llm_unknown_tool",
             "llm_malformed_output",
             "llm_http_error",
-            "llm_talk_only");
+            "llm_talk_only",
+            "llm_contract_repair",
+            "llm_contract_only_repair",
+            "llm_contract_exhausted",
+            "llm_answered");
     /** Scenarios that make real network calls. Selectable by name, never included in a profile. */
     private static final Set<String> LIVE_SCENARIOS = Set.of("llm_live", "llm_live_multi_step");
     private static final UUID FAKE_OWNER_UUID =
@@ -527,6 +532,7 @@ public final class DevAutoTest {
                         200,
                         ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
                                 llmResponse("On it.",
+                                        llmContract("[]", false),
                                         llmCall("mine", "{\"resource\":\"dirt\",\"count\":1}"),
                                         llmCall("teleport", "{\"x\":0,\"z\":0}")))),
                                 "take me home"),
@@ -539,6 +545,7 @@ public final class DevAutoTest {
                         ignoredServer -> prepareLlmPlan(FixtureTransport.of(
                                 FixtureTransport.rateLimited("0"),
                                 FixtureTransport.ok(llmResponse("One moment.",
+                                        llmContract("[]", false),
                                         llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
                                                 + spawn.getZ() + "}")))),
                                 "come here"),
@@ -593,6 +600,7 @@ public final class DevAutoTest {
                         300,
                         ignoredServer -> prepareLlmPlan(FixtureTransport.delayed(400L,
                                 FixtureTransport.ok(llmResponse("Coming.",
+                                        llmContract("[]", false),
                                         llmCall("goto", "{\"x\":" + (spawn.getX() + 40_000)
                                                 + ",\"z\":" + spawn.getZ() + "}")))),
                                 "go a very long way"),
@@ -619,6 +627,41 @@ public final class DevAutoTest {
                         ignoredServer -> prepareLlmReplanBudget(),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::llmReplanBudgetInvariant),
+                // The playtest semantic regressions: a delivery contract the plan does not honor
+                // gets one repair; a reply that stays incomplete after its repair closes the order.
+                Scenario.probe("llm_contract_repair",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && !companion.getPlanExecutor().isPlannerRequestPending(),
+                        () -> llmContractRepairVerdict("does not fetch 1 iron_sword"),
+                        400,
+                        ignoredServer -> prepareLlmContractRepair(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                Scenario.probe("llm_contract_only_repair",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && !companion.getPlanExecutor().isPlannerRequestPending(),
+                        () -> llmContractRepairVerdict("declared a contract but no world-tool calls"),
+                        400,
+                        ignoredServer -> prepareLlmContractOnlyRepair(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                Scenario.probe("llm_contract_exhausted",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::llmContractExhaustedVerdict,
+                        300,
+                        ignoredServer -> prepareLlmContractExhausted(),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                Scenario.probe("llm_answered",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        () -> llmAnsweredVerdict("inventory answer"),
+                        200,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
+                                llmResponse(null, llmStatus("ANSWERED",
+                                        "I am carrying cobblestone and a stone pickaxe.")))),
+                                "what is in your inventory?"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
                 // Never in a profile: these are the only scenarios that leave the machine or cost
                 // money. Select them by name, and only with a key configured.
                 Scenario.probe("llm_live",
@@ -1091,6 +1134,7 @@ public final class DevAutoTest {
         prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
         installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
                 llmResponse("I will make the planks, then bring them to you.",
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":4}]", true),
                         llmCall("craft", "{\"item\":\"oak_planks\",\"count\":4}"),
                         llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":4}")))), 0);
         requestLlmPlan("make 4 oak planks for me");
@@ -1111,7 +1155,10 @@ public final class DevAutoTest {
     private static void prepareLlmReplanBudget() {
         prepareInventory();
         llmBudgetSawFinalPlanOpen = false;
+        // The repeating reply re-declares the contract on every replan, which dispatch tolerates
+        // and ignores; this scenario doubles as coverage of that path.
         installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(llmResponse("Working on it.",
+                llmContract("[]", false),
                 llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":" + spawn.getZ() + "}")))),
                 LLM_REPLAN_BUDGET);
         requestLlmPlan("keep busy");
@@ -1119,8 +1166,11 @@ public final class DevAutoTest {
 
     private static void prepareLlmPlanBoundary() {
         prepareInventory();
+        // The contract goes with the first reply only; the replan reply deliberately omits it,
+        // proving a stored contract is not demanded again.
         installLlmPlanner(FixtureTransport.of(
                 FixtureTransport.ok(llmResponse("I am moving into position.",
+                        llmContract("[]", false),
                         llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
                                 + spawn.getZ() + "}"))),
                 FixtureTransport.ok(llmResponse("I am continuing to the distant checkpoint.",
@@ -1134,11 +1184,67 @@ public final class DevAutoTest {
         prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
         installLlmPlanner(FixtureTransport.of(
                 FixtureTransport.ok(llmResponse("I am coming over.",
+                        llmContract("[]", false),
                         llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
                                 + spawn.getZ() + "}"))),
                 FixtureTransport.ok(llmResponse(null,
                         llmStatus("COMPLETED", "I am here.")))), 3);
         requestLlmPlan("come here");
+    }
+
+    /**
+     * The iron-sword playtest shape: the first reply declares delivery but only crafts, so the
+     * dispatcher demands one repair; the repaired reply adds the fetch and is accepted.
+     */
+    private static void prepareLlmContractRepair() {
+        prepareInventory();
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I will forge you an iron sword.",
+                        llmContract("[{\"item\":\"iron_sword\",\"count\":1}]", true),
+                        llmCall("craft", "{\"item\":\"iron_sword\",\"count\":1}"))),
+                FixtureTransport.ok(llmResponse("I will forge the sword and bring it over.",
+                        llmContract("[{\"item\":\"iron_sword\",\"count\":1}]", true),
+                        llmCall("craft", "{\"item\":\"iron_sword\",\"count\":1}"),
+                        llmCall("fetch", "{\"resource\":\"iron_sword\",\"count\":1}")))), 0);
+        requestLlmPlan("make me an iron sword");
+    }
+
+    /**
+     * The live bucket regression: a single-call-habit model declares the contract, says it is on
+     * the job, and plans nothing. The repair demands the contract and the work in one reply.
+     */
+    private static void prepareLlmContractOnlyRepair() {
+        prepareInventory();
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I will get you an iron sword.",
+                        llmContract("[{\"item\":\"iron_sword\",\"count\":1}]", true))),
+                FixtureTransport.ok(llmResponse("Forging the sword and bringing it over.",
+                        llmContract("[{\"item\":\"iron_sword\",\"count\":1}]", true),
+                        llmCall("craft", "{\"item\":\"iron_sword\",\"count\":1}"),
+                        llmCall("fetch", "{\"resource\":\"iron_sword\",\"count\":1}")))), 0);
+        requestLlmPlan("can u make me an iron sword");
+    }
+
+    /**
+     * The stone-tools playtest shape, exercising both violation kinds: the first reply declares no
+     * contract at all, and the repaired reply declares one its stick-crafting still does not cover,
+     * so the order closes without executing anything.
+     */
+    private static void prepareLlmContractExhausted() {
+        prepareInventory();
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I will get a stone tool set going.",
+                        llmCall("craft", "{\"item\":\"stick\",\"count\":7}"))),
+                FixtureTransport.ok(llmResponse("Finishing the tool set.",
+                        llmContract("[{\"item\":\"stone_pickaxe\",\"count\":1},"
+                                + "{\"item\":\"stone_axe\",\"count\":1},"
+                                + "{\"item\":\"stone_shovel\",\"count\":1},"
+                                + "{\"item\":\"stone_sword\",\"count\":1},"
+                                + "{\"item\":\"stone_hoe\",\"count\":1}]", true),
+                        llmCall("craft", "{\"item\":\"stick\",\"count\":8}")))), 0);
+        requestLlmPlan("give me a full set of stone tools");
     }
 
     private static void clearLlmPlanner(MinecraftServer server) {
@@ -1313,6 +1419,12 @@ public final class DevAutoTest {
         return llmCall(PlannerProtocol.STATUS_TOOL, arguments.toString());
     }
 
+    /** deliverablesJson is the raw array, e.g. {@code [{"item":"iron_sword","count":1}]}. */
+    private static JsonObject llmContract(String deliverablesJson, boolean deliverToOwner) {
+        return llmCall(PlannerProtocol.CONTRACT_TOOL, "{\"deliverables\":" + deliverablesJson
+                + ",\"deliver_to_owner\":" + deliverToOwner + "}");
+    }
+
     private static JsonObject[] nineGotoCalls() {
         JsonObject[] calls = new JsonObject[Plan.MAX_STEPS + 1];
         for (int index = 0; index < calls.length; index++) {
@@ -1398,6 +1510,17 @@ public final class DevAutoTest {
         if (!"fetch".equals(second.tool()) || !"chest".equals(argument(second, "resource"))) {
             return "second action was not fetch(chest): " + second.toCompactString();
         }
+        if (plan.contract() == null) {
+            return "the live reply did not declare an order contract";
+        }
+        if (!plan.contract().deliverToOwner()
+                || plan.contract().deliverables().stream()
+                        .noneMatch(deliverable -> "oak_boat".equals(deliverable.item()))
+                || plan.contract().deliverables().stream()
+                        .noneMatch(deliverable -> "chest".equals(deliverable.item()))) {
+            return "the live contract did not cover oak_boat and chest for the owner: "
+                    + plan.contract();
+        }
         MineMate.LOGGER.info("[autotest] llm_live_multi_step accepted first reply: {}",
                 plan.steps().stream().map(step -> step.call().toCompactString()).toList());
         return null;
@@ -1458,6 +1581,86 @@ public final class DevAutoTest {
         }
         if (companion.getStandingOrder() != null) {
             return "COMPLETED did not close the standing order";
+        }
+        return null;
+    }
+
+    private static String llmContractRepairVerdict(String expectedViolation) {
+        if (llmTransport.calls() != 2) {
+            return "expected one rejection and one repair request, saw " + llmTransport.calls();
+        }
+        String body = llmTransport.lastRequestBody();
+        if (!body.contains("REPAIR:") || !body.contains(expectedViolation)) {
+            return "the repair request did not quote the violation: " + expectedViolation;
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "a repairable reply was recorded as a planner failure";
+        }
+        if (!companion.getPlanExecutor().isActive()) {
+            return "the repaired plan was not accepted and active";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null) {
+            return "the repair closed the standing order";
+        }
+        OrderContract contract = order.contract();
+        if (contract == null || !contract.deliverToOwner()
+                || contract.deliverables().size() != 1
+                || !"iron_sword".equals(contract.deliverables().get(0).item())) {
+            return "the accepted repair did not store its contract: " + contract;
+        }
+        if (order.replansUsed() != 0) {
+            return "the repair was charged against the replan budget";
+        }
+        return null;
+    }
+
+    private static String llmContractExhaustedVerdict() {
+        if (llmTransport.calls() != 2) {
+            return "expected one rejection and one repair request, saw " + llmTransport.calls();
+        }
+        String body = llmTransport.lastRequestBody();
+        if (!body.contains("REPAIR:") || !body.contains("did not declare the order contract")) {
+            return "the repair request did not quote the missing-contract violation";
+        }
+        if (!journalHasSummary(EventKind.PLANNER_FAILED, "planning failed (the plan does not fetch"
+                + " 1 stone_pickaxe for the owner; fetch acquires or crafts and then delivers)")) {
+            return "the exhausted repair did not record the coverage violation";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            return "an incomplete plan executed anyway";
+        }
+        if (sawNewPlanOutcome()) {
+            return "an incomplete plan reached PlanExecutor";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "an incomplete plan submitted a goal";
+        }
+        if (companion.getStandingOrder() != null) {
+            return "the exhausted repair left the standing order open";
+        }
+        return null;
+    }
+
+    /** ANSWERED closes an informational or social order without touching the world. */
+    private static String llmAnsweredVerdict(String label) {
+        if (llmTransport.calls() != 1) {
+            return label + ": expected one request, saw " + llmTransport.calls();
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return label + ": an ANSWERED terminal was recorded as a planner failure";
+        }
+        if (sawNewPlanOutcome()) {
+            return label + ": an ANSWERED terminal reached PlanExecutor";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return label + ": an ANSWERED terminal submitted a goal";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            return label + ": an ANSWERED terminal started a plan";
+        }
+        if (companion.getStandingOrder() != null) {
+            return label + ": ANSWERED did not close the standing order";
         }
         return null;
     }
@@ -1533,7 +1736,10 @@ public final class DevAutoTest {
                 && "fetch".equals(outcome.stepOutcomes().get(1).call().tool())
                 // Several tool calls in one reply is what a multi-step plan is made of.
                 && body.contains("\"parallel_tool_calls\":true")
+                // Every valid reply carries a function call, so the provider can enforce that.
+                && body.contains("\"tool_choice\":\"required\"")
                 && body.contains(PlannerProtocol.STATUS_TOOL)
+                && body.contains(PlannerProtocol.CONTRACT_TOOL)
                 && body.contains("Include every step that is currently known")
                 && !body.contains("do not try to plan the whole job")
                 // The nested Chat Completions wrapper here would be rejected by the real endpoint.
@@ -1580,6 +1786,9 @@ public final class DevAutoTest {
         if (registrySchema.contains(PlannerProtocol.STATUS_TOOL)) {
             return "the reserved status function leaked into ToolRegistry";
         }
+        if (registrySchema.contains(PlannerProtocol.CONTRACT_TOOL)) {
+            return "the reserved contract function leaked into ToolRegistry";
+        }
         String hostedSchema;
         JsonArray tools;
         try {
@@ -1588,9 +1797,9 @@ public final class DevAutoTest {
         } catch (RuntimeException error) {
             return "the strict transform threw " + error;
         }
-        if (tools.size() != ToolRegistry.defaults().tools().size() + 1) {
+        if (tools.size() != ToolRegistry.defaults().tools().size() + 2) {
             return "the hosted transform produced " + tools.size() + " tools instead of "
-                    + (ToolRegistry.defaults().tools().size() + 1);
+                    + (ToolRegistry.defaults().tools().size() + 2);
         }
         for (JsonElement element : tools) {
             String violation = strictToolViolation(element.getAsJsonObject(), hostedSchema);
@@ -1599,10 +1808,14 @@ public final class DevAutoTest {
             }
         }
         JsonObject statusTool = null;
+        JsonObject contractTool = null;
         for (JsonElement element : tools) {
             JsonObject tool = element.getAsJsonObject();
             if (PlannerProtocol.STATUS_TOOL.equals(tool.get("name").getAsString())) {
                 statusTool = tool;
+            }
+            if (PlannerProtocol.CONTRACT_TOOL.equals(tool.get("name").getAsString())) {
+                contractTool = tool;
             }
         }
         if (statusTool == null) {
@@ -1610,14 +1823,33 @@ public final class DevAutoTest {
         }
         JsonArray statuses = statusTool.getAsJsonObject("parameters")
                 .getAsJsonObject("properties").getAsJsonObject("status").getAsJsonArray("enum");
-        if (statuses.contains(JsonParser.parseString("\"ACTION\"")) || statuses.size() != 4) {
+        if (statuses.contains(JsonParser.parseString("\"ACTION\"")) || statuses.size() != 5
+                || !statuses.contains(JsonParser.parseString("\"ANSWERED\""))) {
             return "the status function exposed the wrong dispositions";
+        }
+        if (contractTool == null) {
+            return "the hosted schema omitted the reserved contract function";
+        }
+        // The strict transform rewrites only the top level, so the nested deliverable object must
+        // arrive pre-strict; losing that would only ever show up as an opaque 400 from the provider.
+        JsonObject deliverable = contractTool.getAsJsonObject("parameters")
+                .getAsJsonObject("properties").getAsJsonObject("deliverables")
+                .getAsJsonObject("items");
+        JsonElement nestedAdditional = deliverable.get("additionalProperties");
+        if (nestedAdditional == null || nestedAdditional.getAsBoolean()) {
+            return "the contract deliverable did not forbid additional properties";
+        }
+        JsonArray nestedRequired = deliverable.getAsJsonArray("required");
+        if (nestedRequired == null || nestedRequired.size() != 2
+                || !nestedRequired.contains(JsonParser.parseString("\"item\""))
+                || !nestedRequired.contains(JsonParser.parseString("\"count\""))) {
+            return "the contract deliverable did not require item and count";
         }
         return nullStrippingViolation();
     }
 
     private static String llmProtocolViolation() {
-        for (PlanDisposition expected : List.of(PlanDisposition.COMPLETED,
+        for (PlanDisposition expected : List.of(PlanDisposition.COMPLETED, PlanDisposition.ANSWERED,
                 PlanDisposition.CLARIFICATION, PlanDisposition.UNSUPPORTED, PlanDisposition.BLOCKED)) {
             LlmReply reply;
             try {
@@ -1659,6 +1891,63 @@ public final class DevAutoTest {
         }
         violation = expectMalformed("nine-action reply",
                 llmResponse("This is too much.", nineGotoCalls()));
+        if (violation != null) {
+            return violation;
+        }
+
+        // The contract call is protocol, not work: it must parse into the reply's contract and
+        // never count as a world call.
+        LlmReply contractReply;
+        try {
+            contractReply = OpenAiResponsesBackend.parseReply(llmResponse("On it.",
+                    llmContract("[{\"item\":\"minecraft:Iron_Sword\",\"count\":1}]", true),
+                    llmCall("fetch", "{\"resource\":\"iron_sword\",\"count\":1}")));
+        } catch (RuntimeException error) {
+            return "a contract-bearing action reply failed to parse: " + error.getMessage();
+        }
+        if (contractReply.calls().size() != 1
+                || !"fetch".equals(contractReply.calls().get(0).tool())) {
+            return "the contract call leaked into the world calls";
+        }
+        if (contractReply.contract() == null || !contractReply.contract().deliverToOwner()
+                || contractReply.contract().deliverables().size() != 1
+                || !"iron_sword".equals(contractReply.contract().deliverables().get(0).item())) {
+            return "the contract did not parse and normalize";
+        }
+        violation = expectMalformed("duplicate contract", llmResponse("On it.",
+                llmContract("[]", false), llmContract("[]", false),
+                llmCall("goto", "{\"x\":1,\"z\":1}")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectMalformed("contract on a terminal reply", llmResponse(null,
+                llmContract("[]", false), llmStatus("COMPLETED", "Done.")));
+        if (violation != null) {
+            return violation;
+        }
+        // Parseable on purpose: single-call-habit models send exactly this, and dispatch must get
+        // the chance to repair it instead of the parser failing the order.
+        LlmReply contractOnly;
+        try {
+            contractOnly = OpenAiResponsesBackend.parseReply(llmResponse(
+                    "On it, I will get you a bucket.",
+                    llmContract("[{\"item\":\"bucket\",\"count\":1}]", true)));
+        } catch (RuntimeException error) {
+            return "a contract-only reply failed to parse: " + error.getMessage();
+        }
+        if (!contractOnly.calls().isEmpty() || contractOnly.contract() == null
+                || contractOnly.disposition() != PlanDisposition.ACTION) {
+            return "a contract-only reply did not parse into an empty action reply";
+        }
+        violation = expectMalformed("contract with a zero count", llmResponse("On it.",
+                llmContract("[{\"item\":\"stick\",\"count\":0}]", true),
+                llmCall("fetch", "{\"resource\":\"stick\",\"count\":1}")));
+        if (violation != null) {
+            return violation;
+        }
+        violation = expectMalformed("contract missing deliver_to_owner", llmResponse("On it.",
+                llmCall(PlannerProtocol.CONTRACT_TOOL, "{\"deliverables\":[]}"),
+                llmCall("goto", "{\"x\":1,\"z\":1}")));
         if (violation != null) {
             return violation;
         }

@@ -13,6 +13,8 @@ public final class StandingOrder {
     private final String requestText;
     private final long openedAtGameTime;
     private int replansUsed;
+    private OrderContract contract;
+    private boolean repairUsed;
 
     public StandingOrder(String requestText, long openedAtGameTime) {
         this.requestText = requestText == null ? "" : requestText;
@@ -38,6 +40,28 @@ public final class StandingOrder {
 
     public void consumeReplan() {
         replansUsed++;
+    }
+
+    /** The contract the accepted first action reply declared, or null before one was accepted. */
+    public OrderContract contract() {
+        return contract;
+    }
+
+    /**
+     * Stored only when the declaring reply is accepted. A rejected reply's contract dies with the
+     * reply, so a repair reply must redeclare it and is validated as a whole, self-contained.
+     */
+    public void declareContract(OrderContract contract) {
+        this.contract = contract;
+    }
+
+    /** One repair per order, charged separately from the replan budget. */
+    public boolean repairAvailable() {
+        return !repairUsed;
+    }
+
+    public void consumeRepair() {
+        repairUsed = true;
     }
 
     @Override

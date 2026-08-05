@@ -11,14 +11,21 @@ import java.util.Objects;
  *
  * @param renderedContext the snapshot already rendered, so a planner never re-derives the prompt
  * @param trigger         the event that prompted this call; null for a direct owner request
+ * @param repairNote      why the previous reply for this order was rejected, quoted back to the
+ *                        model for its one bounded repair attempt; null for an ordinary request
  */
 public record PlanRequest(String requestText, WorldSnapshot snapshot, String renderedContext,
-        ReplanReason trigger, String toolSchemaJson) {
+        ReplanReason trigger, String toolSchemaJson, String repairNote) {
 
     public PlanRequest {
         Objects.requireNonNull(snapshot, "snapshot");
         requestText = requestText == null ? "" : requestText;
         renderedContext = renderedContext == null ? "" : renderedContext;
         toolSchemaJson = toolSchemaJson == null ? "" : toolSchemaJson;
+    }
+
+    public PlanRequest(String requestText, WorldSnapshot snapshot, String renderedContext,
+            ReplanReason trigger, String toolSchemaJson) {
+        this(requestText, snapshot, renderedContext, trigger, toolSchemaJson, null);
     }
 }

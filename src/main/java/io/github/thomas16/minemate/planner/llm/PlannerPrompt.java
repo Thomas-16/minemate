@@ -32,12 +32,23 @@ public final class PlannerPrompt {
               most %d calls, ending at a useful checkpoint. If a future choice depends on evidence
               that does not exist yet, stop before that unknown choice.
             - 'follow' never finishes on its own, so call it only as the very last tool, if at all.
+            - The first action reply for an order must include the declare_order_contract call and
+              the world-tool calls together, in that one reply: declare every final item the owner
+              asked to receive and whether it must be delivered to the owner, then call the world
+              tools that do the work. Declaring the contract alone is not a plan. Do not repeat
+              the contract on a replan of the same order, and never call it with a terminal
+              status.
+            - When deliver_to_owner is true, the same reply must include a fetch call for each
+              deliverable with at least the declared count, unless all %d calls are used and the
+              reply ends at a useful checkpoint. fetch acquires or crafts the item as needed and
+              delivers it; craft alone leaves the output with you.
             - A terminal reply is exactly one report_order_status call, no world-tool calls, and no
-              separate assistant message. Use COMPLETED, CLARIFICATION, UNSUPPORTED, or BLOCKED.
-              COMPLETED is valid only when the snapshot proves the order is satisfied. Use
-              CLARIFICATION when the owner must choose or supply missing information, UNSUPPORTED
-              when no available capability can perform the order, and BLOCKED when the world state
-              prevents useful progress now.
+              separate assistant message. Use COMPLETED, ANSWERED, CLARIFICATION, UNSUPPORTED, or
+              BLOCKED. COMPLETED is valid only when the snapshot proves the order is satisfied. Use
+              ANSWERED when the order is a question or a social remark you can answer from the
+              snapshot without any world action. Use CLARIFICATION when the owner must choose or
+              supply missing information, UNSUPPORTED when no available capability can perform the
+              order, and BLOCKED when the world state prevents useful progress now.
             - Use plain Minecraft ids for resources and items: oak_log, cobblestone, iron_ore,
               oak_planks. Do not invent names; an unknown name fails the whole plan.
             - Keep speech to one short sentence, in character as a capable teammate rather than an
@@ -59,7 +70,7 @@ public final class PlannerPrompt {
 
             A section is absent when it has nothing to report, or when it was dropped to fit the
             context budget. Absent never means empty.
-            """.formatted(Plan.MAX_STEPS, Plan.MAX_STEPS, Plan.MAX_STEPS);
+            """.formatted(Plan.MAX_STEPS, Plan.MAX_STEPS, Plan.MAX_STEPS, Plan.MAX_STEPS);
 
     private PlannerPrompt() {
     }
@@ -78,6 +89,13 @@ public final class PlannerPrompt {
                     .append("): the order below is still open. Look at LAST and EVENTS, then either")
                     .append(" continue it with a complete bounded action chunk or report an explicit")
                     .append(" terminal order status.\n");
+        }
+        if (request.repairNote() != null && !request.repairNote().isBlank()) {
+            text.append("REPAIR: your previous reply for this order was rejected: ")
+                    .append(request.repairNote())
+                    .append(". Send one corrected complete reply: call declare_order_contract for")
+                    .append(" this order and cover every deliverable with matching world-tool calls,")
+                    .append(" or report a terminal order status.\n");
         }
         return text.append("ORDER: ").append(request.requestText()).toString();
     }

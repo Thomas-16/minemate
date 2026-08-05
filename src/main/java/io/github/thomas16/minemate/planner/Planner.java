@@ -20,6 +20,15 @@ public interface Planner {
      */
     CompletableFuture<Plan> plan(PlanRequest request);
 
+    /**
+     * Whether this planner speaks the order-contract protocol: its first action reply for an order
+     * must declare an {@link OrderContract}, which dispatch validates the plan against. Scripted
+     * planners do not, and are never contract-checked.
+     */
+    default boolean requiresContract() {
+        return false;
+    }
+
     default void close() {
     }
 }

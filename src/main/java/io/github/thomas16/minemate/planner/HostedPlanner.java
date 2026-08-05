@@ -57,6 +57,11 @@ public final class HostedPlanner implements Planner {
     }
 
     @Override
+    public boolean requiresContract() {
+        return true;
+    }
+
+    @Override
     public CompletableFuture<Plan> plan(PlanRequest request) {
         String hostedSchema = PlannerProtocol.hostedSchema(request.toolSchemaJson());
         LlmPrompt prompt = new LlmPrompt(PlannerPrompt.SYSTEM, PlannerPrompt.user(request),
@@ -84,20 +89,25 @@ public final class HostedPlanner implements Planner {
             throw LlmException.malformed("planner returned more than " + Plan.MAX_STEPS
                     + " world-tool calls");
         }
+        // A contract with no world calls passes through as an empty ACTION plan: dispatch owns
+        // that case, because its remedy is a repair request, not a parse failure.
         if (reply.disposition() == PlanDisposition.ACTION
-                && (calls.isEmpty() || reply.dialogue().isBlank())) {
+                && (reply.dialogue().isBlank() || (calls.isEmpty() && reply.contract() == null))) {
             throw LlmException.malformed("action reply requires speech and at least one world-tool call");
         }
         if (reply.disposition().terminal()
                 && (!calls.isEmpty() || reply.dialogue().isBlank())) {
             throw LlmException.malformed("terminal reply requires one status message and no world-tool calls");
         }
+        if (reply.disposition().terminal() && reply.contract() != null) {
+            throw LlmException.malformed("terminal reply must not declare an order contract");
+        }
         List<PlanStep> steps = new ArrayList<>(calls.size());
         for (ToolCall call : calls) {
             steps.add(PlanStep.of(call));
         }
         return new Plan(Plan.nextId(), request.requestText(), steps, reply.dialogue(),
-                reply.disposition());
+                reply.disposition(), reply.contract());
     }
 
     private String cacheKeyFor(String schemaJson) {

@@ -9,9 +9,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * @param dialogue what the companion says about this plan, or the message for a terminal disposition
  * @param disposition whether this contains executable actions or closes the standing order
+ * @param contract the order contract the reply declared, or null for planners without one
  */
 public record Plan(String id, String requestText, List<PlanStep> steps, String dialogue,
-        PlanDisposition disposition) {
+        PlanDisposition disposition, OrderContract contract) {
 
     /** Hard protocol bound; larger orders continue as coherent chunks through replanning. */
     public static final int MAX_STEPS = 8;
@@ -26,9 +27,14 @@ public record Plan(String id, String requestText, List<PlanStep> steps, String d
         disposition = disposition == null ? PlanDisposition.ACTION : disposition;
     }
 
+    public Plan(String id, String requestText, List<PlanStep> steps, String dialogue,
+            PlanDisposition disposition) {
+        this(id, requestText, steps, dialogue, disposition, null);
+    }
+
     /** Scripted and ordinary plans are executable unless they explicitly say otherwise. */
     public Plan(String id, String requestText, List<PlanStep> steps, String dialogue) {
-        this(id, requestText, steps, dialogue, PlanDisposition.ACTION);
+        this(id, requestText, steps, dialogue, PlanDisposition.ACTION, null);
     }
 
     public static String nextId() {

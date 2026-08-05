@@ -219,6 +219,10 @@ free-form snapshots.
 
 ## Prioritized Next Steps
 
+> **2026-08-05:** P0 is implemented, and P1-P3 below are superseded by the revised
+> priorities in the addendum at the end of this document. The sections are kept as
+> written for the record of what the 2026-08-04 session justified.
+
 ### P0: Close the remaining protocol and semantic gaps
 
 1. Set Responses API `tool_choice` to `required`. Every valid hosted reply already
@@ -296,3 +300,120 @@ free-form snapshots.
   structured evidence.
 - The semantic regression suite asserts both protocol shape and whether the calls
   actually cover the player's requested outcome.
+
+## Addendum (2026-08-05): P0 Implemented and Retested Live
+
+### What P0 became
+
+- `tool_choice` is `required`, so a zero-call speech reply is stopped at the provider
+  boundary.
+- `ANSWERED` is a terminal disposition alongside `COMPLETED`, `CLARIFICATION`,
+  `UNSUPPORTED`, and `BLOCKED`, reserved for questions and social remarks answered from
+  the snapshot.
+- The contract is emitted by the LLM itself, not derived from the order text: a new
+  hosted-protocol function `declare_order_contract` (deliverables as item/count pairs,
+  plus `deliver_to_owner`) must accompany the first action reply of an order. It is
+  parsed into an `OrderContract`, carried on the `Plan`, and stored on the
+  `StandingOrder` only when its reply is accepted.
+- Deterministic `ContractCoverage` validation: every deliverable bound for the owner
+  must be covered by `fetch` calls in the same reply, because `fetch` is the one tool
+  that acquires or crafts and then delivers. A plan already at the eight-step bound may
+  end at a checkpoint; replans against a stored contract are not re-validated, since
+  judging remainders needs the P2 evidence ledger.
+- One bounded repair per order, charged to a `repairUsed` flag rather than the replan
+  budget. A violating reply never executes; the repair request quotes the violation and
+  the rejected reply's speech and calls. A second violation closes the order with an
+  honest owner message.
+- Offline regression fixtures: `llm_contract_repair` (coverage violation, repaired,
+  accepted), `llm_contract_only_repair` (contract declared, no work planned, repaired),
+  `llm_contract_exhausted` (missing contract, then still-uncovered repair, order
+  closed), and `llm_answered`. The pure schema and protocol probes cover the ANSWERED
+  round trip, contract parsing and normalization, the new malformed shapes, and the
+  nested strict-schema form of the contract function.
+
+### Live retest findings (runClient, 2026-08-05)
+
+1. **The single-call habit collided with the contract protocol immediately.** The
+   model's first reply to "can u make me a bucket" was speech plus exactly one function
+   call - a correct `declare_order_contract` - and no world calls. The parser treated
+   that as malformed, so the order died with the generic failure message, twice,
+   identically. The fix, made the same session: a contract-only reply parses into an
+   empty action plan, and dispatch turns it into the repairable violation "declared a
+   contract but no world-tool calls" instead of a parse failure. The general lesson:
+   any protocol that adds a required call must expect this model to send that call
+   alone, and the repair path is the right place to absorb the habit.
+2. **ANSWERED works in practice.** "hi!" and "thx!" both closed as terse in-character
+   replies with no world action and no planning failure.
+3. **The bucket order then succeeded end to end, but expensively.** The accepted plan
+   was one `fetch(bucket, 1)` - the intended shape, since the design deliberately makes
+   fetch the whole objective and keeps recipes out of the model's hands. The fetch spun
+   on "0/1 bucket collecting" for 74 seconds and ended `BLOCKED resource_unavailable`,
+   yet the very next replan said "I have the iron now" and crafted the bucket in two
+   seconds; a second replan delivered it and the order closed `COMPLETED`. Roughly
+   four to five requests and over two minutes for a bucket.
+4. **The diagnosis moves the bottleneck down a layer.** The planner did everything
+   right; the deterministic task under it did not. Two specific gaps: the no-progress
+   watchdog counts only the final item, so it killed an acquisition pipeline that was
+   actively mining and smelting iron and declared a false `BLOCKED`; and composite
+   work exposes no phase, so the player watched an opaque "collecting" for 74 seconds
+   with no hint that real progress was happening. The replan chain rescued the order,
+   which proves the lifecycle but is the expensive way to finish a fetch.
+
+### Status against the acceptance criteria
+
+- No hosted reply can contain only assistant speech: **met**, at the provider boundary
+  and in the parser.
+- "What is in your inventory?" returns a valid terminal answer: **met** (`ANSWERED`).
+- Item orders are not deferred to later replans: **enforced** by contract coverage plus
+  one repair; verified offline, and live for the bucket order's plan shape.
+- "Give me a full set of stone tools" names and delivers final tools: **partially** -
+  the failure mode is now honest and bounded (fixture-verified close after repair), but
+  a live success has not been observed yet.
+- "Come to me" as one finite world task, 3D destinations, hunting evidence, and
+  receipt-backed `COMPLETED`: **not started**; see revised priorities.
+
+### Revised priorities
+
+P0's protocol work moved the bottleneck: the semantic boundary now holds, and the live
+evidence points at deterministic task depth and legibility. The original P1's item 1 was
+delivered by P0 (fetch is the canonical delivery operation, enforced by contract
+coverage), and its `count` clarification is partially delivered by the contract's
+"desired total" phrasing; the registry rename remains a low-priority cleanup.
+
+#### P1: Make composite acquisition reliable and legible
+
+1. Fetch and craft progress probes must count ingredient and sub-goal progress, not
+   only the final item, so the supervisor stops killing working pipelines as
+   `no_progress` or `resource_unavailable`. This is the direct fix for the bucket
+   order's false `BLOCKED` and would have made it one plan with zero replans.
+2. Report the current phase of composite work - searching, mining, smelting, crafting,
+   approaching, delivering - in progress messages (promoted from P3; the 74-second
+   opaque "collecting" is the live justification).
+3. A structured multi-item delivery objective, expanded by deterministic code, so a
+   full tool set becomes a list of final items rather than eight parallel fetches.
+4. A finite `come_to_owner(distance)` task that continuously rebinds to the owner's
+   position.
+5. `goto(x, y, z, radius)` if navigation can honor Y; otherwise reject or clarify
+   before any movement starts.
+
+#### P2: World awareness and evidence (unchanged in substance)
+
+1. Nearby passive mobs in snapshots; a bounded `hunt` or cooked-food objective owned by
+   deterministic code.
+2. An order ledger with per-deliverable acquired/crafted/delivered/blocked states. The
+   contract now provides the normalized deliverables to seed it.
+3. Delivery receipts and relevant owner-inventory changes, so `COMPLETED` rests on
+   evidence rather than model inference - the bucket order's `COMPLETED` was still
+   inferred.
+4. Source distance and feasibility information for acquisition choices such as food.
+
+#### P3: Experience and efficiency
+
+1. Handle trivial acknowledgments locally once the semantic protocol has settled;
+   `ANSWERED` currently costs a full model round trip per "thx!".
+2. Track actions per plan, planner calls per completed order, repair frequency,
+   terminal accuracy, and completion cost. The bucket order is the baseline anecdote:
+   one deliverable, roughly five requests.
+3. Reconsider model or reasoning settings only after P1's task-depth work is measured;
+   the repair path now absorbs the single-call habit, which was the strongest argument
+   for a model change.

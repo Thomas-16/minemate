@@ -106,7 +106,7 @@ public final class OpenAiResponsesBackend implements LlmBackend {
     JsonObject requestBody(LlmPrompt prompt) {
         JsonObject root = new JsonObject();
         root.addProperty("model", model);
-        root.addProperty("instructions", prompt.system());
+        root.addProperty("instructions", prompt.combinedSystem());
         root.add("tools", OpenAiToolSchemas.toOpenAiTools(prompt.toolSchemaJson()));
         // Required, not auto: every valid hosted reply carries at least one function call, whether
         // a world action or report_order_status, so a zero-call speech reply is stopped at the

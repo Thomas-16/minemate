@@ -107,6 +107,7 @@ import java.util.function.Supplier;
  */
 public final class DevAutoTest {
     private static final int GLOBAL_CAP_TICKS = 30_000;
+    private static final String AUTOTEST_COMPANION_NAME = "Ada Stone";
     private static final Set<String> SMOKE_SCENARIOS = Set.of(
             "debug_snapshot",
             "owner_friendly_fire",
@@ -275,6 +276,7 @@ public final class DevAutoTest {
         storagePos = spawn.offset(5, 0, 3);
         furnacePos = spawn.offset(5, 0, -3);
         companion = new CompanionEntity(MineMateEntities.COMPANION, level);
+        companion.setCompanionName(AUTOTEST_COMPANION_NAME);
         companion.moveTo(spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5, 0.0F, 0.0F);
         level.addFreshEntity(companion);
         debugViewer = FakePlayer.get(level, new GameProfile(DEBUG_VIEWER_UUID, "MineMateDebugViewer"));
@@ -856,12 +858,12 @@ public final class DevAutoTest {
                         DevAutoTest::planRejectionInvariant),
                 Scenario.probe("llm_answered",
                         () -> llmPlannerSettled() && companion.getStandingOrder() == null,
-                        () -> llmAnsweredVerdict("inventory answer"),
+                        () -> llmAnsweredVerdict("identity answer"),
                         200,
                         ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
                                 llmResponse(null, llmStatus("ANSWERED",
-                                        "I am carrying cobblestone and a stone pickaxe.")))),
-                                "what is in your inventory?"),
+                                        "My name is " + AUTOTEST_COMPANION_NAME + ".")))),
+                                "what's your name?"),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
                 // The order ledger's pure state machine and remainder coverage, no world needed.
@@ -1318,8 +1320,9 @@ public final class DevAutoTest {
                 + "{\"tool\":\"mine\",\"arguments\":{\"resource\":\"unobtainium\",\"count\":1}},"
                 + "{\"tool\":\"goto\",\"arguments\":{\"x\":0,\"z\":0}}]");
         WorldSnapshot snapshot = companion.getContext().snapshot();
-        PlannerDispatch.request(companion, planner, new PlanRequest("bad plan", snapshot,
-                snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
+        PlannerDispatch.request(companion, planner, new PlanRequest("bad plan",
+                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
+                ToolRegistry.defaults().schemaJson()));
     }
 
     private static boolean acceptPlanInvalidTool(PlanOutcome outcome) {
@@ -1433,8 +1436,9 @@ public final class DevAutoTest {
         companion.getJournal().clear();
         companion.openStandingOrder(requestText);
         WorldSnapshot snapshot = companion.getContext().snapshot();
-        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(requestText, snapshot,
-                snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
+        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(requestText,
+                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
+                ToolRegistry.defaults().schemaJson()));
     }
 
     private static void prepareLlmReplanBudget() {
@@ -1684,7 +1688,8 @@ public final class DevAutoTest {
         companion.openStandingOrder(order);
         WorldSnapshot snapshot = companion.getContext().snapshot();
         PlannerDispatch.request(companion, Planners.active(), new PlanRequest(order,
-                snapshot, snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
+                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
+                ToolRegistry.defaults().schemaJson()));
     }
 
     private static final String LLM_LIVE_ORDER = "get me 2 dirt and then come stand next to me";
@@ -2167,6 +2172,20 @@ public final class DevAutoTest {
         if (llmTransport.calls() != 1) {
             return label + ": expected one request, saw " + llmTransport.calls();
         }
+        JsonObject requestBody;
+        try {
+            requestBody = JsonParser.parseString(llmTransport.lastRequestBody()).getAsJsonObject();
+        } catch (RuntimeException error) {
+            return label + ": request body was not JSON: " + error.getMessage();
+        }
+        String instructions = requestBody.has("instructions")
+                ? requestBody.get("instructions").getAsString() : "";
+        if (!instructions.contains(PlannerPrompt.identity(AUTOTEST_COMPANION_NAME))) {
+            return label + ": system instructions did not include the companion identity";
+        }
+        if (!requestBody.has("prompt_cache_key")) {
+            return label + ": the identity-aware OpenAI cache key was missing";
+        }
         if (journalHas(EventKind.PLANNER_FAILED)) {
             return label + ": an ANSWERED terminal was recorded as a planner failure";
         }
@@ -2621,7 +2640,52 @@ public final class DevAutoTest {
         if (!itemsEntry.getAsJsonObject("properties").getAsJsonObject("count").has("maximum")) {
             return "the fetch_items entry count lost its range";
         }
-        return nullStrippingViolation();
+        String identityCacheViolation = openAiIdentityCacheViolation();
+        return identityCacheViolation == null ? nullStrippingViolation() : identityCacheViolation;
+    }
+
+    /** The OpenAI routing key includes stable identity without retaining shared mutable state. */
+    private static String openAiIdentityCacheViolation() {
+        FixtureTransport transport = FixtureTransport.of(FixtureTransport.ok(
+                llmResponse(null, llmStatus("ANSWERED", "Identity cache probe."))));
+        PlannerConfig config = PlannerConfig.of(PlannerConfig.PROVIDER_OPENAI,
+                "http://fixture.invalid/v1", "fixture-model", "fixture-key",
+                LLM_TIMEOUT_SECONDS, 0);
+        HostedPlanner planner = new HostedPlanner(new OpenAiResponsesBackend(transport,
+                config.baseUrl(), config.model(), config.apiKey().orElse(""),
+                config.reasoningEffort(), config.verbosity(), config.maxOutputTokens()), config);
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        String schema = ToolRegistry.defaults().schemaJson();
+        try {
+            for (String name : List.of(AUTOTEST_COMPANION_NAME, AUTOTEST_COMPANION_NAME, "Ember")) {
+                planner.plan(new PlanRequest("identity cache probe", name, snapshot,
+                        snapshot.render(), null, schema)).join();
+            }
+        } catch (RuntimeException error) {
+            return "identity cache probe failed: " + error.getMessage();
+        } finally {
+            planner.close();
+        }
+        if (transport.calls() != 3) {
+            return "identity cache probe sent " + transport.calls() + " requests instead of 3";
+        }
+        JsonObject first = JsonParser.parseString(transport.requestBody(0)).getAsJsonObject();
+        JsonObject repeated = JsonParser.parseString(transport.requestBody(1)).getAsJsonObject();
+        JsonObject other = JsonParser.parseString(transport.requestBody(2)).getAsJsonObject();
+        String firstKey = first.get("prompt_cache_key").getAsString();
+        String repeatedKey = repeated.get("prompt_cache_key").getAsString();
+        String otherKey = other.get("prompt_cache_key").getAsString();
+        if (!firstKey.equals(repeatedKey)) {
+            return "the same companion name produced different OpenAI cache keys";
+        }
+        if (firstKey.equals(otherKey)) {
+            return "different companion names produced the same OpenAI cache key";
+        }
+        if (!first.get("instructions").getAsString()
+                .contains(PlannerPrompt.identity(AUTOTEST_COMPANION_NAME))) {
+            return "the OpenAI instructions omitted the companion identity";
+        }
+        return null;
     }
 
     private static String llmProtocolViolation() {
@@ -2759,7 +2823,8 @@ public final class DevAutoTest {
      * the wire verbatim -- no strict transform, no null unions, no OpenAI keys -- with the cache
      * breakpoint on the system block and the forced-tool choice spelled as an object. Driven
      * through {@code complete()} over a fixture transport because the builder itself is package
-     * private to the llm package.
+     * private to the llm package. The two system blocks create a shared-rules breakpoint followed
+     * by the per-companion identity breakpoint.
      */
     private static String llmClaudeSchemaViolation() {
         String registrySchema = ToolRegistry.defaults().schemaJson();
@@ -2769,7 +2834,9 @@ public final class DevAutoTest {
         AnthropicMessagesBackend backend = new AnthropicMessagesBackend(transport,
                 "http://fixture.invalid/v1", "fixture-model", "fixture-key",
                 PlannerConfig.DEFAULT_EFFORT, PlannerConfig.DEFAULT_MAX_OUTPUT_TOKENS);
-        backend.complete(new LlmPrompt(PlannerPrompt.SYSTEM, "ORDER: schema probe", hostedSchema, ""));
+        String systemIdentity = PlannerPrompt.identity(AUTOTEST_COMPANION_NAME);
+        backend.complete(new LlmPrompt(PlannerPrompt.SYSTEM, systemIdentity,
+                "ORDER: schema probe", hostedSchema, ""));
         JsonObject body;
         try {
             body = JsonParser.parseString(transport.lastRequestBody()).getAsJsonObject();
@@ -2810,16 +2877,25 @@ public final class DevAutoTest {
             return "fetch_items.items lost its length constraint";
         }
         JsonArray system = body.getAsJsonArray("system");
-        if (system == null || system.size() != 1) {
-            return "the system prompt was not a single block";
+        if (system == null || system.size() != 2) {
+            return "the system prompt did not contain shared and identity blocks";
         }
-        JsonObject systemBlock = system.get(0).getAsJsonObject();
-        if (!PlannerPrompt.SYSTEM.equals(systemBlock.get("text").getAsString())) {
-            return "the system block did not carry PlannerPrompt.SYSTEM byte-identical";
+        JsonObject sharedBlock = system.get(0).getAsJsonObject();
+        JsonObject identityBlock = system.get(1).getAsJsonObject();
+        if (!PlannerPrompt.SYSTEM.equals(sharedBlock.get("text").getAsString())) {
+            return "the shared system block did not carry PlannerPrompt.SYSTEM byte-identical";
         }
-        if (!systemBlock.has("cache_control") || !"ephemeral".equals(
-                systemBlock.getAsJsonObject("cache_control").get("type").getAsString())) {
-            return "the system block lost its cache_control breakpoint";
+        if (!systemIdentity.equals(identityBlock.get("text").getAsString())) {
+            return "the identity system block did not carry the companion name";
+        }
+        for (JsonObject block : List.of(sharedBlock, identityBlock)) {
+            if (!block.has("cache_control") || !"ephemeral".equals(
+                    block.getAsJsonObject("cache_control").get("type").getAsString())) {
+                return "a system block lost its cache_control breakpoint";
+            }
+            if (block.getAsJsonObject("cache_control").has("ttl")) {
+                return "a system block changed the default five-minute cache TTL";
+            }
         }
         if (!body.has("tool_choice")
                 || !"auto".equals(body.getAsJsonObject("tool_choice").get("type").getAsString())) {

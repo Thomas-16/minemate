@@ -30,10 +30,9 @@ import java.util.concurrent.TimeUnit;
  * truncated reply announces itself only through {@code stop_reason: "max_tokens"}, so that field
  * has to be checked before trusting the blocks.
  *
- * <p>Prompt caching is explicit here rather than implicit: the {@code cache_control} breakpoint on
- * the system block caches the tools-plus-system prefix, which is why {@code PlannerPrompt.SYSTEM}
- * must stay byte-identical across requests. {@code LlmPrompt.cacheKey} is unused; Anthropic matches
- * prefixes automatically.
+ * <p>Prompt caching is explicit here rather than implicit: one {@code cache_control} breakpoint
+ * caches tools plus shared system rules, and a second caches the stable per-companion identity.
+ * {@code LlmPrompt.cacheKey} is unused; Anthropic matches prefixes automatically.
  */
 public final class AnthropicMessagesBackend implements LlmBackend {
 
@@ -107,7 +106,7 @@ public final class AnthropicMessagesBackend implements LlmBackend {
     // ---- request ----------------------------------------------------------------------------
 
     /**
-     * Field order mirrors the cached prefix: tools then system are the byte-stable prefix that
+     * Field order mirrors the cached prefix: tools then system are the reusable prefix that
      * {@code cache_control} snapshots, and the volatile user message goes last. The {@code thinking}
      * parameter is omitted on purpose -- the model's default (adaptive on the 5-series) is the only
      * shape valid across every current Claude model -- and {@code output_config.effort} carries the
@@ -127,14 +126,12 @@ public final class AnthropicMessagesBackend implements LlmBackend {
         toolChoice.addProperty("type", "auto");
         root.add("tool_choice", toolChoice);
 
-        JsonObject cacheControl = new JsonObject();
-        cacheControl.addProperty("type", "ephemeral");
-        JsonObject systemBlock = new JsonObject();
-        systemBlock.addProperty("type", "text");
-        systemBlock.addProperty("text", prompt.system());
-        systemBlock.add("cache_control", cacheControl);
         JsonArray system = new JsonArray();
-        system.add(systemBlock);
+        // Two explicit writes matter. A request for another companion misses at the identity block
+        // but can walk back to the shared rules entry; repeated requests for one companion hit the
+        // complete tools + rules + identity prefix.
+        system.add(cachedSystemBlock(prompt.system()));
+        system.add(cachedSystemBlock(prompt.systemIdentity()));
         root.add("system", system);
 
         if (!reasoningEffort.isBlank()) {
@@ -151,6 +148,17 @@ public final class AnthropicMessagesBackend implements LlmBackend {
         root.add("messages", messages);
         // No temperature and no top_p: the 5-series rejects them outright.
         return root;
+    }
+
+    /** Default ephemeral cache control intentionally retains Anthropic's five-minute TTL. */
+    private static JsonObject cachedSystemBlock(String text) {
+        JsonObject cacheControl = new JsonObject();
+        cacheControl.addProperty("type", "ephemeral");
+        JsonObject block = new JsonObject();
+        block.addProperty("type", "text");
+        block.addProperty("text", text);
+        block.add("cache_control", cacheControl);
+        return block;
     }
 
     /** The registry's neutral schema is already Anthropic's tool shape; parse it once and reuse. */

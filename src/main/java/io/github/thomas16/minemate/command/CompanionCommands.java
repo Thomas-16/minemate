@@ -169,7 +169,8 @@ public final class CompanionCommands {
             scripted.bind(companion);
         }
         WorldSnapshot snapshot = companion.getContext().snapshot();
-        PlanRequest request = new PlanRequest(requestText, snapshot, snapshot.render(), null,
+        PlanRequest request = new PlanRequest(requestText,
+                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
                 ToolRegistry.defaults().schemaJson());
         PlannerDispatch.request(companion, Planners.active(), request);
         source.sendSuccess(() -> Component.literal("Planning: " + requestText), false);

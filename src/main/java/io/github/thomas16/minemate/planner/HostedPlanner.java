@@ -31,10 +31,6 @@ public final class HostedPlanner implements Planner {
     private final LlmBackend backend;
     private final PlannerConfig config;
 
-    /** Derived from the prompt prefix, so adding a tool invalidates the provider's cache for us. */
-    private volatile String cachedSchema = "";
-    private volatile String cacheKey = "";
-
     public HostedPlanner(LlmBackend backend, PlannerConfig config) {
         this.backend = Objects.requireNonNull(backend, "backend");
         this.config = Objects.requireNonNull(config, "config");
@@ -79,8 +75,10 @@ public final class HostedPlanner implements Planner {
     @Override
     public CompletableFuture<Plan> plan(PlanRequest request) {
         String hostedSchema = PlannerProtocol.hostedSchema(request.toolSchemaJson());
-        LlmPrompt prompt = new LlmPrompt(PlannerPrompt.SYSTEM, PlannerPrompt.user(request),
-                hostedSchema, cacheKeyFor(hostedSchema));
+        String identity = PlannerPrompt.identity(request.companionName());
+        LlmPrompt prompt = new LlmPrompt(PlannerPrompt.SYSTEM, identity,
+                PlannerPrompt.user(request), hostedSchema,
+                cacheKeyFor(PlannerPrompt.SYSTEM, identity, hostedSchema));
         // The backend returns immediately; the mapping below runs on whatever thread completes it,
         // and touches nothing but the reply. PlannerDispatch owns the hop back to the server.
         //
@@ -126,12 +124,11 @@ public final class HostedPlanner implements Planner {
                 reply.disposition(), reply.contract());
     }
 
-    private String cacheKeyFor(String schemaJson) {
+    private static String cacheKeyFor(String system, String identity, String schemaJson) {
         String schema = schemaJson == null ? "" : schemaJson;
-        if (!schema.equals(cachedSchema) || cacheKey.isEmpty()) {
-            cacheKey = "minemate-" + Integer.toHexString(Objects.hash(PlannerPrompt.SYSTEM, schema));
-            cachedSchema = schema;
-        }
-        return cacheKey;
+        // Cheap to derive for every request and safe for a shared HostedPlanner serving multiple
+        // companions: equal names get equal routing keys, while one companion cannot overwrite
+        // another's cached key in mutable instance state.
+        return "minemate-" + Integer.toHexString(Objects.hash(system, identity, schema));
     }
 }

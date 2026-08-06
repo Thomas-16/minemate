@@ -186,8 +186,8 @@ public final class PlannerDispatch {
         String note = "it declared the order contract, which is now recorded, but contained no"
                 + " world-tool calls";
         WorldSnapshot snapshot = companion.getContext().snapshot();
-        request(companion, planner, new PlanRequest(request.requestText(), snapshot,
-                snapshot.render(), request.trigger(), request.toolSchemaJson(), note,
+        request(companion, planner, new PlanRequest(request.requestText(), request.companionName(),
+                snapshot, snapshot.render(), request.trigger(), request.toolSchemaJson(), note,
                 ledgerTextOf(companion)));
     }
 
@@ -226,8 +226,8 @@ public final class PlannerDispatch {
         // before PlannerAutonomy can interleave, and /companion stop still disowns the repair
         // through the ordinary generation counter.
         WorldSnapshot snapshot = companion.getContext().snapshot();
-        request(companion, planner, new PlanRequest(request.requestText(), snapshot,
-                snapshot.render(), request.trigger(), request.toolSchemaJson(), note,
+        request(companion, planner, new PlanRequest(request.requestText(), request.companionName(),
+                snapshot, snapshot.render(), request.trigger(), request.toolSchemaJson(), note,
                 ledgerTextOf(companion)));
     }
 

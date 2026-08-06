@@ -75,6 +75,7 @@ public final class PlannerAutonomy {
         order.consumeReplan();
         WorldSnapshot snapshot = companion.getContext().snapshot();
         PlannerDispatch.request(companion, planner, new PlanRequest(order.requestText(), snapshot,
-                snapshot.render(), trigger.reason(), ToolRegistry.defaults().schemaJson()));
+                snapshot.render(), trigger.reason(), ToolRegistry.defaults().schemaJson(), null,
+                PlannerDispatch.ledgerTextOf(companion)));
     }
 }

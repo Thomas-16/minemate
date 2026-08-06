@@ -14,6 +14,7 @@ public final class StandingOrder {
     private final long openedAtGameTime;
     private int replansUsed;
     private OrderContract contract;
+    private OrderLedger ledger;
     private boolean repairUsed;
     private boolean awaitingCoverage;
 
@@ -54,6 +55,12 @@ public final class StandingOrder {
      */
     public void declareContract(OrderContract contract) {
         this.contract = contract;
+        this.ledger = OrderLedger.seed(contract);
+    }
+
+    /** Evidence per deliverable, seeded with the contract; null before a contract is declared. */
+    public OrderLedger ledger() {
+        return ledger;
     }
 
     /** One repair per order, charged separately from the replan budget. */

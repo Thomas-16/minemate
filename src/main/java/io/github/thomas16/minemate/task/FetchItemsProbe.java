@@ -17,7 +17,7 @@ import java.util.List;
  * and {@code oak_planks}) can credit one delivery to both entries. Harmless for the tool-set
  * shape this exists for; do not feed it deliberately aliased entries.
  */
-final class FetchItemsProbe implements GoalProbe {
+final class FetchItemsProbe implements GoalProbe, DeliveryEvidenceSource {
 
     private final List<OwnerGiveItemsTask.FetchEntry> entries;
     private final int[] ownerBaseline;
@@ -128,6 +128,16 @@ final class FetchItemsProbe implements GoalProbe {
         // Only a missing owner blocks mid-run; a single entry's exhaustion is skipped by the
         // task and reported through terminalResult once the remaining entries have been tried.
         return Goals.owner(context) == null ? Reasons.OWNER_OFFLINE : null;
+    }
+
+    @Override
+    public List<DeliveryEvidence> deliveryEvidence() {
+        List<DeliveryEvidence> evidence = new ArrayList<>(entries.size());
+        for (int i = 0; i < entries.size(); i++) {
+            evidence.add(new DeliveryEvidence(entries.get(i).item(), entries.get(i).count(),
+                    deliveredUnits(i)));
+        }
+        return evidence;
     }
 
     private int deliveredUnits(int index) {

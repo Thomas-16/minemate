@@ -1,9 +1,13 @@
 package io.github.thomas16.minemate.planner;
 
+import com.google.gson.JsonElement;
+
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.context.EventKind;
 import io.github.thomas16.minemate.context.ReplanReason;
 import io.github.thomas16.minemate.entity.CompanionEntity;
+import io.github.thomas16.minemate.task.DeliveryEvidence;
+import io.github.thomas16.minemate.task.DeliveryEvidenceSource;
 import io.github.thomas16.minemate.task.Goal;
 import io.github.thomas16.minemate.task.OutcomeStatus;
 import io.github.thomas16.minemate.task.Reasons;
@@ -48,6 +52,7 @@ public final class PlanExecutor {
     private final List<PlanStepOutcome> stepOutcomes = new ArrayList<>();
     private int stepIndex;
     private String awaitingGoalId;
+    private Goal activeGoal;
     private long startMs;
     private PlanOutcome lastOutcome;
     private int plannerRequestGeneration;
@@ -160,9 +165,11 @@ public final class PlanExecutor {
             return;
         }
         awaitingGoalId = goal.id();
+        activeGoal = goal;
     }
 
     private void consume(TaskOutcome outcome) {
+        harvestEvidence(outcome);
         PlanStep step = plan.steps().get(stepIndex);
         recordStep(step, outcome.goalId(), outcome.status(), outcome.reason(), outcome.detail());
         awaitingGoalId = null;
@@ -190,6 +197,58 @@ public final class PlanExecutor {
     private void recordStep(PlanStep step, String goalId, OutcomeStatus status,
             String reason, String detail) {
         stepOutcomes.add(new PlanStepOutcome(stepIndex, step.call(), goalId, status, reason, detail));
+    }
+
+    /**
+     * Reads owner-inventory delivery evidence latched by the finished step's probe, updates the
+     * standing order's ledger, and journals a receipt. Runs at most once per step: the null-and-guard
+     * on {@code activeGoal} makes the {@code finish} inside {@code consume} a no-op, while an
+     * abnormal end (cancel, supersede, shutdown, death) harvests with no outcome at all — the
+     * probe's latched arrays outlive the goal because the {@link Goal} record holds the probe.
+     */
+    private void harvestEvidence(TaskOutcome outcome) {
+        if (activeGoal == null) {
+            return;
+        }
+        Goal finished = activeGoal;
+        activeGoal = null;
+        StandingOrder order = companion.getStandingOrder();
+        OrderLedger ledger = order == null ? null : order.ledger();
+        if (finished.probe() instanceof DeliveryEvidenceSource source) {
+            boolean shortfallBlocked = outcome != null
+                    && (outcome.status() == OutcomeStatus.BLOCKED
+                            || outcome.status() == OutcomeStatus.TIMED_OUT);
+            for (DeliveryEvidence evidence : source.deliveryEvidence()) {
+                if (evidence.delivered() > 0) {
+                    if (ledger != null) {
+                        ledger.recordDelivered(evidence.item(), evidence.delivered());
+                    }
+                    if (companion.getContext() != null) {
+                        companion.getContext().record(EventKind.DELIVERY_RECEIPT,
+                                "delivered %d %s to owner".formatted(evidence.delivered(),
+                                        evidence.item()),
+                                evidence.item());
+                    }
+                }
+                if (shortfallBlocked && evidence.delivered() < evidence.requested()
+                        && ledger != null) {
+                    ledger.recordBlocked(evidence.item(), outcome.reason());
+                }
+            }
+        } else if (ledger != null && outcome != null
+                && outcome.status() == OutcomeStatus.SUCCEEDED) {
+            PlanStep step = plan.steps().get(stepIndex);
+            if ("craft".equals(outcome.kind())) {
+                ledger.recordCrafted(argString(step, "item"));
+            } else if ("mine".equals(outcome.kind())) {
+                ledger.recordAcquired(argString(step, "resource"));
+            }
+        }
+    }
+
+    private static String argString(PlanStep step, String name) {
+        JsonElement value = step.call().arguments().get(name);
+        return value != null && value.isJsonPrimitive() ? value.getAsString() : "";
     }
 
     /**
@@ -259,6 +318,7 @@ public final class PlanExecutor {
     }
 
     private void finish(PlanStatus status, String reason) {
+        harvestEvidence(null);
         Plan finished = plan;
         long elapsed = startMs == 0L ? 0L : Math.max(0L, System.currentTimeMillis() - startMs);
         List<PlanStepOutcome> outcomes = List.copyOf(stepOutcomes);

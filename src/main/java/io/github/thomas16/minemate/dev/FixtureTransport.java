@@ -91,6 +91,13 @@ public final class FixtureTransport implements HttpTransport {
         }
     }
 
+    /** The body of the zero-based Nth request, or "" when it has not happened yet. */
+    public String requestBody(int index) {
+        synchronized (requestBodies) {
+            return index < 0 || index >= requestBodies.size() ? "" : requestBodies.get(index);
+        }
+    }
+
     public String lastRequestBody() {
         synchronized (requestBodies) {
             return requestBodies.isEmpty() ? "" : requestBodies.get(requestBodies.size() - 1);

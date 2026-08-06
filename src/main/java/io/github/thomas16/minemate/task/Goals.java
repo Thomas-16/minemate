@@ -263,6 +263,14 @@ public final class Goals {
         return companion.resolveOwner().orElse(null);
     }
 
+    /** Owner inventory count for a catalogue item name, or -1 when the name is unknown. */
+    public static int ownerCountOf(ServerPlayer owner, String item) {
+        if (owner == null || !TaskCatalogue.taskExists(item)) {
+            return -1;
+        }
+        return playerInventoryCount(owner, TaskCatalogue.getItemMatches(item));
+    }
+
     static int playerInventoryCount(ServerPlayer player, Item[] matches) {
         int count = 0;
         for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
@@ -332,7 +340,7 @@ public final class Goals {
         }
     }
 
-    private static final class FetchProbe implements GoalProbe {
+    private static final class FetchProbe implements GoalProbe, DeliveryEvidenceSource {
         private final Item[] matches;
         private final String resource;
         private final int count;
@@ -394,6 +402,12 @@ public final class Goals {
                 return Reasons.RESOURCE_UNAVAILABLE;
             }
             return null;
+        }
+
+        @Override
+        public List<DeliveryEvidence> deliveryEvidence() {
+            return List.of(new DeliveryEvidence(resource, count,
+                    Math.min(count, Math.max(0, maxOwnerCount - ownerBaseline))));
         }
     }
 

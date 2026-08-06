@@ -13,19 +13,27 @@ import java.util.Objects;
  * @param trigger         the event that prompted this call; null for a direct owner request
  * @param repairNote      why the previous reply for this order was rejected, quoted back to the
  *                        model for its one bounded repair attempt; null for an ordinary request
+ * @param ledgerText      the standing order's delivery ledger rendered for the prompt; blank for
+ *                        a fresh order, which has no ledger until its contract is declared
  */
 public record PlanRequest(String requestText, WorldSnapshot snapshot, String renderedContext,
-        ReplanReason trigger, String toolSchemaJson, String repairNote) {
+        ReplanReason trigger, String toolSchemaJson, String repairNote, String ledgerText) {
 
     public PlanRequest {
         Objects.requireNonNull(snapshot, "snapshot");
         requestText = requestText == null ? "" : requestText;
         renderedContext = renderedContext == null ? "" : renderedContext;
         toolSchemaJson = toolSchemaJson == null ? "" : toolSchemaJson;
+        ledgerText = ledgerText == null ? "" : ledgerText;
+    }
+
+    public PlanRequest(String requestText, WorldSnapshot snapshot, String renderedContext,
+            ReplanReason trigger, String toolSchemaJson, String repairNote) {
+        this(requestText, snapshot, renderedContext, trigger, toolSchemaJson, repairNote, null);
     }
 
     public PlanRequest(String requestText, WorldSnapshot snapshot, String renderedContext,
             ReplanReason trigger, String toolSchemaJson) {
-        this(requestText, snapshot, renderedContext, trigger, toolSchemaJson, null);
+        this(requestText, snapshot, renderedContext, trigger, toolSchemaJson, null, null);
     }
 }

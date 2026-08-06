@@ -48,6 +48,42 @@ public final class ContractCoverage {
         return null;
     }
 
+    /**
+     * Null when the steps cover every undelivered remainder in the ledger; otherwise one ASCII
+     * violation sentence. Same {@code MAX_STEPS} checkpoint escape and raw-JSON counting as
+     * {@link #violation}, but judged against measured delivery evidence instead of the full
+     * contract, so a replan is only asked to fetch what the owner has not received yet.
+     */
+    public static String remainderViolation(OrderLedger ledger, List<PlanStep> steps) {
+        if (ledger == null || steps.size() >= Plan.MAX_STEPS) {
+            return null;
+        }
+        for (OrderLedger.Entry entry : ledger.entries()) {
+            int remaining = entry.wanted() - entry.delivered();
+            if (remaining <= 0) {
+                continue;
+            }
+            int fetched = 0;
+            for (PlanStep step : steps) {
+                JsonObject arguments = step.call().arguments();
+                if ("fetch".equals(step.call().tool())) {
+                    String resource = stringOf(arguments.get("resource"));
+                    if (OrderContract.normalize(resource).equals(entry.item())) {
+                        fetched += countOf(arguments.get("count"));
+                    }
+                } else if ("fetch_items".equals(step.call().tool())) {
+                    fetched += itemsCountOf(arguments.get("items"), entry.item());
+                }
+            }
+            if (fetched < remaining) {
+                return "the plan does not fetch the remaining " + remaining + " " + entry.item()
+                        + " for the owner; the ledger shows " + Math.min(entry.delivered(),
+                                entry.wanted()) + " of " + entry.wanted() + " delivered";
+            }
+        }
+        return null;
+    }
+
     private static String stringOf(JsonElement value) {
         return value != null && value.isJsonPrimitive() ? value.getAsString() : "";
     }

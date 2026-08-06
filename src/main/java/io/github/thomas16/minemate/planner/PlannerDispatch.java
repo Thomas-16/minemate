@@ -2,6 +2,7 @@ package io.github.thomas16.minemate.planner;
 
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.context.EventKind;
+import io.github.thomas16.minemate.context.ReplanReason;
 import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.entity.CompanionEntity;
 import io.github.thomas16.minemate.task.Reasons;
@@ -74,6 +75,23 @@ public final class PlannerDispatch {
                 companion.closeStandingOrder();
                 return;
             }
+            StandingOrder completedOrder = companion.getStandingOrder();
+            if (plan.disposition() == PlanDisposition.COMPLETED && completedOrder != null
+                    && completedOrder.contract() != null
+                    && completedOrder.contract().deliverToOwner()
+                    && completedOrder.ledger() != null) {
+                // COMPLETED must rest on evidence: top the ledger up from the owner's live
+                // inventory first, so items still in the air when the goal ended get credited.
+                companion.resolveOwner().ifPresent(completedOrder.ledger()::refreshFromOwner);
+                String undelivered = completedOrder.ledger().undeliveredSummary();
+                if (undelivered != null) {
+                    repairOrClose(companion, planner, request, plan,
+                            "the reply claimed COMPLETED but the ledger shows " + undelivered,
+                            "I could not confirm delivery: " + undelivered
+                                    + ". I am setting that order aside.");
+                    return;
+                }
+            }
             tell(companion, plan.dialogue());
             companion.closeStandingOrder();
             return;
@@ -90,6 +108,7 @@ public final class PlannerDispatch {
                         // order needs: record it and ask for the world calls as a continuation.
                         // Coverage is still enforced on that follow-up via awaitingCoverage.
                         order.declareContract(plan.contract());
+                        companion.resolveOwner().ifPresent(order.ledger()::captureOwnerBaselines);
                         order.markAwaitingCoverage();
                         continueForCoverage(companion, planner, request, plan);
                         return;
@@ -106,12 +125,23 @@ public final class PlannerDispatch {
                     // first real plan is judged against the whole contract, exactly as if the
                     // model had sent contract and calls together.
                     violation = ContractCoverage.violation(order.contract(), plan.steps());
-                } else if (plan.contract() != null) {
-                    // A replan re-declaring the contract is tolerated and ignored: the stored one
-                    // is authoritative, and replans plan only the remaining work, which cannot be
-                    // judged against the full contract without delivery evidence.
-                    MineMate.LOGGER.debug("Planner {} re-declared the order contract on a replan",
-                            planner.name());
+                } else {
+                    if (plan.contract() != null) {
+                        // A replan re-declaring the contract is tolerated and ignored: the stored
+                        // one is authoritative.
+                        MineMate.LOGGER.debug(
+                                "Planner {} re-declared the order contract on a replan",
+                                planner.name());
+                    }
+                    // Replans plan only the remaining work, which the ledger's delivery evidence
+                    // can now judge. Scoped to plan-finished replans: a damage-taken replan
+                    // legitimately answers a threat with non-fetch work.
+                    if (request.trigger() == ReplanReason.PLAN_FINISHED
+                            && order.ledger() != null) {
+                        companion.resolveOwner().ifPresent(order.ledger()::refreshFromOwner);
+                        violation = ContractCoverage.remainderViolation(order.ledger(),
+                                plan.steps());
+                    }
                 }
                 if (violation != null) {
                     repairOrClose(companion, planner, request, plan, violation);
@@ -119,6 +149,7 @@ public final class PlannerDispatch {
                 }
                 if (order.contract() == null) {
                     order.declareContract(plan.contract());
+                    companion.resolveOwner().ifPresent(order.ledger()::captureOwnerBaselines);
                 }
                 order.clearAwaitingCoverage();
             }
@@ -156,7 +187,8 @@ public final class PlannerDispatch {
                 + " world-tool calls";
         WorldSnapshot snapshot = companion.getContext().snapshot();
         request(companion, planner, new PlanRequest(request.requestText(), snapshot,
-                snapshot.render(), request.trigger(), request.toolSchemaJson(), note));
+                snapshot.render(), request.trigger(), request.toolSchemaJson(), note,
+                ledgerTextOf(companion)));
     }
 
     /**
@@ -166,6 +198,11 @@ public final class PlannerDispatch {
      */
     private static void repairOrClose(CompanionEntity companion, Planner planner,
             PlanRequest request, Plan plan, String violation) {
+        repairOrClose(companion, planner, request, plan, violation, SEMANTIC_CLOSE_MESSAGE);
+    }
+
+    private static void repairOrClose(CompanionEntity companion, Planner planner,
+            PlanRequest request, Plan plan, String violation, String closeMessage) {
         StandingOrder order = companion.getStandingOrder();
         if (order == null || !order.repairAvailable()) {
             MineMate.LOGGER.warn("Planner {} reply rejected after repair: {}", planner.name(),
@@ -174,7 +211,7 @@ public final class PlannerDispatch {
                 companion.getContext().record(EventKind.PLANNER_FAILED,
                         "planning failed (" + violation + ")", planner.name());
             }
-            tell(companion, SEMANTIC_CLOSE_MESSAGE);
+            tell(companion, closeMessage);
             companion.closeStandingOrder();
             return;
         }
@@ -190,7 +227,18 @@ public final class PlannerDispatch {
         // through the ordinary generation counter.
         WorldSnapshot snapshot = companion.getContext().snapshot();
         request(companion, planner, new PlanRequest(request.requestText(), snapshot,
-                snapshot.render(), request.trigger(), request.toolSchemaJson(), note));
+                snapshot.render(), request.trigger(), request.toolSchemaJson(), note,
+                ledgerTextOf(companion)));
+    }
+
+    /** The standing order's ledger rendered for the prompt, refreshed against the live owner. */
+    static String ledgerTextOf(CompanionEntity companion) {
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || order.ledger() == null) {
+            return null;
+        }
+        companion.resolveOwner().ifPresent(order.ledger()::refreshFromOwner);
+        return order.ledger().describe();
     }
 
     private static String rootMessage(Throwable error) {

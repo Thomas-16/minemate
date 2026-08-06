@@ -47,6 +47,11 @@ public final class PlannerPrompt {
               order names more than one final item, or a fetch call for a single deliverable.
               fetch and fetch_items acquire or craft each item as needed and deliver it; craft
               alone leaves the output with you.
+            - A replan or repair request may include a LEDGER line: for each deliverable, the units
+              confirmed in the owner's hands out of the declared count, with a state word (pending,
+              acquired, crafted, delivered, blocked). The ledger is measured evidence; trust it
+              over your memory of this order, and claim COMPLETED only when it shows every
+              deliverable delivered.
             - A terminal reply is exactly one report_order_status call, no world-tool calls, and no
               separate assistant message. Use COMPLETED, ANSWERED, CLARIFICATION, UNSUPPORTED, or
               BLOCKED. COMPLETED is valid only when the snapshot proves the order is satisfied. Use
@@ -94,6 +99,9 @@ public final class PlannerPrompt {
                     .append("): the order below is still open. Look at LAST and EVENTS, then either")
                     .append(" continue it with a complete bounded action chunk or report an explicit")
                     .append(" terminal order status.\n");
+        }
+        if (!request.ledgerText().isBlank()) {
+            text.append("LEDGER: ").append(request.ledgerText()).append('\n');
         }
         if (request.repairNote() != null && !request.repairNote().isBlank()) {
             text.append("REPAIR: your previous reply for this order was rejected: ")

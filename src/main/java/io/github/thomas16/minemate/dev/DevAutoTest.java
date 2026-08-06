@@ -56,8 +56,10 @@ import io.github.thomas16.minemate.context.CompanionJournal;
 import io.github.thomas16.minemate.context.EventKind;
 import io.github.thomas16.minemate.context.JournalEntry;
 import io.github.thomas16.minemate.context.WorldSnapshot;
+import io.github.thomas16.minemate.planner.ContractCoverage;
 import io.github.thomas16.minemate.planner.HostedPlanner;
 import io.github.thomas16.minemate.planner.OrderContract;
+import io.github.thomas16.minemate.planner.OrderLedger;
 import io.github.thomas16.minemate.planner.Plan;
 import io.github.thomas16.minemate.planner.PlanDisposition;
 import io.github.thomas16.minemate.planner.PlanExecutor;
@@ -140,7 +142,11 @@ public final class DevAutoTest {
             "llm_contract_only_continuation",
             "llm_contract_only_exhausted",
             "llm_contract_exhausted",
-            "llm_answered");
+            "llm_answered",
+            "order_ledger",
+            "llm_completed_with_receipt",
+            "llm_completed_denied_close",
+            "llm_replan_remainder_repair");
     /** Scenarios that make real network calls. Selectable by name, never included in a profile. */
     private static final Set<String> LIVE_SCENARIOS = Set.of("llm_live", "llm_live_multi_step");
     private static final UUID FAKE_OWNER_UUID =
@@ -165,6 +171,10 @@ public final class DevAutoTest {
      */
     private static final UUID CLAUDE_PLAN_OWNER_UUID =
             UUID.fromString("7f2b8c14-5a63-4d97-9e08-c41d72ab6f35");
+    private static final UUID COMPLETED_RECEIPT_OWNER_UUID =
+            UUID.fromString("d4a7f2c9-6b31-4e85-a1c0-58f2d9e3b7a4");
+    private static final UUID COMPLETED_REPAIR_OWNER_UUID =
+            UUID.fromString("f0c3e8b5-2d94-47a6-8b1e-c5a9d7f4e2b1");
     private static final UUID FRIENDLY_FIRE_OWNER_UUID =
             UUID.fromString("5ec29e35-81d1-4c23-aef9-0e394daaf52d");
     private static final UUID DEBUG_VIEWER_UUID =
@@ -854,6 +864,53 @@ public final class DevAutoTest {
                                 "what is in your inventory?"),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
+                // The order ledger's pure state machine and remainder coverage, no world needed.
+                Scenario.probe("order_ledger",
+                        () -> true,
+                        DevAutoTest::orderLedgerViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
+                // The evidence-backed happy path: one fetch really delivers, the harvest journals
+                // a receipt, the replan request carries the ledger, and COMPLETED is accepted.
+                Scenario.probe("llm_completed_with_receipt",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::llmCompletedWithReceiptVerdict,
+                        1200,
+                        ignoredServer -> prepareLlmCompletedWithReceipt(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // A COMPLETED claim with no delivery evidence is rejected, repaired once, and when
+                // the model insists, closed honestly: three requests, nothing executed.
+                Scenario.probe("llm_completed_denied_close",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::llmCompletedDeniedCloseVerdict,
+                        300,
+                        ignoredServer -> prepareLlmCompletedDeniedClose(),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                // The full reject-repair-deliver-accept loop: an unevidenced COMPLETED spends the
+                // repair, the repaired fetch delivers, and the next COMPLETED closes on evidence.
+                Scenario.probe("llm_completed_without_evidence",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::llmCompletedWithoutEvidenceVerdict,
+                        2400,
+                        ignoredServer -> prepareLlmCompletedWithoutEvidence(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // A plan-finished replan that ignores the undelivered remainder is rejected and
+                // repaired toward the canonical fetch shape, quoting the ledger's blocked state.
+                Scenario.probe("llm_replan_remainder_repair",
+                        () -> llmTransport != null && llmTransport.calls() == 3
+                                && !companion.getPlanExecutor().isPlannerRequestPending(),
+                        DevAutoTest::llmReplanRemainderRepairVerdict,
+                        400,
+                        ignoredServer -> prepareLlmReplanRemainderRepair(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
                 // Never in a profile: these are the only scenarios that leave the machine or cost
                 // money. Select them by name, and only with a key configured.
                 Scenario.probe("llm_live",
@@ -1506,6 +1563,76 @@ public final class DevAutoTest {
         requestLlmPlan("give me a full set of stone tools");
     }
 
+    /**
+     * The evidence-backed COMPLETED path: the planks are preloaded, so the fetch is pure delivery;
+     * the plan-finished replan then carries the ledger and its COMPLETED claim is provable.
+     */
+    private static void prepareLlmCompletedWithReceipt() {
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 2));
+        prepareFakeOwner(COMPLETED_RECEIPT_OWNER_UUID, "MineMateReceiptOwner");
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("Bringing them over.",
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true),
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}"))),
+                FixtureTransport.ok(llmResponse(null,
+                        llmStatus("COMPLETED", "Delivered the planks.")))), 1);
+        requestLlmPlan("bring me two oak planks");
+    }
+
+    /**
+     * A model that claims COMPLETED with nothing delivered: the contract-only first reply gets the
+     * free continuation, the unevidenced COMPLETED spends the repair, and the repeated claim
+     * closes the order honestly. Nothing executes.
+     */
+    private static void prepareLlmCompletedDeniedClose() {
+        prepareInventory();
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I will bring you the planks.",
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true))),
+                FixtureTransport.ok(llmResponse(null,
+                        llmStatus("COMPLETED", "Delivered them to you.")))), 0);
+        requestLlmPlan("bring me two oak planks");
+    }
+
+    /**
+     * The full loop: an unevidenced COMPLETED is rejected and repaired, the repaired fetch really
+     * delivers, and the next COMPLETED closes on the ledger's evidence.
+     */
+    private static void prepareLlmCompletedWithoutEvidence() {
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 2));
+        prepareFakeOwner(COMPLETED_REPAIR_OWNER_UUID, "MineMateCompletedRepairOwner");
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I will bring you the planks.",
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true))),
+                FixtureTransport.ok(llmResponse(null,
+                        llmStatus("COMPLETED", "Delivered them to you."))),
+                FixtureTransport.ok(llmResponse("Bringing them over now.",
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}"))),
+                FixtureTransport.ok(llmResponse(null,
+                        llmStatus("COMPLETED", "The planks are in your hands.")))), 2);
+        requestLlmPlan("bring me two oak planks");
+    }
+
+    /**
+     * No owner on purpose: the accepted fetch blocks owner_offline within a sample, the ledger
+     * records the blocked shortfall, and the plan-finished replan that then plans only a goto is
+     * held against the remainder and repaired.
+     */
+    private static void prepareLlmReplanRemainderRepair() {
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 2));
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("Bringing them over.",
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true),
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}"))),
+                FixtureTransport.ok(llmResponse("Let me reposition first.",
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
+                                + spawn.getZ() + "}"))),
+                FixtureTransport.ok(llmResponse("Retrying the delivery.",
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}")))), 1);
+        requestLlmPlan("bring me two oak planks");
+    }
+
     private static void clearLlmPlanner(MinecraftServer server) {
         if (companion != null && companion.getPlanExecutor() != null) {
             companion.getPlanExecutor().discardPendingPlannerRequests();
@@ -2054,6 +2181,162 @@ public final class DevAutoTest {
         }
         if (companion.getStandingOrder() != null) {
             return label + ": ANSWERED did not close the standing order";
+        }
+        return null;
+    }
+
+    /** The order ledger's pure state machine: seeding, evidence records, remainder coverage. */
+    private static String orderLedgerViolation() {
+        OrderLedger ledger = OrderLedger.seed(new OrderContract(List.of(
+                new OrderContract.Deliverable("stick", 2),
+                new OrderContract.Deliverable("minecraft:STICK", 2),
+                new OrderContract.Deliverable("oak_planks", 2)), true));
+        if (ledger.entries().size() != 2 || ledger.entries().get(0).wanted() != 4) {
+            return "duplicate deliverables did not merge summed: " + ledger.describe();
+        }
+        if (ledger.deliveryComplete() || ledger.undeliveredSummary() == null) {
+            return "an undelivered ledger reported completion";
+        }
+        ledger.recordCrafted("stick");
+        if (!ledger.describe().contains("stick 0/4 crafted")) {
+            return "crafted state missing: " + ledger.describe();
+        }
+        ledger.recordDelivered("stick", 3);
+        ledger.recordBlocked("stick", "resource_unavailable");
+        if (!ledger.describe().contains("stick 3/4 blocked (resource_unavailable)")) {
+            return "partial blocked state missing: " + ledger.describe();
+        }
+        ledger.recordDelivered("bucket", 1);
+        if (ledger.describe().contains("bucket")) {
+            return "an undeclared item entered the ledger: " + ledger.describe();
+        }
+        if (!"3 of 4 stick delivered; 0 of 2 oak_planks delivered"
+                .equals(ledger.undeliveredSummary())) {
+            return "unexpected undelivered summary: " + ledger.undeliveredSummary();
+        }
+        ledger.recordDelivered("stick", 1);
+        ledger.recordDelivered("oak_planks", 2);
+        if (!ledger.deliveryComplete() || ledger.undeliveredSummary() != null
+                || !ledger.describe().contains("stick 4/4 delivered")) {
+            return "a fully delivered ledger did not read as complete: " + ledger.describe();
+        }
+
+        OrderLedger remainder = OrderLedger.seed(new OrderContract(
+                List.of(new OrderContract.Deliverable("oak_planks", 2)), true));
+        List<PlanStep> gotoOnly = List.of(PlanStep.of(
+                ToolCall.of("goto").with("x", 1).with("z", 2)));
+        String violation = ContractCoverage.remainderViolation(remainder, gotoOnly);
+        if (violation == null || !violation.contains("remaining 2 oak_planks")) {
+            return "an uncovered remainder was not flagged: " + violation;
+        }
+        if (ContractCoverage.remainderViolation(remainder, List.of(PlanStep.of(
+                ToolCall.of("fetch").with("resource", "minecraft:oak_planks").with("count", 2))))
+                != null) {
+            return "a covering fetch was flagged against the remainder";
+        }
+        List<PlanStep> fullPlan = new ArrayList<>();
+        for (int index = 0; index < Plan.MAX_STEPS; index++) {
+            fullPlan.add(PlanStep.of(ToolCall.of("goto").with("x", index).with("z", 0)));
+        }
+        if (ContractCoverage.remainderViolation(remainder, fullPlan) != null) {
+            return "a plan at the step bound was not allowed to checkpoint";
+        }
+        remainder.recordDelivered("oak_planks", 1);
+        if (ContractCoverage.remainderViolation(remainder, List.of(PlanStep.of(
+                ToolCall.of("fetch").with("resource", "oak_planks").with("count", 1)))) != null) {
+            return "a fetch covering the exact remainder was flagged";
+        }
+        remainder.recordDelivered("oak_planks", 1);
+        if (ContractCoverage.remainderViolation(remainder, gotoOnly) != null) {
+            return "a delivered ledger still demanded fetches";
+        }
+        return null;
+    }
+
+    private static String llmCompletedWithReceiptVerdict() {
+        if (llmTransport.calls() != 2) {
+            return "expected one action and one completion request, saw " + llmTransport.calls();
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "the evidence-backed exchange was treated as a planner failure";
+        }
+        if (!journalHasSummary(EventKind.DELIVERY_RECEIPT, "delivered 2 oak_planks to owner")) {
+            return "the confirmed delivery did not journal a receipt";
+        }
+        if (fakeOwnerInventoryCount(Items.OAK_PLANKS) < 2) {
+            return "the owner never received the planks: "
+                    + fakeOwnerInventoryCount(Items.OAK_PLANKS);
+        }
+        if (!llmTransport.lastRequestBody().contains("LEDGER: oak_planks 2/2 delivered")) {
+            return "the replan request did not carry the delivered ledger";
+        }
+        return null;
+    }
+
+    private static String llmCompletedDeniedCloseVerdict() {
+        if (llmTransport.calls() != 3) {
+            return "expected continuation, rejected COMPLETED, then close, saw "
+                    + llmTransport.calls();
+        }
+        String repairBody = llmTransport.requestBody(2);
+        if (!repairBody.contains("REPAIR:") || !repairBody.contains("claimed COMPLETED")) {
+            return "the repair request did not quote the unevidenced COMPLETED claim";
+        }
+        if (!journalHasSummary(EventKind.PLANNER_FAILED, "planning failed (the reply claimed"
+                + " COMPLETED but the ledger shows 0 of 2 oak_planks delivered)")) {
+            return "the repeated claim did not record the ledger violation";
+        }
+        if (sawNewPlanOutcome()) {
+            return "an unevidenced COMPLETED reached PlanExecutor";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "an unevidenced COMPLETED submitted a goal";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            return "an unevidenced COMPLETED started a plan";
+        }
+        return null;
+    }
+
+    private static String llmCompletedWithoutEvidenceVerdict() {
+        if (llmTransport.calls() != 4) {
+            return "expected continuation, rejection, delivery, then completion, saw "
+                    + llmTransport.calls();
+        }
+        String repairBody = llmTransport.requestBody(2);
+        if (!repairBody.contains("REPAIR:") || !repairBody.contains("claimed COMPLETED")) {
+            return "the repair request did not quote the unevidenced COMPLETED claim";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "the repaired order was recorded as a planner failure";
+        }
+        if (!journalHasSummary(EventKind.DELIVERY_RECEIPT, "delivered 2 oak_planks to owner")) {
+            return "the repaired delivery did not journal a receipt";
+        }
+        if (fakeOwnerInventoryCount(Items.OAK_PLANKS) < 2) {
+            return "the owner never received the planks: "
+                    + fakeOwnerInventoryCount(Items.OAK_PLANKS);
+        }
+        if (!llmTransport.lastRequestBody().contains("LEDGER: oak_planks 2/2 delivered")) {
+            return "the final request did not carry the delivered ledger";
+        }
+        return null;
+    }
+
+    private static String llmReplanRemainderRepairVerdict() {
+        String body = llmTransport.lastRequestBody();
+        if (!body.contains("REPAIR:")
+                || !body.contains("does not fetch the remaining 2 oak_planks")) {
+            return "the repair request did not quote the remainder violation";
+        }
+        if (!body.contains("LEDGER: oak_planks 0/2 blocked (owner_offline)")) {
+            return "the repair request did not carry the blocked ledger";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "the repairable replan was recorded as a planner failure";
+        }
+        if (!companion.getPlanExecutor().isActive()) {
+            return "the repaired fetch plan was not accepted and active";
         }
         return null;
     }

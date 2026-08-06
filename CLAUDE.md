@@ -59,6 +59,16 @@ Build with `gradlew build`; launch a client with `gradlew runClient`. The projec
 - A loaded Fabric `FakePlayer` does not run vanilla's player collision/pickup loop, so thrown items never reach it on their own. Delivery scenarios must simulate `playerTouch` for drops that actually touch the owner. Without it a fetch looks like it stalled during acquisition when in fact it had already acquired and thrown.
 - A `FakePlayer` that has completed a delivery, been discarded, and re-added from Fabric's profile cache stops receiving deliveries: the next scenario's fetch sits at 0/N until its cap. Any scenario that completes a real delivery must own its fake-owner profile (UUID and name) outright, never reuse `FAKE_OWNER_UUID`.
 - A reach-blocked container task must recover with `GetCloseToBlockTask` (a ratcheting `GoalNear` that forces a walk around the obstruction), never `GetToBlockTask`, whose `GoalBlock` demands standing inside the container's own block and is unsatisfiable — the pathfinder wanders and the stall budget kills the goal. For the same reason, never pin `BoundedContainerTransferTask` in its NAVIGATE phase (e.g. by gating its arrival `closerThan` on reach): that phase's only recovery is its own memoized `GetToBlockTask`. Gate the container access itself (resolve/validate/transfer) instead.
+- The order ledger (`OrderLedger` on `StandingOrder`, seeded by `declareContract`) holds measured
+  evidence only: delivered units are owner-inventory deltas, latched by the fetch probes
+  (`DeliveryEvidenceSource`) and harvested by `PlanExecutor` when a step ends on any path -
+  the probe outlives the goal because the `Goal` record holds it, so cancelled steps still
+  yield their receipts. A `COMPLETED` claim on a deliver-to-owner contract is validated against
+  the ledger (after `refreshFromOwner`, which credits items picked up in the throw-to-pickup lag
+  window) and an unevidenced claim goes through the one bounded repair; `PLAN_FINISHED` replans
+  are validated against the undelivered remainder via `ContractCoverage.remainderViolation`,
+  while `DAMAGE_TAKEN` replans stay exempt so threat responses are not forced into fetches. The
+  ledger reaches the model as a `LEDGER:` line in the user prompt, never the cached SYSTEM block.
 - Planner results are asynchronous, so every completion carries a generation claimed on the server thread by `PlanExecutor.beginPlannerRequest()`. Without it a plan requested before `/companion stop` still arrives and starts seconds later, and two concurrent requests race. `stop` invalidates pending requests unconditionally, not inside the `isActive()` branch: a request can be in flight while the supervisor is busy with a manual order.
 
 ## Known issues

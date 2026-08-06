@@ -405,10 +405,23 @@ coverage), and its `count` clarification is partially delivered by the contract'
 1. Nearby passive mobs in snapshots; a bounded `hunt` or cooked-food objective owned by
    deterministic code.
 2. An order ledger with per-deliverable acquired/crafted/delivered/blocked states. The
-   contract now provides the normalized deliverables to seed it.
+   contract now provides the normalized deliverables to seed it. **Delivered
+   (2026-08-05):** `OrderLedger` lives on the `StandingOrder`, seeded when the contract
+   is declared; states are derived strictly from observables (owner-inventory deltas,
+   succeeded craft/mine steps, blocked shortfalls) and rendered to the model as a
+   `LEDGER:` line on replan, continuation, and repair requests. Plan-finished replans
+   are now validated against the undelivered remainder - the exemption that waited on
+   this evidence is closed.
 3. Delivery receipts and relevant owner-inventory changes, so `COMPLETED` rests on
    evidence rather than model inference - the bucket order's `COMPLETED` was still
-   inferred.
+   inferred. **Delivered (2026-08-05):** the fetch probes' owner-inventory delta
+   measurements are harvested when a plan step ends on any path, journaled as
+   `DELIVERY_RECEIPT` events, and credited to the ledger; a `COMPLETED` claim on a
+   deliver-to-owner contract is checked against the ledger (topped up from the owner's
+   live inventory to close the throw-to-pickup lag window), with one bounded repair
+   before an honest close. Offline fixtures: `order_ledger`,
+   `llm_completed_with_receipt`, `llm_completed_denied_close`,
+   `llm_completed_without_evidence`, `llm_replan_remainder_repair`.
 4. Source distance and feasibility information for acquisition choices such as food.
 
 #### P3: Experience and efficiency

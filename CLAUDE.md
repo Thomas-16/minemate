@@ -57,19 +57,13 @@ Build with `gradlew build`; launch a client with `gradlew runClient`. The projec
 - PlayerEngine assigns a task's `controller` when it first *ticks* it, and `ResourceTask.isFinished()` dereferences that controller. Never ask a freshly created child task whether it is finished — `OwnerGiveItemTask` did, and crashed the server on the first tick of any `fetch` whose resource is not craftable. It went unnoticed because `oak_boat` resolves to a craft macro, whose `isFinished` touches no controller.
 - A loaded Fabric `FakePlayer` does not run vanilla's player collision/pickup loop, so thrown items never reach it on their own. Delivery scenarios must simulate `playerTouch` for drops that actually touch the owner. Without it a fetch looks like it stalled during acquisition when in fact it had already acquired and thrown.
 - A `FakePlayer` that has completed a delivery, been discarded, and re-added from Fabric's profile cache stops receiving deliveries: the next scenario's fetch sits at 0/N until its cap. Any scenario that completes a real delivery must own its fake-owner profile (UUID and name) outright, never reuse `FAKE_OWNER_UUID`.
+- A reach-blocked container task must recover with `GetCloseToBlockTask` (a ratcheting `GoalNear` that forces a walk around the obstruction), never `GetToBlockTask`, whose `GoalBlock` demands standing inside the container's own block and is unsatisfiable — the pathfinder wanders and the stall budget kills the goal. For the same reason, never pin `BoundedContainerTransferTask` in its NAVIGATE phase (e.g. by gating its arrival `closerThan` on reach): that phase's only recovery is its own memoized `GetToBlockTask`. Gate the container access itself (resolve/validate/transfer) instead.
 - Planner results are asynchronous, so every completion carries a generation claimed on the server thread by `PlanExecutor.beginPlannerRequest()`. Without it a plan requested before `/companion stop` still arrives and starts seconds later, and two concurrent requests race. `stop` invalidates pending requests unconditionally, not inside the `isActive()` branch: a request can be in flight while the supervisor is busy with a manual order.
 
 ## Known issues
 
 `craft_iron_sword_world` is order-sensitive: it passes alone (~89s) but can exhaust its cap after a
 different preceding sequence.
-
-`withdraw_wall_reach` fails on `master`, independently of any planner work: `withdraw TIMED_OUT
-no_progress 0/2 14s`. It fails identically in isolation and on a clean checkout with every local
-change stashed, so it is not order-sensitivity and not a regression — the full profile, and
-therefore CI, is red until it is fixed. Its sibling `smelt_wall_reach` passes, so the reach rule
-itself works for furnaces; suspect the withdraw path added in "Prevent container access through
-walls".
 
 ## Where this is going
 

@@ -17,6 +17,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.level.dimension.DimensionType;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -425,13 +426,16 @@ public final class ToolRegistry {
                         (args, ctx) -> Goals.withdraw(ctx.companion(), args.getBlockPos("container"),
                                 args.getItem("item"), args.getInt("count"))),
 
-                new ToolDescriptor("goto", "Travel to a horizontal position.",
+                new ToolDescriptor("goto", "Travel to a position. Include y only when the order "
+                        + "names a specific height; omit y for surface travel.",
                         ExecutionScope.DIRECT,
                         List.of(ToolParam.requiredInt("x", -WORLD_LIMIT, WORLD_LIMIT, "Target block X."),
+                                ToolParam.optionalInt("y", DimensionType.MIN_Y, DimensionType.MAX_Y,
+                                        "Target block Y at feet level. Omit for surface travel."),
                                 ToolParam.requiredInt("z", -WORLD_LIMIT, WORLD_LIMIT, "Target block Z."),
                                 ToolParam.optionalNumber("radius", 0.5, 64.0, 2.5,
                                         "How close counts as arrived, in blocks.")),
-                        (args, ctx) -> Goals.goTo(args.getInt("x"), args.getInt("z"), args.getDouble("radius"))),
+                        ToolRegistry::buildGoTo),
 
                 new ToolDescriptor("come_to_owner", "Walk to the owner's current position, tracking "
                         + "them if they move, and finish once within the given distance. Use this "
@@ -454,6 +458,27 @@ public final class ToolRegistry {
                                 ToolParam.optionalNumber("distance", 0.0, 32.0, 3.0,
                                         "How far behind to trail, in blocks.")),
                         ToolRegistry::buildFollow));
+    }
+
+    /**
+     * The schema is world-free, so it can only carry engine-absolute Y bounds; whether the Y exists
+     * in this dimension is decided here, before any movement starts.
+     */
+    private static Goal buildGoTo(ToolArguments args, ToolContext ctx) {
+        int x = args.getInt("x");
+        int z = args.getInt("z");
+        double radius = args.getDouble("radius");
+        if (!args.has("y")) {
+            return Goals.goTo(x, z, radius);
+        }
+        int y = args.getInt("y");
+        int minY = ctx.level().getMinBuildHeight();
+        int maxY = ctx.level().getMaxBuildHeight() - 1;
+        if (y < minY || y > maxY) {
+            throw new ToolBindException(Reasons.ARGUMENT_OUT_OF_RANGE,
+                    "y must be between %d and %d in this dimension".formatted(minY, maxY));
+        }
+        return Goals.goTo(x, y, z, radius);
     }
 
     /**

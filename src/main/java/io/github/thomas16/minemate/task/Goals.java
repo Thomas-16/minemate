@@ -4,6 +4,7 @@ import com.player2.playerengine.TaskCatalogue;
 import com.player2.playerengine.tasks.ResourceTask;
 import com.player2.playerengine.tasks.entity.KillEntityTask;
 import com.player2.playerengine.tasks.movement.FollowPlayerTask;
+import com.player2.playerengine.tasks.movement.GetToBlockTask;
 import com.player2.playerengine.tasks.movement.GetToXZTask;
 import com.player2.playerengine.util.ItemTarget;
 
@@ -111,6 +112,26 @@ public final class Goals {
         return new Goal(Goal.nextId(), "goto", description,
                 GoalExecutionProfile.direct("May break or place route-support blocks while pathfinding"),
                 () -> new GetToXZTask(x, z),
+                probe, 2400, 400);
+    }
+
+    public static Goal goTo(int x, int y, int z, double arriveRadius) {
+        if (arriveRadius <= 0.0) {
+            throw new IllegalArgumentException("Arrival radius must be positive");
+        }
+        String description = "go to " + x + ", " + y + ", " + z;
+        GoalProbe probe = context -> {
+            double dx = context.companion().getX() - (x + 0.5);
+            // Feet position against the target's feet block, so standing on it reads as zero.
+            double dy = context.companion().getY() - y;
+            double dz = context.companion().getZ() - (z + 0.5);
+            double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            return GoalProgress.approach(distance, arriveRadius,
+                    "%.1f blocks from %d, %d, %d".formatted(distance, x, y, z));
+        };
+        return new Goal(Goal.nextId(), "goto", description,
+                GoalExecutionProfile.direct("May break or place route-support blocks while pathfinding"),
+                () -> new GetToBlockTask(new BlockPos(x, y, z)),
                 probe, 2400, 400);
     }
 

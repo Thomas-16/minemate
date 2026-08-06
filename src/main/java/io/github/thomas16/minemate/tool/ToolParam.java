@@ -48,6 +48,11 @@ public record ToolParam(String name, ParamType type, boolean required, Object de
         return new ToolParam(name, ParamType.INT, false, defaultValue, min, max, description);
     }
 
+    /** Optional with no default: an absent value stays absent, visible via {@link ToolArguments#has}. */
+    public static ToolParam optionalInt(String name, int min, int max, String description) {
+        return new ToolParam(name, ParamType.INT, false, null, min, max, description);
+    }
+
     public static ToolParam optionalNumber(String name, double min, double max, double defaultValue,
             String description) {
         return new ToolParam(name, ParamType.NUMBER, false, defaultValue, min, max, description);

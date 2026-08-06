@@ -80,7 +80,9 @@ import io.github.thomas16.minemate.planner.llm.OpenAiResponsesBackend;
 import io.github.thomas16.minemate.planner.llm.OpenAiToolSchemas;
 import io.github.thomas16.minemate.planner.llm.PlannerPrompt;
 import io.github.thomas16.minemate.planner.llm.PlannerProtocol;
+import io.github.thomas16.minemate.tool.ToolBindException;
 import io.github.thomas16.minemate.tool.ToolCall;
+import io.github.thomas16.minemate.tool.ToolContext;
 import io.github.thomas16.minemate.tool.ToolRegistry;
 import io.github.thomas16.minemate.tool.ToolValidation;
 
@@ -108,6 +110,7 @@ public final class DevAutoTest {
             "owner_friendly_fire",
             "mine_success",
             "goto_success",
+            "goto_y",
             "cancel",
             "come_to_owner_success",
             "come_to_owner_moving",
@@ -183,6 +186,7 @@ public final class DevAutoTest {
     private static BlockPos spawn;
     private static BlockPos storagePos;
     private static BlockPos furnacePos;
+    private static BlockPos gotoYTarget;
     private static boolean sawEatingReflex;
     private static boolean sawEatingClear;
     private static boolean sawMobDefenseReflex;
@@ -323,6 +327,21 @@ public final class DevAutoTest {
                         outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
                                 && Reasons.GOAL_MET.equals(outcome.reason()),
                         2400),
+                // The 3D destination proof the playtest lacked: arrival is checked at the target
+                // tier, not just the target column, and the invariant shows a Y outside this
+                // dimension rejects at bind time before any movement.
+                new Scenario("goto_y",
+                        ignored -> Goals.goTo(gotoYTarget.getX(), gotoYTarget.getY(),
+                                gotoYTarget.getZ(), 2.5),
+                        outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
+                                && Reasons.GOAL_MET.equals(outcome.reason())
+                                && companion.position()
+                                        .distanceTo(Vec3.atBottomCenterOf(gotoYTarget)) <= 3.5,
+                        2400,
+                        ignoredServer -> prepareGotoYFixture(),
+                        ignoredServer -> {
+                        },
+                        DevAutoTest::gotoYBindInvariant),
                 new Scenario("cancel",
                         ignored -> Goals.goTo(spawn.getX() + 100_000, spawn.getZ(), 2.5),
                         outcome -> outcome.status() == OutcomeStatus.CANCELLED
@@ -2954,6 +2973,37 @@ public final class DevAutoTest {
         if (rejected != null) {
             return rejected;
         }
+        rejected = expectRejected(registry,
+                ToolCall.of("goto").with("x", 0).with("z", 0).with("y", "NaN"),
+                Reasons.INVALID_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                ToolCall.of("goto").with("x", 0).with("z", 0).with("y", 5000),
+                Reasons.ARGUMENT_OUT_OF_RANGE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                ToolCall.of("goto").with("x", 0).with("z", 0).with("y", 64.5),
+                Reasons.INVALID_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        // An absent y must stay absent rather than pick up a default: a defaulted Y would
+        // recreate the silently dropped third coordinate the tool exists to prevent.
+        ToolValidation withY = registry.validate(
+                ToolCall.of("goto").with("x", 0).with("z", 0).with("y", 64));
+        if (!(withY instanceof ToolValidation.Accepted acceptedY)
+                || !acceptedY.arguments().has("y") || acceptedY.arguments().getInt("y") != 64) {
+            return "goto with y did not carry the y argument through validation";
+        }
+        ToolValidation withoutY = registry.validate(ToolCall.of("goto").with("x", 0).with("z", 0));
+        if (!(withoutY instanceof ToolValidation.Accepted acceptedNoY)
+                || acceptedNoY.arguments().has("y")) {
+            return "goto without y did not leave the y argument absent";
+        }
         rejected = expectRejected(registry, ToolCall.of("come_to_owner").with("distance", 0.5),
                 Reasons.ARGUMENT_OUT_OF_RANGE);
         if (rejected != null) {
@@ -3058,6 +3108,27 @@ public final class DevAutoTest {
         JsonObject arguments = new JsonObject();
         arguments.add("items", JsonParser.parseString(itemsJson));
         return new ToolCall("fetch_items", arguments);
+    }
+
+    /**
+     * A Y that fits the engine-absolute schema bound but not this dimension must reject at bind
+     * time, before any movement starts; pure validation alone cannot see the dimension.
+     */
+    private static String gotoYBindInvariant() {
+        ToolCall call = ToolCall.of("goto")
+                .with("x", spawn.getX()).with("z", spawn.getZ())
+                .with("y", companion.level().getMinBuildHeight() - 1);
+        if (!(ToolRegistry.defaults().validate(call) instanceof ToolValidation.Accepted accepted)) {
+            return "a schema-legal y below the dimension floor failed pure validation";
+        }
+        try {
+            accepted.tool().builder().build(accepted.arguments(), ToolContext.of(companion));
+            return "a y below the dimension floor bound a goal instead of rejecting";
+        } catch (ToolBindException expected) {
+            return Reasons.ARGUMENT_OUT_OF_RANGE.equals(expected.reason()) ? null
+                    : "the y bind rejection gave " + expected.reason()
+                            + ", expected " + Reasons.ARGUMENT_OUT_OF_RANGE;
+        }
     }
 
     private static String expectRejected(ToolRegistry registry, ToolCall call, String expectedReason) {
@@ -3289,6 +3360,23 @@ public final class DevAutoTest {
                     fakeOwner, Entity.RemovalReason.DISCARDED);
         }
         fakeOwner = null;
+    }
+
+    /**
+     * A one-block stone step whose top is the destination, so the arrival Y differs from the
+     * natural surface and the 3D probe is actually exercised. The column must stay inside the
+     * spawn entity-ticking region: a companion that pathfinds beyond it freezes mid-walk with its
+     * supervisor (no stall or timeout can fire), and the scenario dies by hard cap. Chunk (+24, +8)
+     * is the region goto_success already proves ticks.
+     */
+    private static void prepareGotoYFixture() {
+        ServerLevel level = (ServerLevel) companion.level();
+        BlockPos step = level.getHeightmapPos(
+                Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, spawn.offset(24, 0, 8));
+        level.setBlockAndUpdate(step, Blocks.STONE.defaultBlockState());
+        gotoYTarget = step.above();
+        level.setBlockAndUpdate(gotoYTarget, Blocks.AIR.defaultBlockState());
+        level.setBlockAndUpdate(gotoYTarget.above(), Blocks.AIR.defaultBlockState());
     }
 
     private static void prepareComeOwner(UUID ownerUuid, String ownerName, int dx, int dz) {

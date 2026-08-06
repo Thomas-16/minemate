@@ -369,8 +369,9 @@ free-form snapshots.
 - "Give me a full set of stone tools" names and delivers final tools: **partially** -
   the failure mode is now honest and bounded (fixture-verified close after repair), but
   a live success has not been observed yet.
-- "Come to me" as one finite world task, 3D destinations, hunting evidence, and
-  receipt-backed `COMPLETED`: **not started**; see revised priorities.
+- "Come to me" as one finite world task and 3D destinations: **delivered**
+  (`come_to_owner`, and `goto` with an optional `y` honored by navigation). Hunting
+  evidence and receipt-backed `COMPLETED`: **not started**; see revised priorities.
 
 ### Revised priorities
 
@@ -394,7 +395,10 @@ coverage), and its `count` clarification is partially delivered by the contract'
 4. A finite `come_to_owner(distance)` task that continuously rebinds to the owner's
    position.
 5. `goto(x, y, z, radius)` if navigation can honor Y; otherwise reject or clarify
-   before any movement starts.
+   before any movement starts. Delivered: navigation honors an optional `y` via
+   `GetToBlockTask`, the arrival probe measures full 3D distance so a wrong-tier
+   arrival is an honest `BLOCKED`, and a Y outside the current dimension rejects at
+   bind time before any movement.
 
 #### P2: World awareness and evidence (unchanged in substance)
 

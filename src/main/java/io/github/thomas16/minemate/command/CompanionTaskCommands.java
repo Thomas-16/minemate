@@ -25,6 +25,7 @@ import net.minecraft.server.level.ColumnPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.dimension.DimensionType;
 
 import java.util.Collection;
 import java.util.List;
@@ -60,7 +61,12 @@ final class CompanionTaskCommands {
                                 .with("distance", DoubleArgumentType.getDouble(ctx, "distance"))))));
         root.then(Commands.literal("goto")
                 .then(Commands.argument("pos", ColumnPosArgument.columnPos())
-                        .executes(ctx -> goTo(ctx.getSource(), ColumnPosArgument.getColumnPos(ctx, "pos")))));
+                        .executes(ctx -> goTo(ctx.getSource(), ColumnPosArgument.getColumnPos(ctx, "pos")))
+                        .then(Commands.argument("y",
+                                IntegerArgumentType.integer(DimensionType.MIN_Y, DimensionType.MAX_Y))
+                                .executes(ctx -> goTo(ctx.getSource(),
+                                        ColumnPosArgument.getColumnPos(ctx, "pos"),
+                                        IntegerArgumentType.getInteger(ctx, "y"))))));
         root.then(Commands.literal("kill")
                 .then(Commands.argument("target", EntityArgument.entity())
                         .executes(ctx -> kill(ctx.getSource(), EntityArgument.getEntity(ctx, "target")))));
@@ -125,6 +131,11 @@ final class CompanionTaskCommands {
 
     private static int goTo(CommandSourceStack source, ColumnPos position) {
         return runTool(source, ToolCall.of("goto").with("x", position.x()).with("z", position.z()));
+    }
+
+    private static int goTo(CommandSourceStack source, ColumnPos position, int y) {
+        return runTool(source, ToolCall.of("goto")
+                .with("x", position.x()).with("y", y).with("z", position.z()));
     }
 
     /**

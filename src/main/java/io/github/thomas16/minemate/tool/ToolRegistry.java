@@ -433,6 +433,15 @@ public final class ToolRegistry {
                                         "How close counts as arrived, in blocks.")),
                         (args, ctx) -> Goals.goTo(args.getInt("x"), args.getInt("z"), args.getDouble("radius"))),
 
+                new ToolDescriptor("come_to_owner", "Walk to the owner's current position, tracking "
+                        + "them if they move, and finish once within the given distance. Use this "
+                        + "whenever the owner asks the companion to come to them; it completes on "
+                        + "arrival.",
+                        ExecutionScope.DIRECT,
+                        List.of(ToolParam.optionalNumber("distance", 1.0, 32.0, 2.5,
+                                "How close counts as arrived, in blocks.")),
+                        ToolRegistry::buildComeToOwner),
+
                 new ToolDescriptor("kill", "Attack a specific entity until it dies.",
                         ExecutionScope.DIRECT,
                         List.of(ToolParam.entity("target", "UUID of the entity to attack.")),
@@ -464,6 +473,14 @@ public final class ToolRegistry {
             throw new ToolBindException(Reasons.TARGET_GONE, "That entity is no longer here");
         }
         return Goals.killEntity(ctx.level(), targetId, target.getName().getString());
+    }
+
+    private static Goal buildComeToOwner(ToolArguments args, ToolContext ctx) {
+        ServerPlayer owner = ctx.companion().resolveOwnerInLevel().orElse(null);
+        if (owner == null) {
+            throw new ToolBindException(Reasons.OWNER_OFFLINE, "The owner is not reachable in this world");
+        }
+        return Goals.comeToOwner(owner, args.getDouble("distance"));
     }
 
     private static Goal buildFollow(ToolArguments args, ToolContext ctx) {

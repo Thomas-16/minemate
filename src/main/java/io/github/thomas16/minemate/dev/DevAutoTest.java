@@ -109,6 +109,8 @@ public final class DevAutoTest {
             "mine_success",
             "goto_success",
             "cancel",
+            "come_to_owner_success",
+            "come_to_owner_moving",
             "craft_success",
             "fetch_oak_boat_delivery",
             "fetch_plain_resource",
@@ -166,6 +168,12 @@ public final class DevAutoTest {
             UUID.fromString("e1cdca3b-20c4-4853-9352-474eb62406b7");
     private static final UUID CONTEXT_OWNER_UUID =
             UUID.fromString("3a0d9d64-6a5a-4f1e-8f2b-2b1f5c8c1a77");
+    private static final UUID COME_OWNER_UUID =
+            UUID.fromString("1f6d3b82-9c47-4e05-b8a1-d24e96c07f13");
+    private static final UUID COME_MOVING_OWNER_UUID =
+            UUID.fromString("c8a51e94-3d76-4b28-a90f-7e12b45d68c3");
+    private static final UUID COME_LOST_OWNER_UUID =
+            UUID.fromString("64b29f07-8a15-4cd3-b7e6-f90a2c81d534");
 
     private static CompanionEntity companion;
     private static FakePlayer fakeOwner;
@@ -320,6 +328,35 @@ public final class DevAutoTest {
                         outcome -> outcome.status() == OutcomeStatus.CANCELLED
                                 && Reasons.CANCELLED_BY_OWNER.equals(outcome.reason()),
                         400),
+                new Scenario("come_to_owner_success",
+                        ignored -> Goals.comeToOwner(fakeOwner, 2.5),
+                        outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
+                                && Reasons.GOAL_MET.equals(outcome.reason())
+                                && companion.distanceTo(fakeOwner) <= 3.5,
+                        2400,
+                        ignoredServer -> prepareComeOwner(COME_OWNER_UUID, "MineMateComeOwner", 20, 0),
+                        ignoredServer -> clearFakeOwner(),
+                        () -> null),
+                // The rebinding proof: a tick hook teleports the owner sideways mid-walk, and the
+                // one goal must finish at the owner's new position with no replan.
+                new Scenario("come_to_owner_moving",
+                        ignored -> Goals.comeToOwner(fakeOwner, 2.5),
+                        outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
+                                && Reasons.GOAL_MET.equals(outcome.reason())
+                                && companion.distanceTo(fakeOwner) <= 3.5
+                                && fakeOwner.getZ() > spawn.getZ() + 10,
+                        2400,
+                        ignoredServer -> prepareComeOwner(COME_MOVING_OWNER_UUID, "MineMateComeMover", 16, 0),
+                        ignoredServer -> clearFakeOwner(),
+                        () -> null),
+                new Scenario("come_to_owner_owner_lost",
+                        ignored -> Goals.comeToOwner(fakeOwner, 2.5),
+                        outcome -> outcome.status() == OutcomeStatus.BLOCKED
+                                && Reasons.OWNER_OFFLINE.equals(outcome.reason()),
+                        600,
+                        ignoredServer -> prepareComeOwner(COME_LOST_OWNER_UUID, "MineMateComeLost", 16, 0),
+                        ignoredServer -> clearFakeOwner(),
+                        () -> null),
                 new Scenario("defense_leash",
                         ignored -> Goals.goTo(spawn.getX() + 16, spawn.getZ(), 2.5),
                         outcome -> outcome.status() == OutcomeStatus.SUCCEEDED
@@ -941,6 +978,13 @@ public final class DevAutoTest {
         if ("plan_owner_cancel".equals(scenario.name()) && scenarioTicks == 40) {
             // The same shape as /companion stop: cancel the plan, not just the running goal.
             companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
+        }
+        if ("come_to_owner_moving".equals(scenario.name()) && scenarioTicks == 30) {
+            // Mid-walk, so the goal must retarget the owner's new position within one task.
+            moveFakeOwnerTo(16, 14);
+        }
+        if ("come_to_owner_owner_lost".equals(scenario.name()) && scenarioTicks == 30) {
+            clearFakeOwner();
         }
         if ("llm_stale_request".equals(scenario.name()) && scenarioTicks == 2) {
             // Well inside the fixture's 400ms delay: the request is genuinely in flight, which is
@@ -2863,8 +2907,8 @@ public final class DevAutoTest {
      */
     private static String toolRegistryViolation() {
         ToolRegistry registry = ToolRegistry.defaults();
-        if (registry.tools().size() != 10) {
-            return "expected 10 tools, found " + registry.tools().size();
+        if (registry.tools().size() != 11) {
+            return "expected 11 tools, found " + registry.tools().size();
         }
         String rejected = expectRejected(registry, ToolCall.of("teleport"), Reasons.UNKNOWN_TOOL);
         if (rejected != null) {
@@ -2907,6 +2951,21 @@ public final class DevAutoTest {
         rejected = expectRejected(registry,
                 ToolCall.of("goto").with("x", 0).with("z", 0).with("radius", "Infinity"),
                 Reasons.INVALID_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry, ToolCall.of("come_to_owner").with("distance", 0.5),
+                Reasons.ARGUMENT_OUT_OF_RANGE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry, ToolCall.of("come_to_owner").with("distance", 64),
+                Reasons.ARGUMENT_OUT_OF_RANGE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry, ToolCall.of("come_to_owner").with("target", "Steve"),
+                Reasons.UNKNOWN_ARGUMENT);
         if (rejected != null) {
             return rejected;
         }
@@ -3230,6 +3289,23 @@ public final class DevAutoTest {
                     fakeOwner, Entity.RemovalReason.DISCARDED);
         }
         fakeOwner = null;
+    }
+
+    private static void prepareComeOwner(UUID ownerUuid, String ownerName, int dx, int dz) {
+        prepareInventory();
+        prepareFakeOwner(ownerUuid, ownerName);
+        moveFakeOwnerTo(dx, dz);
+    }
+
+    /** Places the fake owner on the surface at a spawn offset and refreshes the entity tracker. */
+    private static void moveFakeOwnerTo(int dx, int dz) {
+        ServerLevel level = (ServerLevel) companion.level();
+        int x = spawn.getX() + dx;
+        int z = spawn.getZ() + dz;
+        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        fakeOwner.moveTo(x + 0.5, y, z + 0.5, 0.0F, 0.0F);
+        companion.getController().getEntityTracker().setDirty();
+        companion.getController().getEntityTracker().ensureUpdated();
     }
 
     private static void prepareOwnerFriendlyFire() {

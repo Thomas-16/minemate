@@ -1,5 +1,6 @@
 package io.github.thomas16.minemate.command;
 
+import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
@@ -52,6 +53,11 @@ final class CompanionTaskCommands {
         root.then(itemCommand("smelt", registryAccess));
         root.then(storageCommand("deposit", registryAccess));
         root.then(storageCommand("withdraw", registryAccess));
+        root.then(Commands.literal("come")
+                .executes(ctx -> runTool(ctx.getSource(), ToolCall.of("come_to_owner")))
+                .then(Commands.argument("distance", DoubleArgumentType.doubleArg(1.0, 32.0))
+                        .executes(ctx -> runTool(ctx.getSource(), ToolCall.of("come_to_owner")
+                                .with("distance", DoubleArgumentType.getDouble(ctx, "distance"))))));
         root.then(Commands.literal("goto")
                 .then(Commands.argument("pos", ColumnPosArgument.columnPos())
                         .executes(ctx -> goTo(ctx.getSource(), ColumnPosArgument.getColumnPos(ctx, "pos")))));

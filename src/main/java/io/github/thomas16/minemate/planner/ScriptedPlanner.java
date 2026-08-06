@@ -1,6 +1,5 @@
 package io.github.thomas16.minemate.planner;
 
-import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.entity.CompanionEntity;
 import io.github.thomas16.minemate.task.Reasons;
 import io.github.thomas16.minemate.tool.ToolCall;
@@ -139,15 +138,9 @@ public final class ScriptedPlanner implements Planner {
                                 .with("item", "minecraft:oak_planks").with("count", 8))),
                 "On it - getting wood and turning it into planks."));
 
-        planner.script("come here", (companion, request) -> {
-            // Read the immutable snapshot, never the live entity: this runs off the server thread.
-            WorldSnapshot snapshot = request.snapshot();
-            int x = snapshot.self().blockX() + snapshot.owner().dx();
-            int z = snapshot.self().blockZ() + snapshot.owner().dz();
-            return new Plan(Plan.nextId(), "come here",
-                    List.of(PlanStep.of(ToolCall.of("goto").with("x", x).with("z", z))),
-                    "Coming to you.");
-        });
+        planner.script("come here", (companion, request) -> new Plan(Plan.nextId(), "come here",
+                List.of(PlanStep.of(ToolCall.of("come_to_owner"))),
+                "Coming to you."));
 
         // A continuous tool is legal as the final step, and the plan then stays open-ended.
         planner.script("stay with me", (companion, request) -> new Plan(Plan.nextId(), "stay with me",

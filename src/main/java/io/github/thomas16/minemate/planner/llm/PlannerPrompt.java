@@ -32,6 +32,8 @@ public final class PlannerPrompt {
             - If the order needs more than %d known actions, return the first coherent chunk of at
               most %d calls, ending at a useful checkpoint. If a future choice depends on evidence
               that does not exist yet, stop before that unknown choice.
+            - 'come_to_owner' walks to the owner's current position and finishes on arrival; use it
+              whenever the owner asks you to come to them, never a goto to their coordinates.
             - 'follow' never finishes on its own, so call it only as the very last tool, if at all.
             - The first action reply for an order must include the declare_order_contract call and
               the world-tool calls together, in that one reply: declare every final item the owner

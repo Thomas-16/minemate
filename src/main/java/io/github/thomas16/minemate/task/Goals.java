@@ -114,6 +114,36 @@ public final class Goals {
                 probe, 2400, 400);
     }
 
+    public static Goal comeToOwner(ServerPlayer owner, double arriveDistance) {
+        if (arriveDistance <= 0.0) {
+            throw new IllegalArgumentException("Arrival distance must be positive");
+        }
+        String ownerName = owner.getGameProfile().getName();
+        GoalProbe probe = new GoalProbe() {
+            @Override
+            public GoalProgress sample(Context context) {
+                ServerPlayer current = context.companion().resolveOwnerInLevel().orElse(null);
+                if (current == null) {
+                    return new GoalProgress(0, 1, 0.0, "Waiting for " + ownerName);
+                }
+                double distance = context.companion().distanceTo(current);
+                return GoalProgress.approach(distance, arriveDistance,
+                        "%.1f blocks from %s".formatted(distance, ownerName));
+            }
+
+            @Override
+            public String blockedReason(Context context) {
+                return context.companion().resolveOwnerInLevel().isEmpty()
+                        ? Reasons.OWNER_OFFLINE : null;
+            }
+        };
+        // stallTicks stays 0: advance is -distance to a target that may walk away, so any
+        // stall watchdog would kill an actively chasing companion; the timeout is the bound.
+        return new Goal(Goal.nextId(), "come_to_owner", "come to " + ownerName,
+                GoalExecutionProfile.direct("May break or place route-support blocks while pathfinding"),
+                () -> new ComeToOwnerTask(arriveDistance), probe, 2400, 0);
+    }
+
     public static Goal killEntity(ServerLevel level, UUID targetUuid, String targetName) {
         String description = "kill " + targetName;
         GoalProbe probe = new GoalProbe() {

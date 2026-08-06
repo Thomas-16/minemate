@@ -105,10 +105,11 @@ public final class HostedPlanner implements Planner {
                     + " world-tool calls");
         }
         // A contract with no world calls passes through as an empty ACTION plan: dispatch owns
-        // that case, because its remedy is a repair request, not a parse failure.
+        // that case, because its remedy is a repair request, not a parse failure. Blank dialogue
+        // is legal on an action reply; the protocol layer explains why.
         if (reply.disposition() == PlanDisposition.ACTION
-                && (reply.dialogue().isBlank() || (calls.isEmpty() && reply.contract() == null))) {
-            throw LlmException.malformed("action reply requires speech and at least one world-tool call");
+                && calls.isEmpty() && reply.contract() == null) {
+            throw LlmException.malformed("action reply had no world-tool calls");
         }
         if (reply.disposition().terminal()
                 && (!calls.isEmpty() || reply.dialogue().isBlank())) {

@@ -126,6 +126,7 @@ public final class DevAutoTest {
             "llm_claude_protocol",
             "llm_claude_plan",
             "llm_unknown_tool",
+            "llm_speechless_action",
             "llm_malformed_output",
             "llm_http_error",
             "llm_talk_only",
@@ -647,6 +648,18 @@ public final class DevAutoTest {
                         ignoredServer -> prepareLlmPlan(FixtureTransport.of(
                                 FixtureTransport.rateLimited("0"),
                                 FixtureTransport.ok(llmResponse("One moment.",
+                                        llmContract("[]", false),
+                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
+                                                + spawn.getZ() + "}")))),
+                                "come here"),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                Scenario.plan("llm_speechless_action",
+                        ignored -> null,
+                        DevAutoTest::acceptLlmSpeechlessAction,
+                        400,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
+                                llmResponse(null,
                                         llmContract("[]", false),
                                         llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":"
                                                 + spawn.getZ() + "}")))),
@@ -2145,6 +2158,22 @@ public final class DevAutoTest {
         return accepted;
     }
 
+    /**
+     * The exact shape that broke llm_live, offline: live claude-sonnet-5 under adaptive thinking
+     * answers an action order with correct tool calls and no text block, so a speechless action
+     * reply must plan normally rather than fail the order.
+     */
+    private static boolean acceptLlmSpeechlessAction(PlanOutcome outcome) {
+        boolean accepted = outcome.status() == PlanStatus.SUCCEEDED
+                && llmTransport.calls() == 1
+                && !journalHas(EventKind.PLANNER_FAILED);
+        if (!accepted) {
+            MineMate.LOGGER.error("[autotest] llm_speechless_action postcondition {} requests={}",
+                    outcome.toCompactString(), llmTransport.calls());
+        }
+        return accepted;
+    }
+
     // ---- schema and parse ---------------------------------------------------------------------
 
     /**
@@ -2351,6 +2380,19 @@ public final class DevAutoTest {
                 llmCall("goto", "{\"x\":1,\"z\":1}")));
         if (violation != null) {
             return violation;
+        }
+        // Legal on purpose, and provider-agnostic: the speechless-action habit is a model habit,
+        // not a wire format, so both backends must parse tool calls with no assistant text.
+        LlmReply speechless;
+        try {
+            speechless = OpenAiResponsesBackend.parseReply(
+                    llmResponse(null, llmCall("goto", "{\"x\":1,\"z\":1}")));
+        } catch (RuntimeException error) {
+            return "a speechless action reply failed to parse: " + error.getMessage();
+        }
+        if (speechless.disposition() != PlanDisposition.ACTION || !speechless.dialogue().isBlank()
+                || speechless.calls().size() != 1) {
+            return "a speechless action reply did not parse into a one-call action reply";
         }
         return null;
     }
@@ -2578,10 +2620,18 @@ public final class DevAutoTest {
         if (violation != null) {
             return violation;
         }
-        violation = expectClaudeMalformed("action reply without speech",
-                claudeResponse(null, claudeCall("goto", "{\"x\":1,\"z\":1}")));
-        if (violation != null) {
-            return violation;
+        // Legal on purpose: live claude-sonnet-5 under adaptive thinking reliably sends tool
+        // calls with no text block, so blank dialogue must parse rather than fail the order.
+        LlmReply speechless;
+        try {
+            speechless = AnthropicMessagesBackend.parseReply(
+                    claudeResponse(null, claudeCall("goto", "{\"x\":1,\"z\":1}")));
+        } catch (RuntimeException error) {
+            return "a speechless action reply failed to parse: " + error.getMessage();
+        }
+        if (speechless.disposition() != PlanDisposition.ACTION || !speechless.dialogue().isBlank()
+                || speechless.calls().size() != 1) {
+            return "a speechless action reply did not parse into a one-call action reply";
         }
         // Truncation announces itself only through stop_reason; the blocks may look complete.
         violation = expectClaudeMalformed("truncated reply", claudeResponse("max_tokens",

@@ -23,7 +23,8 @@ public final class PlannerPrompt {
 
             Rules:
             - An action reply is one short nonblank line of assistant speech plus 1-%d world-tool
-              calls and no report_order_status call.
+              calls and no report_order_status call. Write the speech as an ordinary text block in
+              the same reply as the tool calls; never send tool calls alone.
             - Include every step that is currently known, including dependent steps, in execution
               order. Speech is not an action. Never reserve known work for a later replan.
             - World tools run sequentially in the order you call them. A later call may rely on an

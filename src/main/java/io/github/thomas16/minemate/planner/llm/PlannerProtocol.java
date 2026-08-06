@@ -35,9 +35,11 @@ public final class PlannerProtocol {
     /**
      * Turns a provider's parsed reply into an {@link LlmReply}, enforcing every protocol rule in
      * one place so two backends cannot drift apart: at most one status and one contract, a status
-     * never mixes with world calls, a contract, or a separate assistant message, an action reply
-     * needs speech and at most {@link Plan#MAX_STEPS} world calls, and the contract-only shape
-     * stays parseable so dispatch can repair it.
+     * never mixes with world calls, a contract, or a separate assistant message, and an action
+     * reply carries at most {@link Plan#MAX_STEPS} world calls. Action-reply speech is requested
+     * by the prompt but never required here: live claude-sonnet-5 under adaptive thinking
+     * reliably answers a plannable order with tool calls and no text block, so blank dialogue is
+     * legal and simply reaches the owner as nothing -- the goal-start chat line covers them.
      *
      * @param dialogue   the concatenated assistant text, possibly blank
      * @param sawMessage whether any assistant text item existed at all, even an empty one; a
@@ -86,9 +88,6 @@ public final class PlannerProtocol {
         if (worldCalls.size() > Plan.MAX_STEPS) {
             throw LlmException.malformed("reply contained more than " + Plan.MAX_STEPS
                     + " world-tool calls");
-        }
-        if (dialogue == null || dialogue.isBlank()) {
-            throw LlmException.malformed("action reply had no assistant speech");
         }
         List<ToolCall> toolCalls = new ArrayList<>(worldCalls.size());
         for (RawCall call : worldCalls) {

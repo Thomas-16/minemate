@@ -151,7 +151,7 @@ public final class TaskSupervisor {
                     finish(OutcomeStatus.SUCCEEDED, Reasons.GOAL_MET);
                     return;
                 }
-                finish(terminal.status(), terminal.reason(), terminal.moved());
+                finish(terminal.status(), terminal.reason(), terminal.moved(), terminal.detail());
                 return;
             }
             String blocked;
@@ -306,7 +306,8 @@ public final class TaskSupervisor {
             if (error instanceof GoalStartException controlled) {
                 MineMate.LOGGER.info("Goal {} could not start: {}", goal.id(), controlled.result().reason());
                 sampleControlledStartFailure();
-                finish(controlled.result().status(), controlled.result().reason(), controlled.result().moved());
+                finish(controlled.result().status(), controlled.result().reason(),
+                        controlled.result().moved(), controlled.result().detail());
                 return;
             }
             String reason = Reasons.TARGET_GONE.equals(error.getMessage())
@@ -388,6 +389,10 @@ public final class TaskSupervisor {
     }
 
     private void finish(OutcomeStatus status, String reason, int moved) {
+        finish(status, reason, moved, null);
+    }
+
+    private void finish(OutcomeStatus status, String reason, int moved, String detailOverride) {
         Goal finishedGoal = goal;
         StepExecution finishedExecution = execution;
         String stepId = activeStepId;
@@ -420,8 +425,8 @@ public final class TaskSupervisor {
         String engineLog = finishedExecution == null || finishedExecution.getLastLogEntry() == null
                 ? "" : finishedExecution.getLastLogEntry();
         lastOutcome = new TaskOutcome(finishedGoal.id(), finishedGoal.kind(), status, reason,
-                detail(finishedGoal, status, reason), moved, have, want,
-                elapsed, engineState, engineLog);
+                detailOverride != null ? detailOverride : detail(finishedGoal, status, reason),
+                moved, have, want, elapsed, engineState, engineLog);
         TaskListeners.fireFinished(companion, finishedGoal, lastOutcome);
     }
 

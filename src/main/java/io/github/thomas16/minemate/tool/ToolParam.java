@@ -36,6 +36,10 @@ public record ToolParam(String name, ParamType type, boolean required, Object de
         return new ToolParam(name, ParamType.BLOCK_POS, true, null, 0.0, 0.0, description);
     }
 
+    public static ToolParam itemList(String name, String description) {
+        return new ToolParam(name, ParamType.ITEM_LIST, true, null, 0.0, 0.0, description);
+    }
+
     public static ToolParam requiredInt(String name, int min, int max, String description) {
         return new ToolParam(name, ParamType.INT, true, null, min, max, description);
     }

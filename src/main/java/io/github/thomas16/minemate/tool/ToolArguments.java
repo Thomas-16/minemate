@@ -1,8 +1,11 @@
 package io.github.thomas16.minemate.tool;
 
+import io.github.thomas16.minemate.task.ItemQuantity;
+
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.item.Item;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -46,6 +49,19 @@ public record ToolArguments(Map<String, Object> values) {
 
     public UUID getUuid(String name) {
         return require(name, UUID.class);
+    }
+
+    public List<ItemQuantity> getItemQuantities(String name) {
+        List<?> list = require(name, List.class);
+        for (Object element : list) {
+            if (!(element instanceof ItemQuantity)) {
+                throw new IllegalStateException("Argument " + name + " holds a "
+                        + element.getClass().getSimpleName() + ", not an ItemQuantity");
+            }
+        }
+        @SuppressWarnings("unchecked")
+        List<ItemQuantity> quantities = (List<ItemQuantity>) list;
+        return quantities;
     }
 
     private <T> T require(String name, Class<T> type) {

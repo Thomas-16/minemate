@@ -27,6 +27,9 @@ Build with `gradlew build`; launch a client with `gradlew runClient`. The projec
 - PlayerEngine's craft macro used 300- and 1,200-tick collection cutoffs around a nested gather search that can run for 90 seconds. Compatibility patches must preserve the overall MineMate timeout, be guarded by the exact PlayerEngine dependency version, and use Mixin `require = 1` so upstream bytecode changes fail fast.
 - `LivingEntityInventory.insertStack` mutates the supplied stack. Item pickup accounting must compare the stack count before and after insertion, report only that delta, discard a fully consumed entity without restoring its stack, and leave the mutated remainder for a partial pickup.
 - `GiveItemToPlayerTask` considers delivery finished after throwing the items, not after the owner receives them. Fetch must treat acquisition and delivery as separate phases and remain active until the owner's inventory confirms the requested increase. Once delivery begins, do not re-enter acquisition merely because thrown items are no longer in the companion inventory.
+- `fetch_items` is the multi-item delivery objective: one `ITEM_LIST` tool call, expanded by `OwnerGiveItemsTask` into a fresh `OwnerGiveItemTask` per entry, best effort — an entry whose acquisition exhausts is skipped, the rest still deliver, and the goal ends `BLOCKED/resource_unavailable` with a probe-authored detail naming delivered and missing items (`TaskTerminalResult.detail` overrides the supervisor's standard prose). Its `have`/`want` count whole entries, never item units, and `FetchItemsProbe` keeps advance monotone across item transitions by latching a per-entry score; the active entry's `PipelineProgress` restarts per item and must never be shared between entries. Duplicate entries merge everywhere they enter (registry coercion and `Goals.fetchItems`), because two consecutive `isEqual` children make PlayerEngine reuse the previous stopped child instead of restarting it.
+- The `ITEM_LIST` schema is authored pre-strict in `ToolRegistry.propertyOf`, like the contract tool: the OpenAI strict transform rewrites only the top level and its null stripping is shallow, so the nested entry carries its own `required` (every nested field) and `additionalProperties: false`, and Anthropic takes the same shape verbatim. `ContractCoverage` counts both `fetch` and `fetch_items` toward deliverable coverage from the raw wire JSON.
+- An "unavailable" resource is only cleanly unavailable to `ResilientAcquisitionTask` when nothing in the inventory feeds its craft macro. In the best-effort autotest, holding oak planks alongside an impossible bucket let the bucket attempt craft a table, register inventory progress, and fund retries past the scenario cap; the held second entry must be inert to the first entry's pipeline (dirt), not an ingredient of it.
 - A loaded Fabric `FakePlayer` is not necessarily in the connected-player list. Owner resolution should first check connected players and then loaded `ServerPlayer` entities. In delivery tests, vanilla `FakePlayer.playerTouch` may remove an item entity while its old stack object remains readable; phantom-drop assertions should cover entities collected by `CompanionEntity`, while delivery success is verified from the fake owner's inventory.
 - A headless mob fixture must set its vanilla retaliation state directly. `EntityHelper.isAngryAtPlayer` requires `mob.getTarget() == companion`, and letting the kill aura bootstrap that state makes the scenario depend on PlayerEngine state that is created once per companion and reset by nothing.
 - Replacing a chest or furnace fixture with air invokes vanilla container removal and drops its contents. Empty test containers before removing their blocks, or the companion can collect the drops in the next scenario and create misleading results such as `withdraw 6/4`; changing fixture coordinates or adding task-drain delays does not prevent those world item drops.
@@ -67,6 +70,15 @@ change stashed, so it is not order-sensitivity and not a regression — the full
 therefore CI, is red until it is fixed. Its sibling `smelt_wall_reach` passes, so the reach rule
 itself works for furnaces; suspect the withdraw path added in "Prevent container access through
 walls".
+
+`llm_live` fails on `master` (verified 2026-08-05 on a clean checkout with all local work stashed):
+live `claude-sonnet-5` at `effort=medium` reliably answers the action order with an empty
+`thinking` block plus correct tool calls — contract, fetch, goto — and **no text block**, which
+`PlannerProtocol.assemble` rejects as `action reply had no assistant speech` (three consecutive
+live calls, identical shape). The plan content is right; only the mandated speech line is missing,
+so the candidate fixes are a prompt nudge that survives `tool_choice: {"type": "auto"}`, treating a
+speechless action reply as a repairable violation instead of a parse failure, or synthesizing
+placeholder speech. The offline suite is unaffected because fixtures always carry a message.
 
 ## Where this is going
 

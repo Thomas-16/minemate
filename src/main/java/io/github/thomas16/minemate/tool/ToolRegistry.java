@@ -8,6 +8,7 @@ import com.player2.playerengine.TaskCatalogue;
 import io.github.thomas16.minemate.task.ExecutionScope;
 import io.github.thomas16.minemate.task.Goal;
 import io.github.thomas16.minemate.task.Goals;
+import io.github.thomas16.minemate.task.ItemQuantity;
 import io.github.thomas16.minemate.task.Reasons;
 
 import net.minecraft.core.BlockPos;
@@ -34,6 +35,7 @@ import java.util.UUID;
 public final class ToolRegistry {
 
     private static final int MAX_COUNT = 2304;
+    private static final int MAX_ITEM_ENTRIES = 8;
     private static final int WORLD_LIMIT = 30_000_000;
 
     private static ToolRegistry defaults;
@@ -144,6 +146,58 @@ public final class ToolRegistry {
                 } catch (IllegalArgumentException error) {
                     yield reject(Reasons.INVALID_ARGUMENT, param.name() + " must be an entity UUID");
                 }
+            }
+            case ITEM_LIST -> {
+                if (!raw.isJsonArray()) {
+                    yield reject(Reasons.INVALID_ARGUMENT,
+                            param.name() + " must be an array of {item, count} entries");
+                }
+                JsonArray array = raw.getAsJsonArray();
+                if (array.isEmpty() || array.size() > MAX_ITEM_ENTRIES) {
+                    yield reject(Reasons.ARGUMENT_OUT_OF_RANGE,
+                            param.name() + " must contain 1 to " + MAX_ITEM_ENTRIES + " entries");
+                }
+                Map<String, Integer> merged = new LinkedHashMap<>();
+                for (JsonElement element : array) {
+                    if (!element.isJsonObject()) {
+                        reject(Reasons.INVALID_ARGUMENT,
+                                param.name() + " entries must be {item, count} objects");
+                    }
+                    JsonObject entry = element.getAsJsonObject();
+                    // Unknown keys reject rather than vanish, for the same reason as validate().
+                    for (String key : entry.keySet()) {
+                        if (!"item".equals(key) && !"count".equals(key)) {
+                            reject(Reasons.UNKNOWN_ARGUMENT, key);
+                        }
+                    }
+                    JsonElement itemRaw = entry.get("item");
+                    if (itemRaw == null || !itemRaw.isJsonPrimitive()
+                            || !itemRaw.getAsJsonPrimitive().isString()) {
+                        reject(Reasons.INVALID_ARGUMENT,
+                                param.name() + " entry item must be a resource name string");
+                    }
+                    String itemName = itemRaw.getAsString().strip();
+                    if (!TaskCatalogue.taskExists(itemName)) {
+                        reject(Reasons.UNKNOWN_RESOURCE, itemName);
+                    }
+                    JsonElement countRaw = entry.get("count");
+                    if (countRaw == null || countRaw.isJsonNull()) {
+                        reject(Reasons.MISSING_ARGUMENT, "count for " + itemName);
+                    }
+                    double value = number(param, countRaw);
+                    if (value != Math.floor(value)) {
+                        reject(Reasons.INVALID_ARGUMENT,
+                                param.name() + " entry count must be a whole number");
+                    }
+                    int total = merged.merge(itemName, (int) value, Integer::sum);
+                    if ((int) value < 1 || total > MAX_COUNT) {
+                        reject(Reasons.ARGUMENT_OUT_OF_RANGE,
+                                "count must be between 1 and " + MAX_COUNT + " for " + itemName);
+                    }
+                }
+                yield merged.entrySet().stream()
+                        .map(e -> new ItemQuantity(e.getKey(), e.getValue()))
+                        .toList();
             }
             case BLOCK_POS -> {
                 if (!raw.isJsonArray() || raw.getAsJsonArray().size() != 3) {
@@ -285,6 +339,35 @@ public final class ToolRegistry {
                 property.addProperty("minItems", 3);
                 property.addProperty("maxItems", 3);
             }
+            case ITEM_LIST -> {
+                // Written pre-strict - the entry object carries its own required list and
+                // additionalProperties: false - because the OpenAI strict transform rewrites only
+                // the top level of a tool's parameters, and its null stripping is shallow, so
+                // every nested field must be required. Anthropic takes this shape verbatim.
+                JsonObject itemProperty = new JsonObject();
+                itemProperty.addProperty("type", "string");
+                itemProperty.addProperty("description", "Plain resource name, e.g. 'stone_pickaxe'.");
+                JsonObject countProperty = new JsonObject();
+                countProperty.addProperty("type", "integer");
+                countProperty.addProperty("minimum", 1);
+                countProperty.addProperty("maximum", MAX_COUNT);
+                countProperty.addProperty("description", "How many the owner should receive in total.");
+                JsonObject entryProperties = new JsonObject();
+                entryProperties.add("item", itemProperty);
+                entryProperties.add("count", countProperty);
+                JsonArray entryRequired = new JsonArray();
+                entryRequired.add("item");
+                entryRequired.add("count");
+                JsonObject entry = new JsonObject();
+                entry.addProperty("type", "object");
+                entry.add("properties", entryProperties);
+                entry.add("required", entryRequired);
+                entry.addProperty("additionalProperties", false);
+                property.addProperty("type", "array");
+                property.add("items", entry);
+                property.addProperty("minItems", 1);
+                property.addProperty("maxItems", MAX_ITEM_ENTRIES);
+            }
             default -> property.addProperty("type", "string");
         }
         property.addProperty("description", param.description());
@@ -306,6 +389,14 @@ public final class ToolRegistry {
                         List.of(ToolParam.resource("resource", "Resource to acquire if needed and deliver, "
                                 + "including one already held."), count),
                         (args, ctx) -> Goals.fetch(args.getString("resource"), args.getInt("count"))),
+
+                new ToolDescriptor("fetch_items", "Deliver a set of final items to the owner in one "
+                        + "order: each item is acquired or crafted if needed, then delivered in "
+                        + "sequence; an item that proves unavailable is skipped and reported at the end.",
+                        ExecutionScope.COMPOSITE,
+                        List.of(ToolParam.itemList("items",
+                                "The final deliverables as {item, count} entries, e.g. a full tool set.")),
+                        (args, ctx) -> Goals.fetchItems(args.getItemQuantities("items"))),
 
                 new ToolDescriptor("craft", "Craft an item, gathering and crafting its ingredients as needed; "
                         + "the output remains with the companion.",

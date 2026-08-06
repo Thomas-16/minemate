@@ -38,10 +38,12 @@ public final class PlannerPrompt {
               tools that do the work. Declaring the contract alone is not a plan. Do not repeat
               the contract on a replan of the same order, and never call it with a terminal
               status.
-            - When deliver_to_owner is true, the same reply must include a fetch call for each
-              deliverable with at least the declared count, unless all %d calls are used and the
-              reply ends at a useful checkpoint. fetch acquires or crafts the item as needed and
-              delivers it; craft alone leaves the output with you.
+            - When deliver_to_owner is true, the same reply must cover every deliverable with at
+              least its declared count, unless all %d calls are used and the reply ends at a
+              useful checkpoint: use one fetch_items call listing all the deliverables when the
+              order names more than one final item, or a fetch call for a single deliverable.
+              fetch and fetch_items acquire or craft each item as needed and deliver it; craft
+              alone leaves the output with you.
             - A terminal reply is exactly one report_order_status call, no world-tool calls, and no
               separate assistant message. Use COMPLETED, ANSWERED, CLARIFICATION, UNSUPPORTED, or
               BLOCKED. COMPLETED is valid only when the snapshot proves the order is satisfied. Use

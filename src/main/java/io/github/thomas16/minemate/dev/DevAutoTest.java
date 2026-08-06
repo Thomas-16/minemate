@@ -14,6 +14,7 @@ import io.github.thomas16.minemate.task.ExecutionScope;
 import io.github.thomas16.minemate.task.GoalExecutionProfile;
 import io.github.thomas16.minemate.task.GoalProgress;
 import io.github.thomas16.minemate.task.Goals;
+import io.github.thomas16.minemate.task.ItemQuantity;
 import io.github.thomas16.minemate.task.OutcomeStatus;
 import io.github.thomas16.minemate.task.Reasons;
 import io.github.thomas16.minemate.task.TaskListener;
@@ -111,6 +112,7 @@ public final class DevAutoTest {
             "craft_success",
             "fetch_oak_boat_delivery",
             "fetch_plain_resource",
+            "fetch_items_delivery",
             "smelt_success",
             "smelt_wall_reach",
             "deposit_success",
@@ -128,6 +130,7 @@ public final class DevAutoTest {
             "llm_http_error",
             "llm_talk_only",
             "llm_contract_repair",
+            "llm_fetch_items_coverage",
             "llm_contract_only_continuation",
             "llm_contract_only_exhausted",
             "llm_contract_exhausted",
@@ -143,6 +146,12 @@ public final class DevAutoTest {
             UUID.fromString("4d1af7d3-9c26-4b8e-b1d2-6f0e58c92a41");
     private static final UUID UNAVAILABLE_FETCH_OWNER_UUID =
             UUID.fromString("a92c33e5-1e74-4f0a-bd68-30c5f1de77b2");
+    private static final UUID FETCH_ITEMS_OWNER_UUID =
+            UUID.fromString("6c1f4b8e-2d3a-4c5f-9b7e-1a2d3f4c5b6e");
+    private static final UUID BEST_EFFORT_OWNER_UUID =
+            UUID.fromString("9d8c7b6a-5e4f-4a3b-8c2d-7f6e5d4c3b2a");
+    private static final UUID FETCH_ITEMS_LLM_OWNER_UUID =
+            UUID.fromString("2e7a9c4d-8b1f-4e6a-a3c5-9d8e7f6a5b4c");
     /**
      * llm_claude_plan completes a real delivery, and a FakePlayer that has been delivered to,
      * discarded and re-added from Fabric's profile cache stops receiving deliveries. Every
@@ -379,6 +388,29 @@ public final class DevAutoTest {
                         ignoredServer -> prepareFetchUnavailable(),
                         DevAutoTest::clearFetchUnavailable,
                         DevAutoTest::craftSearchWindowInvariant),
+                // One goal, several final items, delivered in sequence. Both entries are already
+                // held, so this exercises pure sequential delivery and the entries-delivered
+                // outcome shape without acquisition time.
+                new Scenario("fetch_items_delivery",
+                        ignored -> Goals.fetchItems(List.of(new ItemQuantity("oak_planks", 4),
+                                new ItemQuantity("stick", 4))),
+                        DevAutoTest::acceptFetchItemsDelivery,
+                        2400,
+                        ignoredServer -> prepareFetchItemsDelivery(),
+                        DevAutoTest::clearFetchItemsDelivery,
+                        () -> null),
+                // Best effort: the unavailable first entry is skipped, the held second entry still
+                // delivers, and the outcome is an honest BLOCKED whose detail names both. The held
+                // item must be useless to the bucket pipeline - held planks fund a crafting table
+                // and the attempt "makes progress" instead of exhausting - so it is dirt.
+                new Scenario("fetch_items_best_effort",
+                        ignored -> Goals.fetchItems(List.of(new ItemQuantity("bucket", 1),
+                                new ItemQuantity("dirt", 2))),
+                        DevAutoTest::acceptFetchItemsBestEffort,
+                        4000,
+                        ignoredServer -> prepareFetchItemsBestEffort(),
+                        DevAutoTest::clearFetchItemsBestEffort,
+                        () -> null),
                 new Scenario("craft_no_recipe",
                         ignored -> Goals.craft(companion, Items.BEDROCK, 1),
                         outcome -> outcome.status() == OutcomeStatus.BLOCKED
@@ -705,6 +737,15 @@ public final class DevAutoTest {
                         () -> llmContractRepairVerdict("does not fetch 1 iron_sword"),
                         400,
                         ignoredServer -> prepareLlmContractRepair(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // One fetch_items call covering a two-deliverable contract is accepted without a
+                // repair round, executes as one plan step, and really delivers both items.
+                Scenario.plan("llm_fetch_items_coverage",
+                        ignored -> null,
+                        DevAutoTest::acceptLlmFetchItemsCoverage,
+                        2400,
+                        ignoredServer -> prepareLlmFetchItemsCoverage(),
                         DevAutoTest::clearLlmPlanner,
                         () -> null),
                 // The single-call habit is absorbed without spending the repair: a contract-only
@@ -1319,6 +1360,23 @@ public final class DevAutoTest {
                         llmCall("craft", "{\"item\":\"iron_sword\",\"count\":1}"),
                         llmCall("fetch", "{\"resource\":\"iron_sword\",\"count\":1}")))), 0);
         requestLlmPlan("make me an iron sword");
+    }
+
+    /**
+     * The multi-item shape fetch_items exists for: one call covers a two-deliverable contract, so
+     * coverage passes without a repair round and the whole order is one plan step. Both items are
+     * preloaded, keeping the scenario to sequential delivery time.
+     */
+    private static void prepareLlmFetchItemsCoverage() {
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 2), new ItemStack(Items.STICK, 1));
+        prepareFakeOwner(FETCH_ITEMS_LLM_OWNER_UUID, "MineMateFetchItemsLlmOwner");
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("Bringing you the planks and the stick.",
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2},"
+                                + "{\"item\":\"stick\",\"count\":1}]", true),
+                        llmCall("fetch_items", "{\"items\":[{\"item\":\"oak_planks\",\"count\":2},"
+                                + "{\"item\":\"stick\",\"count\":1}]}")))), 0);
+        requestLlmPlan("bring me two oak planks and a stick");
     }
 
     /**
@@ -2045,6 +2103,26 @@ public final class DevAutoTest {
         return accepted;
     }
 
+    private static boolean acceptLlmFetchItemsCoverage(PlanOutcome outcome) {
+        int planks = fakeOwnerInventoryCount(Items.OAK_PLANKS);
+        int sticks = fakeOwnerInventoryCount(Items.STICK);
+        boolean accepted = outcome.status() == PlanStatus.SUCCEEDED
+                && outcome.completedSteps() == 1
+                && outcome.totalSteps() == 1
+                && outcome.stepOutcomes().size() == 1
+                && "fetch_items".equals(outcome.stepOutcomes().get(0).call().tool())
+                // One request: the single fetch_items call satisfied coverage with no repair round.
+                && llmTransport != null && llmTransport.calls() == 1
+                && planks >= 2 && sticks >= 1;
+        if (!accepted) {
+            MineMate.LOGGER.error(
+                    "[autotest] llm_fetch_items_coverage postcondition {} requests={} planks={} sticks={}",
+                    outcome.toCompactString(), llmTransport == null ? -1 : llmTransport.calls(),
+                    planks, sticks);
+        }
+        return accepted;
+    }
+
     private static boolean acceptLlmUnknownTool(PlanOutcome outcome) {
         boolean accepted = outcome.status() == PlanStatus.REJECTED
                 && Reasons.UNKNOWN_TOOL.equals(outcome.reason())
@@ -2138,6 +2216,35 @@ public final class DevAutoTest {
                 || !nestedRequired.contains(JsonParser.parseString("\"item\""))
                 || !nestedRequired.contains(JsonParser.parseString("\"count\""))) {
             return "the contract deliverable did not require item and count";
+        }
+        // fetch_items carries the registry's own array-of-objects parameter through the same
+        // top-level-only transform, so its nested entry must also arrive pre-strict.
+        JsonObject fetchItemsTool = toolByName(tools, "fetch_items");
+        if (fetchItemsTool == null) {
+            return "the hosted schema omitted fetch_items";
+        }
+        JsonObject itemsProperty = fetchItemsTool.getAsJsonObject("parameters")
+                .getAsJsonObject("properties").getAsJsonObject("items");
+        JsonElement itemsType = itemsProperty.get("type");
+        if (!itemsType.isJsonPrimitive() || !"array".equals(itemsType.getAsString())) {
+            return "fetch_items.items is required and must keep a plain array type";
+        }
+        if (!itemsProperty.has("minItems") || !itemsProperty.has("maxItems")) {
+            return "fetch_items.items lost its length constraints";
+        }
+        JsonObject itemsEntry = itemsProperty.getAsJsonObject("items");
+        JsonElement entryAdditional = itemsEntry.get("additionalProperties");
+        if (entryAdditional == null || entryAdditional.getAsBoolean()) {
+            return "the fetch_items entry did not forbid additional properties";
+        }
+        JsonArray entryRequired = itemsEntry.getAsJsonArray("required");
+        if (entryRequired == null || entryRequired.size() != 2
+                || !entryRequired.contains(JsonParser.parseString("\"item\""))
+                || !entryRequired.contains(JsonParser.parseString("\"count\""))) {
+            return "the fetch_items entry did not require item and count";
+        }
+        if (!itemsEntry.getAsJsonObject("properties").getAsJsonObject("count").has("maximum")) {
+            return "the fetch_items entry count lost its range";
         }
         return nullStrippingViolation();
     }
@@ -2308,6 +2415,11 @@ public final class DevAutoTest {
         if (deposit == null || !deposit.getAsJsonObject("input_schema").getAsJsonObject("properties")
                 .getAsJsonObject("container").has("minItems")) {
             return "deposit.container lost its length constraint";
+        }
+        JsonObject fetchItems = toolByName(sentTools, "fetch_items");
+        if (fetchItems == null || !fetchItems.getAsJsonObject("input_schema")
+                .getAsJsonObject("properties").getAsJsonObject("items").has("maxItems")) {
+            return "fetch_items.items lost its length constraint";
         }
         JsonArray system = body.getAsJsonArray("system");
         if (system == null || system.size() != 1) {
@@ -2701,8 +2813,8 @@ public final class DevAutoTest {
      */
     private static String toolRegistryViolation() {
         ToolRegistry registry = ToolRegistry.defaults();
-        if (registry.tools().size() != 9) {
-            return "expected 9 tools, found " + registry.tools().size();
+        if (registry.tools().size() != 10) {
+            return "expected 10 tools, found " + registry.tools().size();
         }
         String rejected = expectRejected(registry, ToolCall.of("teleport"), Reasons.UNKNOWN_TOOL);
         if (rejected != null) {
@@ -2749,6 +2861,54 @@ public final class DevAutoTest {
             return rejected;
         }
 
+        // fetch_items: per-entry validation of the one array-of-objects parameter.
+        rejected = expectRejected(registry,
+                fetchItemsCall("[{\"item\":\"unobtainium\",\"count\":1}]"),
+                Reasons.UNKNOWN_RESOURCE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry, fetchItemsCall("[]"), Reasons.ARGUMENT_OUT_OF_RANGE);
+        if (rejected != null) {
+            return rejected;
+        }
+        StringBuilder nineEntries = new StringBuilder("[");
+        for (int index = 0; index < 9; index++) {
+            if (index > 0) {
+                nineEntries.append(',');
+            }
+            nineEntries.append("{\"item\":\"stick\",\"count\":").append(index + 1).append('}');
+        }
+        rejected = expectRejected(registry, fetchItemsCall(nineEntries.append(']').toString()),
+                Reasons.ARGUMENT_OUT_OF_RANGE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry, fetchItemsCall("[{\"item\":\"stick\",\"count\":0}]"),
+                Reasons.ARGUMENT_OUT_OF_RANGE);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry,
+                fetchItemsCall("[{\"item\":\"stick\",\"count\":1,\"extra\":true}]"),
+                Reasons.UNKNOWN_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        rejected = expectRejected(registry, fetchItemsCall("[{\"item\":\"stick\"}]"),
+                Reasons.MISSING_ARGUMENT);
+        if (rejected != null) {
+            return rejected;
+        }
+        // Duplicate entries merge deterministically instead of failing an otherwise-good plan.
+        ToolValidation mergedItems = registry.validate(fetchItemsCall(
+                "[{\"item\":\"stick\",\"count\":2},{\"item\":\"stick\",\"count\":3}]"));
+        if (!(mergedItems instanceof ToolValidation.Accepted acceptedItems)
+                || acceptedItems.arguments().getItemQuantities("items").size() != 1
+                || acceptedItems.arguments().getItemQuantities("items").get(0).count() != 5) {
+            return "duplicate fetch_items entries did not merge";
+        }
+
         // A count arriving as a JSON string is the most common real planner slip; coerce it.
         ToolValidation coerced = registry.validate(
                 ToolCall.of("mine").with("resource", "dirt").with("count", "4"));
@@ -2782,6 +2942,13 @@ public final class DevAutoTest {
             return "the tool schema was not emitted";
         }
         return null;
+    }
+
+    /** Builds a fetch_items call from raw items JSON; ToolCall.with has no JSON-element overload. */
+    private static ToolCall fetchItemsCall(String itemsJson) {
+        JsonObject arguments = new JsonObject();
+        arguments.add("items", JsonParser.parseString(itemsJson));
+        return new ToolCall("fetch_items", arguments);
     }
 
     private static String expectRejected(ToolRegistry registry, ToolCall call, String expectedReason) {
@@ -2922,6 +3089,69 @@ public final class DevAutoTest {
         clearFixtures();
     }
 
+    private static void prepareFetchItemsDelivery() {
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 4), new ItemStack(Items.STICK, 4));
+        prepareFakeOwner(FETCH_ITEMS_OWNER_UUID, "MineMateFetchItemsOwner");
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+    }
+
+    private static void clearFetchItemsDelivery(MinecraftServer server) {
+        clearFakeOwner();
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        clearFixtures();
+    }
+
+    private static boolean acceptFetchItemsDelivery(TaskOutcome outcome) {
+        int planks = fakeOwnerInventoryCount(Items.OAK_PLANKS);
+        int sticks = fakeOwnerInventoryCount(Items.STICK);
+        // have/want count whole entries, not item units: 2/2, never 8/8.
+        boolean accepted = succeeded(outcome) && planks >= 4 && sticks >= 4
+                && outcome.have() == 2 && outcome.want() == 2;
+        if (!accepted) {
+            MineMate.LOGGER.error(
+                    "[autotest] fetch_items postcondition planks={} sticks={} have={} want={} "
+                            + "outcome={} detail={}",
+                    planks, sticks, outcome.have(), outcome.want(),
+                    outcome.status() + "/" + outcome.reason(), outcome.detail());
+        }
+        return accepted;
+    }
+
+    private static void prepareFetchItemsBestEffort() {
+        prepareInventory(new ItemStack(Items.DIRT, 2));
+        prepareFakeOwner(BEST_EFFORT_OWNER_UUID, "MineMateBestEffortOwner");
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+    }
+
+    private static void clearFetchItemsBestEffort(MinecraftServer server) {
+        clearFakeOwner();
+        observedFetchDrops.clear();
+        observedFetchThrows.clear();
+        clearFixtures();
+    }
+
+    private static boolean acceptFetchItemsBestEffort(TaskOutcome outcome) {
+        int dirt = fakeOwnerInventoryCount(Items.DIRT);
+        boolean accepted = outcome.status() == OutcomeStatus.BLOCKED
+                && Reasons.RESOURCE_UNAVAILABLE.equals(outcome.reason())
+                && dirt >= 2
+                && outcome.have() == 1 && outcome.want() == 2
+                && outcome.detail() != null
+                && outcome.detail().contains("dirt")
+                && outcome.detail().contains("bucket");
+        if (!accepted) {
+            MineMate.LOGGER.error(
+                    "[autotest] fetch_items_best_effort postcondition dirt={} have={} want={} "
+                            + "outcome={} detail={}",
+                    dirt, outcome.have(), outcome.want(),
+                    outcome.status() + "/" + outcome.reason(), outcome.detail());
+        }
+        return accepted;
+    }
+
     private static void prepareFakeOwner(UUID ownerUuid, String ownerName) {
         ServerLevel level = (ServerLevel) companion.level();
         fakeOwner = FakePlayer.get(level, new GameProfile(ownerUuid, ownerName));
@@ -2998,7 +3228,7 @@ public final class DevAutoTest {
             return;
         }
         boolean fetchActive = companion.getSupervisor().currentGoal()
-                .map(goal -> "fetch".equals(goal.kind()))
+                .map(goal -> "fetch".equals(goal.kind()) || "fetch_items".equals(goal.kind()))
                 .orElse(false);
         ServerLevel level = (ServerLevel) companion.level();
         for (ItemEntity drop : level.getEntitiesOfClass(

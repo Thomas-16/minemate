@@ -16,6 +16,12 @@ public enum ParamType {
     BLOCK_POS,
     INT,
     NUMBER,
+    /**
+     * An array of {@code {item, count}} objects, where {@code item} is a PlayerEngine
+     * {@code TaskCatalogue} resource name and {@code count} is a positive integer. Duplicate
+     * items are merged by summing their counts.
+     */
+    ITEM_LIST,
     /** A player name, resolved when the goal is built rather than when the call is validated. */
     PLAYER,
     /** An entity UUID string, resolved when the goal is built. */

@@ -2,14 +2,10 @@ package io.github.thomas16.minemate.task;
 
 import com.player2.playerengine.TaskCatalogue;
 import com.player2.playerengine.tasks.ResourceTask;
-import com.player2.playerengine.tasks.base.Task;
-import com.player2.playerengine.tasks.crafting.CraftMacroTasks;
-import com.player2.playerengine.tasks.entity.GiveItemToPlayerTask;
 import com.player2.playerengine.tasks.entity.KillEntityTask;
 import com.player2.playerengine.tasks.movement.FollowPlayerTask;
 import com.player2.playerengine.tasks.movement.GetToXZTask;
 import com.player2.playerengine.util.ItemTarget;
-import com.player2.playerengine.util.helpers.StorageHelper;
 
 import io.github.thomas16.minemate.entity.CompanionEntity;
 
@@ -21,7 +17,10 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 
-import java.util.Optional;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /** Factory methods for the hardcoded stage-2 goal vocabulary. */
@@ -38,6 +37,45 @@ public final class Goals {
 
     public static Goal fetch(String resource, int count) {
         return collect("fetch", resource, count);
+    }
+
+    /**
+     * One goal that delivers several final items to the owner in sequence, best effort: an entry
+     * whose acquisition proves unavailable is skipped and reported in the outcome detail instead
+     * of sinking the rest of the set.
+     */
+    public static Goal fetchItems(List<ItemQuantity> items) {
+        if (items == null || items.isEmpty()) {
+            throw new IllegalArgumentException("Items must not be empty");
+        }
+        // Merge duplicates: two consecutive entries for the same item would build isEqual child
+        // tasks, and PlayerEngine reuses an equal previous child instead of restarting it.
+        LinkedHashMap<String, Integer> merged = new LinkedHashMap<>();
+        for (ItemQuantity item : items) {
+            if (!TaskCatalogue.taskExists(item.item())) {
+                throw new IllegalArgumentException(Reasons.UNKNOWN_RESOURCE + ": " + item.item());
+            }
+            merged.merge(item.item(), item.count(), Integer::sum);
+        }
+        List<OwnerGiveItemsTask.FetchEntry> entries = new ArrayList<>(merged.size());
+        StringBuilder description = new StringBuilder("fetch_items ");
+        for (Map.Entry<String, Integer> item : merged.entrySet()) {
+            entries.add(new OwnerGiveItemsTask.FetchEntry(item.getKey(), item.getValue(),
+                    TaskCatalogue.getItemMatches(item.getKey())));
+            if (entries.size() > 1) {
+                description.append(", ");
+            }
+            description.append(item.getValue()).append(' ').append(item.getKey());
+        }
+        List<OwnerGiveItemsTask.FetchEntry> bound = List.copyOf(entries);
+        return new Goal(Goal.nextId(), "fetch_items", description.toString(),
+                GoalExecutionProfile.composite(
+                        "May gather ingredients, craft tools, smelt, fight, and travel before each delivery"),
+                () -> new OwnerGiveItemsTask(bound),
+                new FetchItemsProbe(bound),
+                // Each entry gets a standalone fetch's budget. The tool schema bounds a call to
+                // 8 entries; note 6 or more would exceed the autotest harness's global tick cap.
+                items.size() * COLLECT_TIMEOUT_TICKS, 0);
     }
 
     public static Goal craft(CompanionEntity companion, Item output, int desiredTotal) {
@@ -162,19 +200,19 @@ public final class Goals {
                 COLLECT_TIMEOUT_TICKS, COLLECT_STALL_TICKS);
     }
 
-    private static int inventoryCount(GoalProbe.Context context, Item[] matches) {
+    static int inventoryCount(GoalProbe.Context context, Item[] matches) {
         return context.controller().getItemStorage().getItemCountInventoryOnly(matches);
     }
 
-    private static ServerPlayer owner(GoalProbe.Context context) {
+    static ServerPlayer owner(GoalProbe.Context context) {
         return owner(context.companion());
     }
 
-    private static ServerPlayer owner(CompanionEntity companion) {
+    static ServerPlayer owner(CompanionEntity companion) {
         return companion.resolveOwner().orElse(null);
     }
 
-    private static int playerInventoryCount(ServerPlayer player, Item[] matches) {
+    static int playerInventoryCount(ServerPlayer player, Item[] matches) {
         int count = 0;
         for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
             ItemStack stack = player.getInventory().getItem(slot);
@@ -308,147 +346,4 @@ public final class Goals {
         }
     }
 
-    /** Resolves the persisted MineMate owner only after PlayerEngine assigns the task. */
-    private static final class OwnerGiveItemTask extends Task {
-        private final String resource;
-        private final int count;
-        private final Item[] matches;
-        private ItemTarget target;
-        private Task acquisition;
-        private GiveItemToPlayerTask delivery;
-        private String ownerName;
-        private String acquisitionFailure;
-        private int ownerBaseline;
-        private boolean acquisitionComplete;
-        private boolean acquisitionTicked;
-        private boolean done;
-
-        private OwnerGiveItemTask(String resource, int count, Item[] matches) {
-            this.resource = resource;
-            this.count = count;
-            this.matches = matches.clone();
-        }
-
-        @Override
-        protected void onStart() {
-            done = false;
-            acquisitionComplete = false;
-            acquisitionTicked = false;
-            acquisitionFailure = null;
-            acquisition = null;
-            delivery = null;
-            target = null;
-            ownerName = null;
-            if (!(controller.getEntity() instanceof CompanionEntity companion)) {
-                fail(Reasons.OWNER_OFFLINE);
-                return;
-            }
-            ServerPlayer owner = Goals.owner(companion);
-            if (owner == null) {
-                fail(Reasons.OWNER_OFFLINE);
-                return;
-            }
-            ownerName = owner.getGameProfile().getName();
-            ownerBaseline = playerInventoryCount(owner, matches);
-            target = new ItemTarget(resource, count);
-            acquisitionComplete = StorageHelper.itemTargetsMet(controller, target);
-            if (!acquisitionComplete) {
-                acquisition = createAcquisitionTask();
-            }
-        }
-
-        @Override
-        protected Task onTick() {
-            if (target == null) {
-                return null;
-            }
-            if (!acquisitionComplete) {
-                if (StorageHelper.itemTargetsMet(controller, target)) {
-                    acquisitionComplete = true;
-                } else {
-                    if (acquisition == null) {
-                        acquisition = createAcquisitionTask();
-                        acquisitionTicked = false;
-                    }
-                    // Only after the runner has had it. PlayerEngine assigns a task's controller
-                    // when it first ticks it, and ResourceTask.isFinished dereferences that
-                    // controller, so asking a freshly created task whether it is finished throws
-                    // and takes the server down with it. It never showed up for oak_boat because
-                    // that resolves to a craft macro, whose isFinished touches no controller.
-                    if (acquisitionTicked && (acquisition.stopped() || acquisition.isFinished())) {
-                        // The wrapper only stops short of the target once its local re-plan
-                        // attempts are exhausted, so failing here is legitimate.
-                        acquisitionFailure = acquisition instanceof ResilientAcquisitionTask resilient
-                                ? resilient.terminalFailure().orElse(Reasons.RESOURCE_UNAVAILABLE)
-                                : Reasons.RESOURCE_UNAVAILABLE;
-                        fail(acquisitionFailure);
-                        return null;
-                    }
-                    acquisitionTicked = true;
-                    setDebugState("Acquiring " + resource + " for owner");
-                    return acquisition;
-                }
-            }
-            if (delivery == null) {
-                delivery = new GiveItemToPlayerTask(ownerName, target);
-            }
-            if (ownerReceivedItems()) {
-                done = true;
-                stop();
-                return null;
-            }
-            if (delivery.stopped() || delivery.isFinished()) {
-                setDebugState("Waiting for owner to pick up " + resource);
-                return null;
-            }
-            setDebugState("Delivering " + resource + " to owner");
-            return delivery;
-        }
-
-        private boolean ownerReceivedItems() {
-            if (!(controller.getEntity() instanceof CompanionEntity companion)) {
-                return false;
-            }
-            ServerPlayer owner = Goals.owner(companion);
-            return owner != null && playerInventoryCount(owner, matches) >= ownerBaseline + count;
-        }
-
-        private Task createAcquisitionTask() {
-            return new ResilientAcquisitionTask(target, () -> {
-                CraftMacroTasks.MacroProbe macro = CraftMacroTasks.macroOutcome(controller, target);
-                if (macro.outcome() == CraftMacroTasks.MacroOutcome.MACRO_CREATED
-                        && macro.taskOrNull() != null) {
-                    return macro.taskOrNull();
-                }
-                return TaskCatalogue.getItemTask(resource, count);
-            }, resource);
-        }
-
-        @Override
-        public boolean isFinished() {
-            return done;
-        }
-
-        @Override
-        protected void onStop(Task interruptTask) {
-        }
-
-        @Override
-        protected boolean isEqual(Task other) {
-            return other instanceof OwnerGiveItemTask fetch
-                    && resource.equals(fetch.resource) && count == fetch.count;
-        }
-
-        @Override
-        protected String toDebugString() {
-            return "Fetch %d %s for owner".formatted(count, resource);
-        }
-
-        private Optional<String> resourceFailure() {
-            // Only the latched terminal failure. A live scan of the sub-chain here turned any
-            // transient descendant failure reason into an instant BLOCKED for a working pipeline;
-            // ResilientAcquisitionTask now owns tree observation and retries.
-            return Optional.ofNullable(acquisitionFailure);
-        }
-    }
 }

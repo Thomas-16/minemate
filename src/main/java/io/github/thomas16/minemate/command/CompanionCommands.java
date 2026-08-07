@@ -15,9 +15,8 @@ import io.github.thomas16.minemate.task.TaskActivitySnapshot;
 import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.integration.ReflexSnapshot;
 import io.github.thomas16.minemate.planner.HostedPlanner;
-import io.github.thomas16.minemate.planner.PlanRequest;
 import io.github.thomas16.minemate.planner.Planner;
-import io.github.thomas16.minemate.planner.PlannerDispatch;
+import io.github.thomas16.minemate.planner.PlannerRequests;
 import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
 import io.github.thomas16.minemate.planner.StandingOrder;
@@ -168,11 +167,7 @@ public final class CompanionCommands {
         if (Planners.active() instanceof ScriptedPlanner scripted) {
             scripted.bind(companion);
         }
-        WorldSnapshot snapshot = companion.getContext().snapshot();
-        PlanRequest request = new PlanRequest(requestText,
-                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
-                ToolRegistry.defaults().schemaJson());
-        PlannerDispatch.request(companion, Planners.active(), request);
+        PlannerRequests.owner(companion, Planners.active(), requestText);
         source.sendSuccess(() -> Component.literal("Planning: " + requestText), false);
         return 1;
     }

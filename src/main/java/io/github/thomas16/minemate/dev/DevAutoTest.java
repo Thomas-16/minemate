@@ -27,6 +27,8 @@ import net.fabricmc.fabric.api.entity.FakePlayer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.Difficulty;
@@ -52,32 +54,39 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import io.github.thomas16.minemate.chat.CompanionSpeech;
 import io.github.thomas16.minemate.context.CompanionJournal;
+import io.github.thomas16.minemate.context.ConversationLog;
 import io.github.thomas16.minemate.context.EventKind;
 import io.github.thomas16.minemate.context.JournalEntry;
 import io.github.thomas16.minemate.context.WorldSnapshot;
+import io.github.thomas16.minemate.planner.CompanionResponse;
 import io.github.thomas16.minemate.planner.ContractCoverage;
 import io.github.thomas16.minemate.planner.HostedPlanner;
+import io.github.thomas16.minemate.planner.OrderCloseStatus;
 import io.github.thomas16.minemate.planner.OrderContract;
 import io.github.thomas16.minemate.planner.OrderLedger;
 import io.github.thomas16.minemate.planner.Plan;
-import io.github.thomas16.minemate.planner.PlanDisposition;
 import io.github.thomas16.minemate.planner.PlanExecutor;
 import io.github.thomas16.minemate.planner.PlanOutcome;
 import io.github.thomas16.minemate.planner.PlanRequest;
 import io.github.thomas16.minemate.planner.PlanStatus;
 import io.github.thomas16.minemate.planner.PlanStep;
 import io.github.thomas16.minemate.planner.PlanStepOutcome;
+import io.github.thomas16.minemate.planner.Planner;
 import io.github.thomas16.minemate.planner.PlannerAutonomy;
 import io.github.thomas16.minemate.planner.PlannerConfig;
 import io.github.thomas16.minemate.planner.PlannerDispatch;
+import io.github.thomas16.minemate.planner.PlannerRequests;
 import io.github.thomas16.minemate.planner.Planners;
+import io.github.thomas16.minemate.planner.RequestOrigin;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
 import io.github.thomas16.minemate.planner.StandingOrder;
 import io.github.thomas16.minemate.planner.llm.AnthropicMessagesBackend;
 import io.github.thomas16.minemate.planner.llm.LlmException;
 import io.github.thomas16.minemate.planner.llm.LlmPrompt;
 import io.github.thomas16.minemate.planner.llm.LlmReply;
+import io.github.thomas16.minemate.planner.llm.LlmTurn;
 import io.github.thomas16.minemate.planner.llm.OpenAiResponsesBackend;
 import io.github.thomas16.minemate.planner.llm.OpenAiToolSchemas;
 import io.github.thomas16.minemate.planner.llm.PlannerPrompt;
@@ -96,6 +105,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -137,13 +147,18 @@ public final class DevAutoTest {
             "llm_speechless_action",
             "llm_malformed_output",
             "llm_http_error",
-            "llm_talk_only",
+            "conversation_speech_only",
+            "llm_multi_turn_wire",
+            "llm_claude_multi_turn_wire",
+            "llm_cancelled_close",
             "llm_contract_repair",
             "llm_fetch_items_coverage",
             "llm_contract_only_continuation",
             "llm_contract_only_exhausted",
             "llm_contract_exhausted",
-            "llm_answered",
+            "conversation_transcript_eviction",
+            "conversation_transcript_nbt",
+            "conversation_named_output",
             "order_ledger",
             "llm_completed_with_receipt",
             "llm_completed_denied_close",
@@ -208,7 +223,7 @@ public final class DevAutoTest {
     private static boolean planSawForbiddenGoal;
     private static FixtureTransport llmTransport;
     private static boolean llmBudgetSawFinalPlanOpen;
-    private static Plan llmObservedLivePlan;
+    private static CompanionResponse llmObservedLiveResponse;
     private static boolean ownerDamageAccepted;
     private static boolean ownerDirectAttackBlocked;
     private static float companionHealthBeforeOwnerDamage;
@@ -759,9 +774,11 @@ public final class DevAutoTest {
                         ignoredServer -> prepareLlmPlan(FixtureTransport.hanging(), "mine something"),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
-                Scenario.probe("llm_talk_only",
-                        () -> llmPlannerSettled(),
-                        () -> llmFailureVerdict("missing status"),
+                // Speech-only is legal conversation now: the words reach the owner as the named
+                // companion, the provisional order is discarded silently, and nothing failed.
+                Scenario.probe("conversation_speech_only",
+                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::conversationSpeechOnlyViolation,
                         200,
                         ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
                                 llmResponse("You already have plenty of dirt."))),
@@ -856,16 +873,67 @@ public final class DevAutoTest {
                         ignoredServer -> prepareLlmContractExhausted(),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
-                Scenario.probe("llm_answered",
-                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
-                        () -> llmAnsweredVerdict("identity answer"),
+                // The multi-turn wire: seeded history reaches OpenAI as alternating input turns
+                // with tool_choice auto, and the newest turn carries snapshot, activity, and the
+                // fresh PLAYER line.
+                Scenario.probe("llm_multi_turn_wire",
+                        () -> llmPlannerSettled() && llmTransport != null
+                                && llmTransport.calls() == 1,
+                        DevAutoTest::llmMultiTurnWireViolation,
                         200,
-                        ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
-                                llmResponse(null, llmStatus("ANSWERED",
-                                        "My name is " + AUTOTEST_COMPANION_NAME + ".")))),
-                                "what's your name?"),
+                        ignoredServer -> prepareLlmMultiTurnWire(),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
+                // The Anthropic mirror, driven through the request builder directly: alternating
+                // messages, same-role collapse, and the two cached system blocks.
+                Scenario.probe("llm_claude_multi_turn_wire",
+                        () -> true,
+                        DevAutoTest::llmClaudeMultiTurnWireViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
+                // A natural mid-work cancellation: speech beside a CANCELLED status closes the
+                // order, the speech wins over the fallback message, and one line is remembered.
+                Scenario.probe("llm_cancelled_close",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && llmPlannerSettled() && companion.getStandingOrder() == null,
+                        DevAutoTest::llmCancelledCloseViolation,
+                        800,
+                        ignoredServer -> prepareLlmCancelledClose(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // Conversational memory: whole-turn-group eviction, entity NBT persistence, and
+                // the named speech gateway. Pure probes over the log and the live companion.
+                Scenario.probe("conversation_transcript_eviction",
+                        () -> true,
+                        DevAutoTest::conversationEvictionViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
+                Scenario.probe("conversation_transcript_nbt",
+                        () -> true,
+                        DevAutoTest::conversationNbtViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
+                Scenario.probe("conversation_named_output",
+                        () -> true,
+                        DevAutoTest::conversationNamedOutputViolation,
+                        20,
+                        ignoredServer -> {
+                        },
+                        ignoredServer -> {
+                        },
+                        () -> null),
                 // The order ledger's pure state machine and remainder coverage, no world needed.
                 Scenario.probe("order_ledger",
                         () -> true,
@@ -1321,8 +1389,8 @@ public final class DevAutoTest {
                 + "{\"tool\":\"goto\",\"arguments\":{\"x\":0,\"z\":0}}]");
         WorldSnapshot snapshot = companion.getContext().snapshot();
         PlannerDispatch.request(companion, planner, new PlanRequest("bad plan",
-                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
-                ToolRegistry.defaults().schemaJson()));
+                companion.getCompanionName().orElse(""), RequestOrigin.OWNER_CHAT, snapshot,
+                snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
     }
 
     private static boolean acceptPlanInvalidTool(PlanOutcome outcome) {
@@ -1434,11 +1502,15 @@ public final class DevAutoTest {
         // "no planner failure" would depend on which scenario ran before, which is exactly the
         // order-sensitivity this suite already has one known case of.
         companion.getJournal().clear();
+        // Same isolation reasoning: the conversation log outlives a scenario exactly like the
+        // journal ring, and speech-asserting verdicts must see only their own scenario's lines.
+        if (companion.getConversationLog() != null) {
+            companion.getConversationLog().clear();
+        }
         companion.openStandingOrder(requestText);
-        WorldSnapshot snapshot = companion.getContext().snapshot();
-        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(requestText,
-                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
-                ToolRegistry.defaults().schemaJson()));
+        // The same builder the command path uses, so what the suite exercises cannot drift from
+        // what the player's /companion plan does.
+        PlannerRequests.owner(companion, Planners.active(), requestText);
     }
 
     private static void prepareLlmReplanBudget() {
@@ -1645,6 +1717,10 @@ public final class DevAutoTest {
             }
             companion.closeStandingOrder();
         }
+        if (companion != null && companion.getConversationLog() != null) {
+            companion.getConversationLog().clear();
+        }
+        CompanionSpeech.setObserver(null);
         Planners.install(ScriptedPlanner.instance());
         llmTransport = null;
         clearFakeOwner();
@@ -1682,14 +1758,41 @@ public final class DevAutoTest {
                 file.apiKey().orElse(""), 60, 0);
         MineMate.LOGGER.info("[autotest] {} against {}", scenarioName, config.describe());
         llmTransport = null;
-        llmObservedLivePlan = null;
-        Planners.install(HostedPlanner.of(config));
+        llmObservedLiveResponse = null;
+        // The verdicts inspect the first raw CompanionResponse, before dispatch consumes its
+        // contract, so the hosted planner is wrapped with a capture-only delegate.
+        HostedPlanner hosted = HostedPlanner.of(config);
+        Planners.install(new Planner() {
+            @Override
+            public String name() {
+                return hosted.name();
+            }
+
+            @Override
+            public boolean requiresContract() {
+                return true;
+            }
+
+            @Override
+            public CompletableFuture<CompanionResponse> plan(PlanRequest request) {
+                return hosted.plan(request).whenComplete((response, error) -> {
+                    if (response != null && llmObservedLiveResponse == null) {
+                        llmObservedLiveResponse = response;
+                    }
+                });
+            }
+
+            @Override
+            public void close() {
+                hosted.close();
+            }
+        });
         companion.getJournal().clear();
+        if (companion.getConversationLog() != null) {
+            companion.getConversationLog().clear();
+        }
         companion.openStandingOrder(order);
-        WorldSnapshot snapshot = companion.getContext().snapshot();
-        PlannerDispatch.request(companion, Planners.active(), new PlanRequest(order,
-                companion.getCompanionName().orElse(""), snapshot, snapshot.render(), null,
-                ToolRegistry.defaults().schemaJson()));
+        PlannerRequests.owner(companion, Planners.active(), order);
     }
 
     private static final String LLM_LIVE_ORDER = "get me 2 dirt and then come stand next to me";
@@ -1721,8 +1824,7 @@ public final class DevAutoTest {
         if (executor.isPlannerRequestPending()) {
             return false;
         }
-        executor.currentPlan().ifPresent(plan -> llmObservedLivePlan = plan);
-        return llmObservedLivePlan != null || sawNewPlanOutcome()
+        return llmObservedLiveResponse != null || sawNewPlanOutcome()
                 || journalHas(EventKind.PLANNER_FAILED)
                 || companion.getStandingOrder() == null;
     }
@@ -1749,9 +1851,8 @@ public final class DevAutoTest {
         if (companion.getPlanExecutor().isActive()) {
             MineMate.LOGGER.info("[autotest] llm_live plan accepted: {}",
                     companion.getPlanExecutor().currentPlan()
-                            .map(plan -> "\"" + plan.dialogue() + "\" / " + plan.steps().size()
-                                    + " steps: " + plan.steps().stream()
-                                            .map(step -> step.call().toCompactString()).toList())
+                            .map(plan -> plan.steps().size() + " steps: " + plan.steps().stream()
+                                    .map(step -> step.call().toCompactString()).toList())
                             .orElse("?"));
             return null;
         }
@@ -1958,35 +2059,35 @@ public final class DevAutoTest {
         if (journalHas(EventKind.PLANNER_FAILED)) {
             return "the live multi-step planner failed; inspect logs/debug.log";
         }
-        Plan plan = llmObservedLivePlan;
-        if (plan == null) {
-            return "the live reply did not produce an inspectable action plan";
+        CompanionResponse response = llmObservedLiveResponse;
+        if (response == null) {
+            return "the live reply did not produce an inspectable response";
         }
-        if (plan.disposition() != PlanDisposition.ACTION || plan.steps().size() != 2) {
-            return "expected one two-action reply, got " + plan.disposition() + " with "
-                    + plan.steps().size() + " actions";
+        if (response.close() != null || response.actions().size() != 2) {
+            return "expected one two-action reply, got close=" + response.close() + " with "
+                    + response.actions().size() + " actions";
         }
-        ToolCall first = plan.steps().get(0).call();
-        ToolCall second = plan.steps().get(1).call();
+        ToolCall first = response.actions().get(0);
+        ToolCall second = response.actions().get(1);
         if (!"fetch".equals(first.tool()) || !"oak_boat".equals(argument(first, "resource"))) {
             return "first action was not fetch(oak_boat): " + first.toCompactString();
         }
         if (!"fetch".equals(second.tool()) || !"chest".equals(argument(second, "resource"))) {
             return "second action was not fetch(chest): " + second.toCompactString();
         }
-        if (plan.contract() == null) {
+        if (response.contract() == null) {
             return "the live reply did not declare an order contract";
         }
-        if (!plan.contract().deliverToOwner()
-                || plan.contract().deliverables().stream()
+        if (!response.contract().deliverToOwner()
+                || response.contract().deliverables().stream()
                         .noneMatch(deliverable -> "oak_boat".equals(deliverable.item()))
-                || plan.contract().deliverables().stream()
+                || response.contract().deliverables().stream()
                         .noneMatch(deliverable -> "chest".equals(deliverable.item()))) {
             return "the live contract did not cover oak_boat and chest for the owner: "
-                    + plan.contract();
+                    + response.contract();
         }
         MineMate.LOGGER.info("[autotest] llm_live_multi_step accepted first reply: {}",
-                plan.steps().stream().map(step -> step.call().toCompactString()).toList());
+                response.actions().stream().map(ToolCall::toCompactString).toList());
         return null;
     }
 
@@ -2167,41 +2268,374 @@ public final class DevAutoTest {
         return null;
     }
 
-    /** ANSWERED closes an informational or social order without touching the world. */
-    private static String llmAnsweredVerdict(String label) {
+    /** Speech-only is conversation: named speech delivered and remembered, no order lifecycle. */
+    private static String conversationSpeechOnlyViolation() {
         if (llmTransport.calls() != 1) {
-            return label + ": expected one request, saw " + llmTransport.calls();
+            return "expected one request, saw " + llmTransport.calls();
         }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "a speech-only reply was recorded as a planner failure";
+        }
+        if (sawNewPlanOutcome()) {
+            return "a speech-only reply reached PlanExecutor";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "a speech-only reply submitted a goal";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            return "a speech-only reply started a plan";
+        }
+        if (companion.getStandingOrder() != null) {
+            return "a speech-only reply left the provisional order open for autonomy";
+        }
+        List<ConversationLog.Entry> entries = companion.getConversationLog().snapshot();
+        if (entries.size() != 2) {
+            return "expected the exchange to be remembered as two entries, saw " + entries;
+        }
+        if (entries.get(0).kind() != ConversationLog.EntryKind.OWNER_UTTERANCE
+                || !"get me some dirt".equals(entries.get(0).text())) {
+            return "the owner utterance was not remembered: " + entries.get(0);
+        }
+        String expected = AUTOTEST_COMPANION_NAME + ": You already have plenty of dirt.";
+        if (entries.get(1).kind() != ConversationLog.EntryKind.COMPANION_UTTERANCE
+                || !expected.equals(entries.get(1).text())) {
+            return "the companion reply was not remembered as the named line: " + entries.get(1);
+        }
+        return null;
+    }
+
+    private static void prepareLlmMultiTurnWire() {
+        prepareInventory();
+        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("Right behind you."))), 0);
+        companion.getJournal().clear();
+        ConversationLog log = companion.getConversationLog();
+        log.clear();
+        long gameTime = companion.level().getGameTime();
+        log.recordOwner("hello there", gameTime);
+        log.recordCompanion(AUTOTEST_COMPANION_NAME + ": Hey! Good to see you.", gameTime);
+        log.recordActivity("delivered 1 crafting_table to owner", gameTime);
+        companion.openStandingOrder("where are you?");
+        PlannerRequests.owner(companion, Planners.active(), "where are you?");
+    }
+
+    /** The seeded history reaches the OpenAI wire as alternating turns with tool_choice auto. */
+    private static String llmMultiTurnWireViolation() {
         JsonObject requestBody;
         try {
             requestBody = JsonParser.parseString(llmTransport.lastRequestBody()).getAsJsonObject();
         } catch (RuntimeException error) {
-            return label + ": request body was not JSON: " + error.getMessage();
+            return "request body was not JSON: " + error.getMessage();
         }
-        String instructions = requestBody.has("instructions")
-                ? requestBody.get("instructions").getAsString() : "";
-        if (!instructions.contains(PlannerPrompt.identity(AUTOTEST_COMPANION_NAME))) {
-            return label + ": system instructions did not include the companion identity";
+        if (!"auto".equals(requestBody.get("tool_choice").getAsString())) {
+            return "tool_choice was not auto";
+        }
+        if (requestBody.get("store").getAsBoolean()) {
+            return "store was not false";
         }
         if (!requestBody.has("prompt_cache_key")) {
-            return label + ": the identity-aware OpenAI cache key was missing";
+            return "the prompt cache key was missing";
         }
-        if (journalHas(EventKind.PLANNER_FAILED)) {
-            return label + ": an ANSWERED terminal was recorded as a planner failure";
+        String instructions = requestBody.get("instructions").getAsString();
+        if (!instructions.contains(
+                PlannerPrompt.identity(AUTOTEST_COMPANION_NAME, "MineMateOwner"))) {
+            return "instructions did not carry the companion and player identity";
         }
-        if (sawNewPlanOutcome()) {
-            return label + ": an ANSWERED terminal reached PlanExecutor";
+        JsonArray input = requestBody.getAsJsonArray("input");
+        if (input == null || input.size() != 3) {
+            return "expected three input turns, saw " + (input == null ? 0 : input.size());
         }
-        if (companion.getSupervisor().currentGoal().isPresent()) {
-            return label + ": an ANSWERED terminal submitted a goal";
+        JsonObject first = input.get(0).getAsJsonObject();
+        JsonObject second = input.get(1).getAsJsonObject();
+        JsonObject third = input.get(2).getAsJsonObject();
+        if (!"user".equals(first.get("role").getAsString())
+                || !"PLAYER: hello there".equals(first.get("content").getAsString())) {
+            return "the first turn was not the historical player line: " + first;
         }
-        if (companion.getPlanExecutor().isActive()) {
-            return label + ": an ANSWERED terminal started a plan";
+        if (!"assistant".equals(second.get("role").getAsString())
+                || !"Hey! Good to see you.".equals(second.get("content").getAsString())) {
+            return "the assistant turn did not carry the prefix-stripped reply: " + second;
         }
+        String newest = third.get("content").getAsString();
+        if (!"user".equals(third.get("role").getAsString())) {
+            return "the newest turn was not a user turn";
+        }
+        if (!newest.contains("SELF")) {
+            return "the newest turn lost the world snapshot";
+        }
+        if (!newest.contains("ACTIVITY RECORD (game observations, not player speech):")
+                || !newest.contains("- delivered 1 crafting_table to owner")) {
+            return "the newest turn lost the activity record";
+        }
+        if (!newest.endsWith("PLAYER: where are you?")) {
+            return "the newest turn did not end with the fresh player line";
+        }
+        // The speech-only fixture reply must then land as conversation, not order lifecycle.
         if (companion.getStandingOrder() != null) {
-            return label + ": ANSWERED did not close the standing order";
+            return "the speech-only reply left the provisional order open";
         }
         return null;
+    }
+
+    /** The Anthropic mirror, plus same-role collapse and orphan-head dropping, builder-direct. */
+    private static String llmClaudeMultiTurnWireViolation() {
+        WorldSnapshot snapshot = companion.getContext().snapshot();
+        List<ConversationLog.Entry> transcript = List.of(
+                new ConversationLog.Entry(ConversationLog.EntryKind.COMPANION_UTTERANCE,
+                        AUTOTEST_COMPANION_NAME + ": An orphan head line.", 0),
+                new ConversationLog.Entry(ConversationLog.EntryKind.ACTIVITY,
+                        "plan ended succeeded (goal_met)", 1),
+                new ConversationLog.Entry(ConversationLog.EntryKind.OWNER_UTTERANCE,
+                        "hi", 2),
+                new ConversationLog.Entry(ConversationLog.EntryKind.COMPANION_UTTERANCE,
+                        AUTOTEST_COMPANION_NAME + ": Hello.", 3),
+                new ConversationLog.Entry(ConversationLog.EntryKind.COMPANION_UTTERANCE,
+                        AUTOTEST_COMPANION_NAME + ": Need anything?", 4));
+        PlanRequest request = new PlanRequest("come here", AUTOTEST_COMPANION_NAME,
+                RequestOrigin.OWNER_CHAT, snapshot, snapshot.render(), null,
+                ToolRegistry.defaults().schemaJson(), null, null, transcript, "MineMateOwner");
+        List<LlmTurn> turns = PlannerPrompt.turns(request);
+        if (turns.size() != 3) {
+            return "expected three rendered turns, saw " + turns.size();
+        }
+        String firstUser = turns.get(0).text();
+        if (turns.get(0).role() != LlmTurn.Role.USER
+                || firstUser.contains("orphan head")
+                || !firstUser.contains("- plan ended succeeded (goal_met)")
+                || !firstUser.endsWith("PLAYER: hi")) {
+            return "the first user turn was wrong: " + firstUser;
+        }
+        if (turns.get(1).role() != LlmTurn.Role.ASSISTANT
+                || !"Hello.\nNeed anything?".equals(turns.get(1).text())) {
+            return "consecutive assistant lines did not collapse: " + turns.get(1).text();
+        }
+        if (turns.get(2).role() != LlmTurn.Role.USER
+                || !turns.get(2).text().endsWith("PLAYER: come here")) {
+            return "the newest turn was wrong: " + turns.get(2).text();
+        }
+
+        String hostedSchema = PlannerProtocol.hostedSchema(ToolRegistry.defaults().schemaJson());
+        FixtureTransport transport = FixtureTransport.of(FixtureTransport.ok(
+                claudeResponse("Right here.")));
+        AnthropicMessagesBackend backend = new AnthropicMessagesBackend(transport,
+                "http://fixture.invalid/v1", "fixture-model", "fixture-key",
+                PlannerConfig.DEFAULT_EFFORT, PlannerConfig.DEFAULT_MAX_OUTPUT_TOKENS);
+        backend.complete(new LlmPrompt(PlannerPrompt.SYSTEM,
+                PlannerPrompt.identity(AUTOTEST_COMPANION_NAME, "MineMateOwner"), turns,
+                hostedSchema, ""));
+        JsonObject body;
+        try {
+            body = JsonParser.parseString(transport.lastRequestBody()).getAsJsonObject();
+        } catch (RuntimeException error) {
+            return "the request builder produced unparseable JSON: " + error;
+        }
+        JsonArray messages = body.getAsJsonArray("messages");
+        if (messages == null || messages.size() != 3) {
+            return "expected three wire messages, saw " + (messages == null ? 0 : messages.size());
+        }
+        String[] roles = {"user", "assistant", "user"};
+        for (int index = 0; index < 3; index++) {
+            JsonObject message = messages.get(index).getAsJsonObject();
+            if (!roles[index].equals(message.get("role").getAsString())
+                    || !turns.get(index).text().equals(message.get("content").getAsString())) {
+                return "wire message " + index + " did not carry its turn verbatim";
+            }
+        }
+        JsonArray system = body.getAsJsonArray("system");
+        if (system == null || system.size() != 2) {
+            return "the multi-turn request lost the two cached system blocks";
+        }
+        return null;
+    }
+
+    private static void prepareLlmCancelledClose() {
+        prepareInventory();
+        // One replan allowed: the plan-finished trigger fetches the CANCELLED close reply.
+        installLlmPlanner(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("On my way.",
+                        llmContract("[]", false),
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 2) + ",\"z\":" + spawn.getZ()
+                                + "}"))),
+                FixtureTransport.ok(llmResponse("Sure, dropping it.",
+                        llmStatus("CANCELLED", "Stopping.")))), 1);
+        requestLlmPlan("walk over there, actually never mind");
+    }
+
+    /** Speech beside a CANCELLED close: one displayed line, the speech, and the order closed. */
+    private static String llmCancelledCloseViolation() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "the cancelled order left a plan running";
+        }
+        if (companion.getStandingOrder() != null) {
+            return "the CANCELLED close did not close the standing order";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "a legal CANCELLED close was recorded as a planner failure";
+        }
+        List<ConversationLog.Entry> entries = companion.getConversationLog().snapshot();
+        String expected = AUTOTEST_COMPANION_NAME + ": Sure, dropping it.";
+        long closeLines = entries.stream()
+                .filter(entry -> entry.kind() == ConversationLog.EntryKind.COMPANION_UTTERANCE)
+                .filter(entry -> entry.text().contains("Sure, dropping it.")).count();
+        if (closeLines != 1) {
+            return "expected exactly one remembered close line, saw " + closeLines;
+        }
+        if (entries.stream().noneMatch(entry -> expected.equals(entry.text()))) {
+            return "the close speech was not remembered as the named line: " + entries;
+        }
+        if (entries.stream().anyMatch(entry -> entry.text().contains("Stopping."))) {
+            return "the fallback message was displayed despite nonblank speech";
+        }
+        return null;
+    }
+
+    /** Pure log semantics: eviction drops whole turn groups and never leaves an orphan head. */
+    private static String conversationEvictionViolation() {
+        // Turn bound: recording a third owner turn into a two-turn log drops the whole oldest
+        // group, including its leading activity and any leading assistant line before any owner
+        // ever spoke.
+        ConversationLog byTurns = new ConversationLog(2, 10_000);
+        byTurns.recordCompanion("Ada Stone: Hello there.", 0);
+        byTurns.recordActivity("a1", 1);
+        byTurns.recordOwner("o1", 2);
+        byTurns.recordCompanion("c1", 3);
+        byTurns.recordOwner("o2", 4);
+        byTurns.recordCompanion("c2", 5);
+        byTurns.recordOwner("o3", 6);
+        List<ConversationLog.Entry> entries = byTurns.snapshot();
+        if (entries.size() != 3) {
+            return "turn eviction kept " + entries.size() + " entries instead of 3";
+        }
+        if (entries.get(0).kind() != ConversationLog.EntryKind.OWNER_UTTERANCE
+                || !"o2".equals(entries.get(0).text())) {
+            return "turn eviction left the log starting with " + entries.get(0);
+        }
+        if (!"c2".equals(entries.get(1).text()) || !"o3".equals(entries.get(2).text())) {
+            return "turn eviction removed the wrong entries: " + entries;
+        }
+
+        // Char bound: three ~66-char groups against a 150-char budget keep only the newest group,
+        // and the survivor still begins with an owner utterance.
+        ConversationLog byChars = new ConversationLog(10, 150);
+        String fifty = "x".repeat(50);
+        for (int turn = 0; turn < 3; turn++) {
+            byChars.recordOwner(fifty + turn, turn * 2);
+            byChars.recordCompanion(fifty + turn, turn * 2 + 1);
+        }
+        entries = byChars.snapshot();
+        if (entries.size() != 2
+                || entries.get(0).kind() != ConversationLog.EntryKind.OWNER_UTTERANCE) {
+            return "char eviction did not reduce to the newest complete group: " + entries.size();
+        }
+
+        // The newest group is never split or dropped merely to satisfy the byte budget: one
+        // oversized single-turn conversation survives intact.
+        ConversationLog oversized = new ConversationLog(10, 150);
+        oversized.recordOwner(fifty, 0);
+        oversized.recordCompanion(fifty, 1);
+        oversized.recordCompanion(fifty + "b", 2);
+        if (oversized.size() != 3) {
+            return "the only turn group was split to satisfy the char budget";
+        }
+        return null;
+    }
+
+    /** Conversation survives the entity NBT round trip, and reading re-enforces bounds. */
+    private static String conversationNbtViolation() {
+        ConversationLog log = companion.getConversationLog();
+        if (log == null) {
+            return "the server-side companion had no conversation log";
+        }
+        try {
+            log.clear();
+            log.recordActivity("started: fetch 2 dirt (1 steps)", 10);
+            log.recordOwner("get me some dirt", 11);
+            log.recordCompanion("Ada Stone: On it.", 12);
+            CompoundTag saved = new CompoundTag();
+            companion.addAdditionalSaveData(saved);
+            log.clear();
+            companion.readAdditionalSaveData(saved);
+            List<ConversationLog.Entry> entries = log.snapshot();
+            if (entries.size() != 3) {
+                return "round trip kept " + entries.size() + " entries instead of 3";
+            }
+            if (entries.get(0).kind() != ConversationLog.EntryKind.ACTIVITY
+                    || entries.get(1).kind() != ConversationLog.EntryKind.OWNER_UTTERANCE
+                    || entries.get(2).kind() != ConversationLog.EntryKind.COMPANION_UTTERANCE) {
+                return "round trip lost entry kinds: " + entries;
+            }
+            if (!"get me some dirt".equals(entries.get(1).text())
+                    || entries.get(1).gameTime() != 11) {
+                return "round trip mangled an entry: " + entries.get(1);
+            }
+
+            // A tighter log truncates oversized saved history by whole groups on read, and a
+            // future version's unknown entry kind is skipped rather than fatal.
+            ListTag oversizedList = new ListTag();
+            for (int turn = 0; turn < 3; turn++) {
+                oversizedList.add(conversationEntryTag("OWNER_UTTERANCE", "o" + turn, turn * 2));
+                oversizedList.add(conversationEntryTag("COMPANION_UTTERANCE", "c" + turn,
+                        turn * 2 + 1));
+            }
+            oversizedList.add(conversationEntryTag("FUTURE_KIND", "mystery", 99));
+            ConversationLog bounded = new ConversationLog(2, 10_000);
+            bounded.readNbt(oversizedList);
+            List<ConversationLog.Entry> boundedEntries = bounded.snapshot();
+            if (boundedEntries.size() != 4
+                    || boundedEntries.get(0).kind() != ConversationLog.EntryKind.OWNER_UTTERANCE
+                    || !"o1".equals(boundedEntries.get(0).text())) {
+                return "bounded read kept the wrong entries: " + boundedEntries;
+            }
+            return null;
+        } finally {
+            log.clear();
+        }
+    }
+
+    private static CompoundTag conversationEntryTag(String kind, String text, long time) {
+        CompoundTag tag = new CompoundTag();
+        tag.putString("kind", kind);
+        tag.putString("text", text);
+        tag.putLong("time", time);
+        return tag;
+    }
+
+    /** Speech is displayed as the named companion, remembered verbatim, and deduplicated. */
+    private static String conversationNamedOutputViolation() {
+        ConversationLog log = companion.getConversationLog();
+        if (log == null) {
+            return "the server-side companion had no conversation log";
+        }
+        List<String> displayed = new ArrayList<>();
+        CompanionSpeech.setObserver((entity, line) -> displayed.add(line));
+        try {
+            log.clear();
+            CompanionSpeech.send(companion, "Still smelting - two ingots to go.");
+            CompanionSpeech.send(companion, "Still smelting - two ingots to go.");
+            CompanionSpeech.send(companion, "   ");
+            if (displayed.size() != 1) {
+                return "expected exactly one displayed line, saw " + displayed;
+            }
+            String line = displayed.get(0);
+            String expected = AUTOTEST_COMPANION_NAME + ": Still smelting - two ingots to go.";
+            if (!expected.equals(line)) {
+                return "speech was not attributed to the companion name: " + line;
+            }
+            if (line.contains("[MineMate]")) {
+                return "companion speech still carried the telemetry prefix";
+            }
+            List<ConversationLog.Entry> entries = log.snapshot();
+            if (entries.size() != 1
+                    || entries.get(0).kind() != ConversationLog.EntryKind.COMPANION_UTTERANCE
+                    || !line.equals(entries.get(0).text())) {
+                return "memory and display disagreed: " + entries;
+            }
+            return null;
+        } finally {
+            CompanionSpeech.setObserver(null);
+            log.clear();
+        }
     }
 
     /** The order ledger's pure state machine: seeding, evidence records, remainder coverage. */
@@ -2431,8 +2865,8 @@ public final class DevAutoTest {
                 && "fetch".equals(outcome.stepOutcomes().get(1).call().tool())
                 // Several tool calls in one reply is what a multi-step plan is made of.
                 && body.contains("\"parallel_tool_calls\":true")
-                // Every valid reply carries a function call, so the provider can enforce that.
-                && body.contains("\"tool_choice\":\"required\"")
+                // Auto, not required: a zero-call speech reply is legal conversation now.
+                && body.contains("\"tool_choice\":\"auto\"")
                 && body.contains(PlannerProtocol.STATUS_TOOL)
                 && body.contains(PlannerProtocol.CONTRACT_TOOL)
                 && body.contains("Include every step that is currently known")
@@ -2589,9 +3023,12 @@ public final class DevAutoTest {
         }
         JsonArray statuses = statusTool.getAsJsonObject("parameters")
                 .getAsJsonObject("properties").getAsJsonObject("status").getAsJsonArray("enum");
-        if (statuses.contains(JsonParser.parseString("\"ACTION\"")) || statuses.size() != 5
-                || !statuses.contains(JsonParser.parseString("\"ANSWERED\""))) {
-            return "the status function exposed the wrong dispositions";
+        if (statuses.size() != 4
+                || !statuses.contains(JsonParser.parseString("\"CANCELLED\""))
+                || statuses.contains(JsonParser.parseString("\"ANSWERED\""))
+                || statuses.contains(JsonParser.parseString("\"CLARIFICATION\""))
+                || statuses.contains(JsonParser.parseString("\"ACTION\""))) {
+            return "the status function exposed the wrong close statuses";
         }
         if (contractTool == null) {
             return "the hosted schema omitted the reserved contract function";
@@ -2647,7 +3084,7 @@ public final class DevAutoTest {
     /** The OpenAI routing key includes stable identity without retaining shared mutable state. */
     private static String openAiIdentityCacheViolation() {
         FixtureTransport transport = FixtureTransport.of(FixtureTransport.ok(
-                llmResponse(null, llmStatus("ANSWERED", "Identity cache probe."))));
+                llmResponse("Identity cache probe.")));
         PlannerConfig config = PlannerConfig.of(PlannerConfig.PROVIDER_OPENAI,
                 "http://fixture.invalid/v1", "fixture-model", "fixture-key",
                 LLM_TIMEOUT_SECONDS, 0);
@@ -2658,8 +3095,9 @@ public final class DevAutoTest {
         String schema = ToolRegistry.defaults().schemaJson();
         try {
             for (String name : List.of(AUTOTEST_COMPANION_NAME, AUTOTEST_COMPANION_NAME, "Ember")) {
-                planner.plan(new PlanRequest("identity cache probe", name, snapshot,
-                        snapshot.render(), null, schema)).join();
+                planner.plan(new PlanRequest("identity cache probe", name,
+                        RequestOrigin.OWNER_CHAT, snapshot, snapshot.render(), null,
+                        schema)).join();
             }
         } catch (RuntimeException error) {
             return "identity cache probe failed: " + error.getMessage();
@@ -2682,15 +3120,17 @@ public final class DevAutoTest {
             return "different companion names produced the same OpenAI cache key";
         }
         if (!first.get("instructions").getAsString()
-                .contains(PlannerPrompt.identity(AUTOTEST_COMPANION_NAME))) {
+                .contains(PlannerPrompt.identity(AUTOTEST_COMPANION_NAME, ""))) {
             return "the OpenAI instructions omitted the companion identity";
+        }
+        if (!"auto".equals(first.get("tool_choice").getAsString())) {
+            return "tool_choice was not auto";
         }
         return null;
     }
 
     private static String llmProtocolViolation() {
-        for (PlanDisposition expected : List.of(PlanDisposition.COMPLETED, PlanDisposition.ANSWERED,
-                PlanDisposition.CLARIFICATION, PlanDisposition.UNSUPPORTED, PlanDisposition.BLOCKED)) {
+        for (OrderCloseStatus expected : OrderCloseStatus.values()) {
             LlmReply reply;
             try {
                 reply = OpenAiResponsesBackend.parseReply(
@@ -2698,13 +3138,26 @@ public final class DevAutoTest {
             } catch (RuntimeException error) {
                 return expected + " terminal reply failed to parse: " + error.getMessage();
             }
-            if (reply.disposition() != expected || !reply.calls().isEmpty()
-                    || !"Status message.".equals(reply.dialogue())) {
+            if (reply.close() == null || reply.close().status() != expected
+                    || !reply.calls().isEmpty()
+                    || !"Status message.".equals(reply.close().fallbackMessage())) {
                 return expected + " terminal reply parsed incorrectly";
             }
         }
 
-        String violation = expectMalformed("missing status", llmResponse("Done."));
+        // Speech alone is legal conversation now; only a fully empty reply stays malformed.
+        LlmReply conversation;
+        try {
+            conversation = OpenAiResponsesBackend.parseReply(llmResponse("Done."));
+        } catch (RuntimeException error) {
+            return "a speech-only reply failed to parse: " + error.getMessage();
+        }
+        if (conversation.close() != null || !conversation.calls().isEmpty()
+                || conversation.contract() != null
+                || !"Done.".equals(conversation.dialogue())) {
+            return "a speech-only reply did not parse into conversation";
+        }
+        String violation = expectMalformed("fully empty reply", llmResponse(null));
         if (violation != null) {
             return violation;
         }
@@ -2724,10 +3177,30 @@ public final class DevAutoTest {
         if (violation != null) {
             return violation;
         }
-        violation = expectMalformed("terminal assistant message", llmResponse("Done.",
-                llmStatus("COMPLETED", "Done.")));
+        // The retired statuses must fail loudly: answering is conversation now.
+        violation = expectMalformed("retired ANSWERED status",
+                llmResponse(null, llmStatus("ANSWERED", "My name is Ada.")));
         if (violation != null) {
             return violation;
+        }
+        violation = expectMalformed("retired CLARIFICATION status",
+                llmResponse(null, llmStatus("CLARIFICATION", "Which ore?")));
+        if (violation != null) {
+            return violation;
+        }
+        // Assistant speech beside a status is legal now; the speech rides on the close reply.
+        LlmReply spokenClose;
+        try {
+            spokenClose = OpenAiResponsesBackend.parseReply(llmResponse("All wrapped up.",
+                    llmStatus("COMPLETED", "Done.")));
+        } catch (RuntimeException error) {
+            return "a close with assistant speech failed to parse: " + error.getMessage();
+        }
+        if (spokenClose.close() == null
+                || spokenClose.close().status() != OrderCloseStatus.COMPLETED
+                || !"All wrapped up.".equals(spokenClose.dialogue())
+                || !"Done.".equals(spokenClose.close().fallbackMessage())) {
+            return "a close with assistant speech did not keep both lines";
         }
         violation = expectMalformed("nine-action reply",
                 llmResponse("This is too much.", nineGotoCalls()));
@@ -2776,7 +3249,7 @@ public final class DevAutoTest {
             return "a contract-only reply failed to parse: " + error.getMessage();
         }
         if (!contractOnly.calls().isEmpty() || contractOnly.contract() == null
-                || contractOnly.disposition() != PlanDisposition.ACTION) {
+                || contractOnly.close() != null) {
             return "a contract-only reply did not parse into an empty action reply";
         }
         violation = expectMalformed("contract with a zero count", llmResponse("On it.",
@@ -2800,7 +3273,7 @@ public final class DevAutoTest {
         } catch (RuntimeException error) {
             return "a speechless action reply failed to parse: " + error.getMessage();
         }
-        if (speechless.disposition() != PlanDisposition.ACTION || !speechless.dialogue().isBlank()
+        if (speechless.close() != null || !speechless.dialogue().isBlank()
                 || speechless.calls().size() != 1) {
             return "a speechless action reply did not parse into a one-call action reply";
         }
@@ -2830,13 +3303,13 @@ public final class DevAutoTest {
         String registrySchema = ToolRegistry.defaults().schemaJson();
         String hostedSchema = PlannerProtocol.hostedSchema(registrySchema);
         FixtureTransport transport = FixtureTransport.of(FixtureTransport.ok(
-                claudeResponse(null, claudeStatus("ANSWERED", "Schema probe."))));
+                claudeResponse("Schema probe.")));
         AnthropicMessagesBackend backend = new AnthropicMessagesBackend(transport,
                 "http://fixture.invalid/v1", "fixture-model", "fixture-key",
                 PlannerConfig.DEFAULT_EFFORT, PlannerConfig.DEFAULT_MAX_OUTPUT_TOKENS);
-        String systemIdentity = PlannerPrompt.identity(AUTOTEST_COMPANION_NAME);
+        String systemIdentity = PlannerPrompt.identity(AUTOTEST_COMPANION_NAME, "");
         backend.complete(new LlmPrompt(PlannerPrompt.SYSTEM, systemIdentity,
-                "ORDER: schema probe", hostedSchema, ""));
+                List.of(new LlmTurn(LlmTurn.Role.USER, "ORDER: schema probe")), hostedSchema, ""));
         JsonObject body;
         try {
             body = JsonParser.parseString(transport.lastRequestBody()).getAsJsonObject();
@@ -2931,8 +3404,7 @@ public final class DevAutoTest {
     }
 
     private static String llmClaudeProtocolViolation() {
-        for (PlanDisposition expected : List.of(PlanDisposition.COMPLETED, PlanDisposition.ANSWERED,
-                PlanDisposition.CLARIFICATION, PlanDisposition.UNSUPPORTED, PlanDisposition.BLOCKED)) {
+        for (OrderCloseStatus expected : OrderCloseStatus.values()) {
             LlmReply reply;
             try {
                 reply = AnthropicMessagesBackend.parseReply(
@@ -2940,14 +3412,27 @@ public final class DevAutoTest {
             } catch (RuntimeException error) {
                 return expected + " terminal reply failed to parse: " + error.getMessage();
             }
-            if (reply.disposition() != expected || !reply.calls().isEmpty()
-                    || !"Status message.".equals(reply.dialogue())) {
+            if (reply.close() == null || reply.close().status() != expected
+                    || !reply.calls().isEmpty()
+                    || !"Status message.".equals(reply.close().fallbackMessage())) {
                 return expected + " terminal reply parsed incorrectly";
             }
         }
 
-        String violation = expectClaudeMalformed("missing status",
-                claudeResponse("end_turn", "Done."));
+        // Speech alone is legal conversation now; only a fully empty reply stays malformed.
+        LlmReply conversation;
+        try {
+            conversation = AnthropicMessagesBackend.parseReply(claudeResponse("end_turn", "Done."));
+        } catch (RuntimeException error) {
+            return "a speech-only reply failed to parse: " + error.getMessage();
+        }
+        if (conversation.close() != null || !conversation.calls().isEmpty()
+                || conversation.contract() != null
+                || !"Done.".equals(conversation.dialogue())) {
+            return "a speech-only reply did not parse into conversation";
+        }
+        String violation = expectClaudeMalformed("fully empty reply",
+                claudeResponse("end_turn", (String) null));
         if (violation != null) {
             return violation;
         }
@@ -2967,10 +3452,29 @@ public final class DevAutoTest {
         if (violation != null) {
             return violation;
         }
-        violation = expectClaudeMalformed("terminal assistant message", claudeResponse("Done.",
-                claudeStatus("COMPLETED", "Done.")));
+        violation = expectClaudeMalformed("retired ANSWERED status",
+                claudeResponse(null, claudeStatus("ANSWERED", "My name is Ada.")));
         if (violation != null) {
             return violation;
+        }
+        violation = expectClaudeMalformed("retired CLARIFICATION status",
+                claudeResponse(null, claudeStatus("CLARIFICATION", "Which ore?")));
+        if (violation != null) {
+            return violation;
+        }
+        // Assistant speech beside a status is legal now; the speech rides on the close reply.
+        LlmReply spokenClose;
+        try {
+            spokenClose = AnthropicMessagesBackend.parseReply(claudeResponse("Done and dusted.",
+                    claudeStatus("COMPLETED", "Done.")));
+        } catch (RuntimeException error) {
+            return "a close with assistant speech failed to parse: " + error.getMessage();
+        }
+        if (spokenClose.close() == null
+                || spokenClose.close().status() != OrderCloseStatus.COMPLETED
+                || !"Done and dusted.".equals(spokenClose.dialogue())
+                || !"Done.".equals(spokenClose.close().fallbackMessage())) {
+            return "a close with assistant speech did not keep both lines";
         }
         JsonObject[] nine = new JsonObject[Plan.MAX_STEPS + 1];
         for (int index = 0; index < nine.length; index++) {
@@ -3027,7 +3531,7 @@ public final class DevAutoTest {
             return "a contract-only reply failed to parse: " + error.getMessage();
         }
         if (!contractOnly.calls().isEmpty() || contractOnly.contract() == null
-                || contractOnly.disposition() != PlanDisposition.ACTION) {
+                || contractOnly.close() != null) {
             return "a contract-only reply did not parse into an empty action reply";
         }
         violation = expectClaudeMalformed("contract with a zero count", claudeResponse("On it.",
@@ -3051,7 +3555,7 @@ public final class DevAutoTest {
         } catch (RuntimeException error) {
             return "a speechless action reply failed to parse: " + error.getMessage();
         }
-        if (speechless.disposition() != PlanDisposition.ACTION || !speechless.dialogue().isBlank()
+        if (speechless.close() != null || !speechless.dialogue().isBlank()
                 || speechless.calls().size() != 1) {
             return "a speechless action reply did not parse into a one-call action reply";
         }

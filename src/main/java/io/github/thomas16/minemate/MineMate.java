@@ -33,6 +33,8 @@ public class MineMate implements ModInitializer {
 	// That way, it's clear which mod wrote info, warnings, and errors.
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
+	private static PlannerConfig plannerConfig = PlannerConfig.defaults();
+
 	@Override
 	public void onInitialize() {
 		// This code runs as soon as Minecraft is in a mod-load-ready state.
@@ -61,15 +63,25 @@ public class MineMate implements ModInitializer {
 	 * stand-in in place. A missing key is an ordinary state, not an error: the mod stays fully
 	 * playable on chat commands, and nothing in the autonomy path fires without a hosted planner.
 	 */
+	/**
+	 * The config loaded at startup; defaults until {@link #installPlanner()} has run. Non-planner
+	 * settings such as the conversation transcript bounds are read from here even when the hosted
+	 * planner itself stays uninstalled.
+	 */
+	public static PlannerConfig plannerConfig() {
+		return plannerConfig;
+	}
+
 	private static void installPlanner() {
 		if (Boolean.getBoolean("minemate.autotest")) {
 			// The headless suite must never be able to reach the network, whatever the developer
 			// happens to have in OPENAI_API_KEY. Its planner scenarios install their own hosted
-			// planner over a fixture transport instead.
+			// planner over a fixture transport instead. Transcript bounds stay at their defaults.
 			LOGGER.info("MineMate planner: scripted (autotest run)");
 			return;
 		}
 		PlannerConfig config = PlannerConfig.loadOrCreate();
+		plannerConfig = config;
 		if (!config.usable()) {
 			LOGGER.info("MineMate planner: scripted ({})",
 					config.enabled() ? "no API key configured" : "disabled in config");

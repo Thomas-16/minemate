@@ -7,12 +7,11 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * A bounded sequence of tool calls to run one at a time.
  *
- * @param dialogue what the companion says about this plan, or the message for a terminal disposition
- * @param disposition whether this contains executable actions or closes the standing order
- * @param contract the order contract the reply declared, or null for planners without one
+ * <p>Action-only: a plan exists because a {@link CompanionResponse}'s actions were accepted.
+ * Speech and order closes never become plans, so there is no such thing as an empty or terminal
+ * plan.
  */
-public record Plan(String id, String requestText, List<PlanStep> steps, String dialogue,
-        PlanDisposition disposition, OrderContract contract) {
+public record Plan(String id, String requestText, List<PlanStep> steps) {
 
     /** Hard protocol bound; larger orders continue as coherent chunks through replanning. */
     public static final int MAX_STEPS = 8;
@@ -22,19 +21,7 @@ public record Plan(String id, String requestText, List<PlanStep> steps, String d
     public Plan {
         Objects.requireNonNull(id, "id");
         requestText = requestText == null ? "" : requestText;
-        dialogue = dialogue == null ? "" : dialogue;
         steps = List.copyOf(Objects.requireNonNull(steps, "steps"));
-        disposition = disposition == null ? PlanDisposition.ACTION : disposition;
-    }
-
-    public Plan(String id, String requestText, List<PlanStep> steps, String dialogue,
-            PlanDisposition disposition) {
-        this(id, requestText, steps, dialogue, disposition, null);
-    }
-
-    /** Scripted and ordinary plans are executable unless they explicitly say otherwise. */
-    public Plan(String id, String requestText, List<PlanStep> steps, String dialogue) {
-        this(id, requestText, steps, dialogue, PlanDisposition.ACTION, null);
     }
 
     public static String nextId() {
@@ -42,6 +29,6 @@ public record Plan(String id, String requestText, List<PlanStep> steps, String d
     }
 
     public static Plan of(String requestText, List<PlanStep> steps) {
-        return new Plan(nextId(), requestText, steps, "", PlanDisposition.ACTION);
+        return new Plan(nextId(), requestText, steps);
     }
 }

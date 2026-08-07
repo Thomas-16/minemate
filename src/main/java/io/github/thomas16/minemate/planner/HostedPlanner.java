@@ -11,16 +11,16 @@ import io.github.thomas16.minemate.planner.llm.PlannerPrompt;
 import io.github.thomas16.minemate.planner.llm.PlannerProtocol;
 import io.github.thomas16.minemate.tool.ToolCall;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The stage-5 planner: asks a hosted model what to do and turns its answer into a {@link Plan}.
+ * The stage-5 planner: asks a hosted model what to do and turns its answer into a
+ * {@link CompanionResponse}.
  *
- * <p>It adds no authority. Everything it produces still goes through {@code ToolRegistry.validate}
+ * <p>It adds no authority. Every action it produces still goes through {@code ToolRegistry.validate}
  * before a single step reaches the supervisor, so the model chooses among already-safe tools and
  * nothing else. Failure is ordinary here rather than exceptional: a timeout, a malformed reply and
  * a refusal all end as a failed future, which {@link PlannerDispatch} reports to the owner and
@@ -73,11 +73,11 @@ public final class HostedPlanner implements Planner {
     }
 
     @Override
-    public CompletableFuture<Plan> plan(PlanRequest request) {
+    public CompletableFuture<CompanionResponse> plan(PlanRequest request) {
         String hostedSchema = PlannerProtocol.hostedSchema(request.toolSchemaJson());
-        String identity = PlannerPrompt.identity(request.companionName());
+        String identity = PlannerPrompt.identity(request.companionName(), request.ownerName());
         LlmPrompt prompt = new LlmPrompt(PlannerPrompt.SYSTEM, identity,
-                PlannerPrompt.user(request), hostedSchema,
+                PlannerPrompt.turns(request), hostedSchema,
                 cacheKeyFor(PlannerPrompt.SYSTEM, identity, hostedSchema));
         // The backend returns immediately; the mapping below runs on whatever thread completes it,
         // and touches nothing but the reply. PlannerDispatch owns the hop back to the server.
@@ -88,7 +88,7 @@ public final class HostedPlanner implements Planner {
         // deadline must not be able to cause that.
         return backend.complete(prompt)
                 .orTimeout(config.timeout().toMillis(), TimeUnit.MILLISECONDS)
-                .thenApply(reply -> toPlan(request, reply));
+                .thenApply(HostedPlanner::toResponse);
     }
 
     @Override
@@ -96,32 +96,30 @@ public final class HostedPlanner implements Planner {
         backend.close();
     }
 
-    private Plan toPlan(PlanRequest request, LlmReply reply) {
+    private static CompanionResponse toResponse(LlmReply reply) {
         List<ToolCall> calls = reply.calls();
         if (calls.size() > Plan.MAX_STEPS) {
             throw LlmException.malformed("planner returned more than " + Plan.MAX_STEPS
                     + " world-tool calls");
         }
-        // A contract with no world calls passes through as an empty ACTION plan: dispatch owns
-        // that case, because its remedy is a repair request, not a parse failure. Blank dialogue
-        // is legal on an action reply; the protocol layer explains why.
-        if (reply.disposition() == PlanDisposition.ACTION
-                && calls.isEmpty() && reply.contract() == null) {
-            throw LlmException.malformed("action reply had no world-tool calls");
+        if (reply.close() != null) {
+            if (!calls.isEmpty()) {
+                throw LlmException.malformed("close reply must not carry world-tool calls");
+            }
+            if (reply.contract() != null) {
+                throw LlmException.malformed("close reply must not declare an order contract");
+            }
+            return CompanionResponse.close(reply.dialogue(), reply.close());
         }
-        if (reply.disposition().terminal()
-                && (!calls.isEmpty() || reply.dialogue().isBlank())) {
-            throw LlmException.malformed("terminal reply requires one status message and no world-tool calls");
+        // Speech with nothing executable is conversation. A silent empty reply was already
+        // rejected by the protocol layer, so dialogue is nonblank here.
+        if (calls.isEmpty() && reply.contract() == null) {
+            return CompanionResponse.speech(reply.dialogue());
         }
-        if (reply.disposition().terminal() && reply.contract() != null) {
-            throw LlmException.malformed("terminal reply must not declare an order contract");
-        }
-        List<PlanStep> steps = new ArrayList<>(calls.size());
-        for (ToolCall call : calls) {
-            steps.add(PlanStep.of(call));
-        }
-        return new Plan(Plan.nextId(), request.requestText(), steps, reply.dialogue(),
-                reply.disposition(), reply.contract());
+        // A contract with no world calls passes through as a contract-only response: dispatch
+        // owns that case, because its remedy is a continuation request, not a parse failure.
+        // Blank dialogue is legal on an action reply; the protocol layer explains why.
+        return CompanionResponse.actions(reply.dialogue(), calls, reply.contract());
     }
 
     private static String cacheKeyFor(String system, String identity, String schemaJson) {

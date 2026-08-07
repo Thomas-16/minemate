@@ -108,10 +108,9 @@ public final class OpenAiResponsesBackend implements LlmBackend {
         root.addProperty("model", model);
         root.addProperty("instructions", prompt.combinedSystem());
         root.add("tools", OpenAiToolSchemas.toOpenAiTools(prompt.toolSchemaJson()));
-        // Required, not auto: every valid hosted reply carries at least one function call, whether
-        // a world action or report_order_status, so a zero-call speech reply is stopped at the
-        // provider boundary instead of burning tokens on something the parser must reject.
-        root.addProperty("tool_choice", "required");
+        // Auto, not required: a zero-call speech reply is legal conversation now, so the provider
+        // boundary must not force a function call onto an answer that is just talk.
+        root.addProperty("tool_choice", "auto");
         // True on purpose: several function calls in one reply are what a multi-step plan is.
         root.addProperty("parallel_tool_calls", true);
 
@@ -124,17 +123,21 @@ public final class OpenAiResponsesBackend implements LlmBackend {
         root.add("text", text);
 
         root.addProperty("max_output_tokens", maxOutputTokens);
-        // Single turn, so there is no reasoning state worth having the provider keep.
+        // The complete bounded transcript is sent explicitly on every request, so the provider
+        // keeps no state; automatic prefix caching plus the stable prompt_cache_key still apply.
         root.addProperty("store", false);
         if (!prompt.cacheKey().isEmpty()) {
             root.addProperty("prompt_cache_key", prompt.cacheKey());
         }
 
-        JsonObject message = new JsonObject();
-        message.addProperty("role", "user");
-        message.addProperty("content", prompt.user());
         JsonArray input = new JsonArray();
-        input.add(message);
+        for (LlmTurn turn : prompt.turns()) {
+            JsonObject message = new JsonObject();
+            message.addProperty("role",
+                    turn.role() == LlmTurn.Role.ASSISTANT ? "assistant" : "user");
+            message.addProperty("content", turn.text());
+            input.add(message);
+        }
         root.add("input", input);
         // No temperature and no top_p: reasoning models reject or ignore them, and effort plus
         // verbosity are the supported knobs.

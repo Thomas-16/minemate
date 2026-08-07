@@ -20,6 +20,7 @@ import io.github.thomas16.minemate.tool.ToolValidation;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -44,6 +45,19 @@ import java.util.Optional;
 public final class PlanExecutor {
 
     public enum StartResult { ACCEPTED, BUSY, REJECTED }
+
+    /** A plan whose every step passed validation; the only thing {@link #commit} accepts. */
+    public record PreparedPlan(Plan plan, List<ToolValidation.Accepted> steps) {
+    }
+
+    /** The result of pure validation: a committable plan or one reason it cannot run. */
+    public sealed interface PrepareOutcome {
+        record Ready(PreparedPlan prepared) implements PrepareOutcome {
+        }
+
+        record Invalid(String reason) implements PrepareOutcome {
+        }
+    }
 
     private final CompanionEntity companion;
 
@@ -72,36 +86,60 @@ public final class PlanExecutor {
         if (newPlan == null) {
             return StartResult.REJECTED;
         }
+        // BUSY before validation, exactly as before the prepare/commit split: an occupied
+        // executor answers BUSY even for a plan that would not have validated.
         if (plan != null) {
             return StartResult.BUSY;
         }
-        if (newPlan.steps().isEmpty()) {
-            publish(newPlan, PlanStatus.REJECTED, Reasons.PLAN_EMPTY, List.of(), 0L);
-            return StartResult.REJECTED;
+        return switch (prepare(newPlan)) {
+            case PrepareOutcome.Ready ready -> commit(ready.prepared());
+            case PrepareOutcome.Invalid invalid -> {
+                publish(newPlan, PlanStatus.REJECTED, invalid.reason(), List.of(), 0L);
+                yield StartResult.REJECTED;
+            }
+        };
+    }
+
+    /**
+     * Pure validation: step bound, registry acceptance, continuous-tool placement. Mutates no
+     * live state, so a caller can prepare a replacement while other work still runs.
+     *
+     * <p>Contract coverage stays in {@link PlannerDispatch} for now — it depends on standing-order
+     * state only dispatch knows. It folds in here when stage 5 adds atomic plan replacement.
+     */
+    public PrepareOutcome prepare(Plan newPlan) {
+        assertServerThread();
+        if (newPlan == null || newPlan.steps().isEmpty()) {
+            return new PrepareOutcome.Invalid(Reasons.PLAN_EMPTY);
         }
         if (newPlan.steps().size() > Plan.MAX_STEPS) {
-            publish(newPlan, PlanStatus.REJECTED, Reasons.PLAN_TOO_LONG, List.of(), 0L);
-            return StartResult.REJECTED;
+            return new PrepareOutcome.Invalid(Reasons.PLAN_TOO_LONG);
         }
         List<ToolValidation.Accepted> accepted = new ArrayList<>(newPlan.steps().size());
         for (int index = 0; index < newPlan.steps().size(); index++) {
             PlanStep step = newPlan.steps().get(index);
             ToolValidation validation = ToolRegistry.defaults().validate(step.call());
             if (validation instanceof ToolValidation.Rejected rejected) {
-                publish(newPlan, PlanStatus.REJECTED, rejected.reason(), List.of(), 0L);
-                return StartResult.REJECTED;
+                return new PrepareOutcome.Invalid(rejected.reason());
             }
             ToolValidation.Accepted ok = (ToolValidation.Accepted) validation;
             // A continuous tool never finishes on its own, so anything after it would never run.
             if (ok.tool().continuous() && index != newPlan.steps().size() - 1) {
-                publish(newPlan, PlanStatus.REJECTED, Reasons.INVALID_ARGUMENT, List.of(), 0L);
-                return StartResult.REJECTED;
+                return new PrepareOutcome.Invalid(Reasons.INVALID_ARGUMENT);
             }
             accepted.add(ok);
         }
+        return new PrepareOutcome.Ready(new PreparedPlan(newPlan, List.copyOf(accepted)));
+    }
 
-        plan = newPlan;
-        validatedSteps = List.copyOf(accepted);
+    /** One server-thread transition installing an already-validated plan. */
+    public StartResult commit(PreparedPlan prepared) {
+        assertServerThread();
+        if (plan != null) {
+            return StartResult.BUSY;
+        }
+        plan = prepared.plan();
+        validatedSteps = prepared.steps();
         stepOutcomes.clear();
         stepIndex = 0;
         awaitingGoalId = null;
@@ -111,8 +149,22 @@ public final class PlanExecutor {
                     "plan %s started (%d steps)".formatted(plan.id(), plan.steps().size()),
                     plan.requestText());
         }
+        recordActivity("started: %s (%d steps)".formatted(plan.requestText(),
+                plan.steps().size()));
         MineMate.LOGGER.info("Plan {} started with {} steps", plan.id(), plan.steps().size());
         return StartResult.ACCEPTED;
+    }
+
+    /**
+     * A concise game-authored record for conversational memory: past actions reach the model as
+     * trusted activity summaries, never as assistant-authored speech or raw tool calls. The
+     * executor is the single source of these so the journal and the conversation cannot
+     * double-record one event.
+     */
+    private void recordActivity(String summary) {
+        if (companion.getConversationLog() != null) {
+            companion.getConversationLog().recordActivity(summary, companion.level().getGameTime());
+        }
     }
 
     /** Server-thread-only. Advances the plan by at most one decision. */
@@ -229,6 +281,8 @@ public final class PlanExecutor {
                                         evidence.item()),
                                 evidence.item());
                     }
+                    recordActivity("delivered %d %s to owner".formatted(evidence.delivered(),
+                            evidence.item()));
                 }
                 if (shortfallBlocked && evidence.delivered() < evidence.requested()
                         && ledger != null) {
@@ -346,6 +400,12 @@ public final class PlanExecutor {
                     lastOutcome.toCompactString());
             companion.getContext().triggers().arm(ReplanReason.PLAN_FINISHED,
                     status + " " + reason);
+        }
+        if (status != PlanStatus.REJECTED) {
+            // A rejected plan never ran; its failure is dispatch's conversational report, not an
+            // activity this companion performed.
+            recordActivity("plan ended %s (%s)".formatted(
+                    status.name().toLowerCase(Locale.ROOT), reason));
         }
         MineMate.LOGGER.info("Plan finished: {}", lastOutcome.toCompactString());
     }

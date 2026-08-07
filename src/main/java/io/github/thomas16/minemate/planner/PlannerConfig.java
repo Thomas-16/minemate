@@ -37,6 +37,8 @@ public final class PlannerConfig {
     public static final int DEFAULT_TIMEOUT_SECONDS = 45;
     public static final int DEFAULT_MAX_OUTPUT_TOKENS = 2048;
     public static final int DEFAULT_MAX_REPLANS = 3;
+    public static final int DEFAULT_CHAT_TRANSCRIPT_TURNS = 40;
+    public static final int DEFAULT_CHAT_TRANSCRIPT_CHARS = 6000;
 
     private static final String PROPERTY_KEY = "minemate.planner.apiKey";
     private static final String PROPERTY_MODEL = "minemate.planner.model";
@@ -51,19 +53,24 @@ public final class PlannerConfig {
     private final int timeoutSeconds;
     private final int maxOutputTokens;
     private final int maxReplansPerOrder;
+    private final int chatTranscriptTurns;
+    private final int chatTranscriptChars;
     private final String apiKey;
     private final String apiKeySource;
 
     private PlannerConfig(boolean enabled, String provider, String baseUrl, String model,
             String reasoningEffort, String verbosity, int timeoutSeconds, int maxOutputTokens,
-            int maxReplansPerOrder, String apiKey) {
+            int maxReplansPerOrder, int chatTranscriptTurns, int chatTranscriptChars,
+            String apiKey) {
         this(enabled, provider, baseUrl, model, reasoningEffort, verbosity, timeoutSeconds,
-                maxOutputTokens, maxReplansPerOrder, apiKey, "explicit");
+                maxOutputTokens, maxReplansPerOrder, chatTranscriptTurns, chatTranscriptChars,
+                apiKey, "explicit");
     }
 
     private PlannerConfig(boolean enabled, String provider, String baseUrl, String model,
             String reasoningEffort, String verbosity, int timeoutSeconds, int maxOutputTokens,
-            int maxReplansPerOrder, String apiKey, String apiKeySource) {
+            int maxReplansPerOrder, int chatTranscriptTurns, int chatTranscriptChars,
+            String apiKey, String apiKeySource) {
         this.enabled = enabled;
         this.provider = provider;
         this.baseUrl = baseUrl;
@@ -73,6 +80,8 @@ public final class PlannerConfig {
         this.timeoutSeconds = timeoutSeconds;
         this.maxOutputTokens = maxOutputTokens;
         this.maxReplansPerOrder = maxReplansPerOrder;
+        this.chatTranscriptTurns = chatTranscriptTurns;
+        this.chatTranscriptChars = chatTranscriptChars;
         this.apiKey = apiKey;
         this.apiKeySource = apiKeySource;
     }
@@ -99,7 +108,8 @@ public final class PlannerConfig {
     public static PlannerConfig defaults() {
         return new PlannerConfig(true, DEFAULT_PROVIDER, defaultBaseUrl(DEFAULT_PROVIDER),
                 defaultModel(DEFAULT_PROVIDER), DEFAULT_EFFORT, DEFAULT_VERBOSITY,
-                DEFAULT_TIMEOUT_SECONDS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_REPLANS, "");
+                DEFAULT_TIMEOUT_SECONDS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_REPLANS,
+                DEFAULT_CHAT_TRANSCRIPT_TURNS, DEFAULT_CHAT_TRANSCRIPT_CHARS, "");
     }
 
     /**
@@ -113,6 +123,7 @@ public final class PlannerConfig {
         PlannerConfig defaults = defaults();
         return new PlannerConfig(true, provider, baseUrl, model, defaults.reasoningEffort,
                 defaults.verbosity, timeoutSeconds, defaults.maxOutputTokens, maxReplansPerOrder,
+                defaults.chatTranscriptTurns, defaults.chatTranscriptChars,
                 apiKey == null ? "" : apiKey);
     }
 
@@ -161,6 +172,8 @@ public final class PlannerConfig {
         json.addProperty("timeoutSeconds", DEFAULT_TIMEOUT_SECONDS);
         json.addProperty("maxOutputTokens", DEFAULT_MAX_OUTPUT_TOKENS);
         json.addProperty("maxReplansPerOrder", DEFAULT_MAX_REPLANS);
+        json.addProperty("chatTranscriptTurns", DEFAULT_CHAT_TRANSCRIPT_TURNS);
+        json.addProperty("chatTranscriptChars", DEFAULT_CHAT_TRANSCRIPT_CHARS);
         json.addProperty("anthropicApiKey", "");
         json.addProperty("openaiApiKey", "");
         try {
@@ -197,6 +210,8 @@ public final class PlannerConfig {
                 integer(json, "timeoutSeconds", defaults.timeoutSeconds, 1, 300),
                 integer(json, "maxOutputTokens", defaults.maxOutputTokens, 256, 32_000),
                 integer(json, "maxReplansPerOrder", defaults.maxReplansPerOrder, 0, 20),
+                integer(json, "chatTranscriptTurns", defaults.chatTranscriptTurns, 4, 200),
+                integer(json, "chatTranscriptChars", defaults.chatTranscriptChars, 500, 50_000),
                 key.value(), key.source());
     }
 
@@ -291,6 +306,16 @@ public final class PlannerConfig {
 
     public int maxReplansPerOrder() {
         return maxReplansPerOrder;
+    }
+
+    /** Bounded conversation memory: how many complete owner/companion turns are retained. */
+    public int chatTranscriptTurns() {
+        return chatTranscriptTurns;
+    }
+
+    /** Bounded conversation memory: approximate rendered-character budget for the transcript. */
+    public int chatTranscriptChars() {
+        return chatTranscriptChars;
     }
 
     public Optional<String> apiKey() {

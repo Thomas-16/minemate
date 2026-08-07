@@ -6,9 +6,10 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
 
+import io.github.thomas16.minemate.planner.OrderClose;
+import io.github.thomas16.minemate.planner.OrderCloseStatus;
 import io.github.thomas16.minemate.planner.OrderContract;
 import io.github.thomas16.minemate.planner.Plan;
-import io.github.thomas16.minemate.planner.PlanDisposition;
 import io.github.thomas16.minemate.tool.ToolCall;
 
 import java.util.ArrayList;
@@ -35,15 +36,17 @@ public final class PlannerProtocol {
     /**
      * Turns a provider's parsed reply into an {@link LlmReply}, enforcing every protocol rule in
      * one place so two backends cannot drift apart: at most one status and one contract, a status
-     * never mixes with world calls, a contract, or a separate assistant message, and an action
-     * reply carries at most {@link Plan#MAX_STEPS} world calls. Action-reply speech is requested
-     * by the prompt but never required here: live claude-sonnet-5 under adaptive thinking
-     * reliably answers a plannable order with tool calls and no text block, so blank dialogue is
-     * legal and simply reaches the owner as nothing -- the goal-start chat line covers them.
+     * never mixes with world calls or a contract, and an action reply carries at most
+     * {@link Plan#MAX_STEPS} world calls. Speech alone is a legal conversation reply; a reply
+     * with no speech, no calls, and no status stays malformed so silence fails loudly.
+     * Action-reply speech is requested by the prompt but never required here: live
+     * claude-sonnet-5 under adaptive thinking reliably answers an action request with tool calls
+     * and no text block, so blank dialogue is legal and simply reaches the owner as nothing --
+     * the goal-start chat line covers them. Assistant speech beside a status call is likewise
+     * legal: the displayed line is the speech when nonblank, else the status message.
      *
      * @param dialogue   the concatenated assistant text, possibly blank
-     * @param sawMessage whether any assistant text item existed at all, even an empty one; a
-     *                   terminal reply must not carry one
+     * @param sawMessage whether any assistant text item existed at all, even an empty one
      */
     public static LlmReply assemble(String dialogue, boolean sawMessage, List<RawCall> calls) {
         List<RawCall> statuses = new ArrayList<>();
@@ -72,18 +75,19 @@ public final class PlannerProtocol {
             if (!contracts.isEmpty()) {
                 throw LlmException.malformed("terminal reply included an order contract");
             }
-            if (sawMessage) {
-                throw LlmException.malformed("terminal reply included a separate assistant message");
-            }
-            return statusReplyOf(statuses.get(0));
+            return statusReplyOf(statuses.get(0), dialogue);
         }
 
         // The contract call is protocol, not work: it does not count toward the step bound, so a
         // contract plus MAX_STEPS world calls is a legal reply. A contract with no world calls is
         // parseable on purpose: single-call-habit models really send it, and dispatch turns it
-        // into a repairable violation rather than an opaque parse failure.
+        // into a continuation rather than an opaque parse failure.
         if (worldCalls.isEmpty() && contracts.isEmpty()) {
-            throw LlmException.malformed("reply had no world-tool calls or order status");
+            if (dialogue.isBlank()) {
+                throw LlmException.malformed("reply had no speech, world-tool calls, or order status");
+            }
+            // Conversation: speech with nothing executable and nothing closed.
+            return new LlmReply(dialogue, List.of(), null, null);
         }
         if (worldCalls.size() > Plan.MAX_STEPS) {
             throw LlmException.malformed("reply contained more than " + Plan.MAX_STEPS
@@ -94,7 +98,7 @@ public final class PlannerProtocol {
             toolCalls.add(toolCallOf(call));
         }
         OrderContract contract = contracts.isEmpty() ? null : contractOf(contracts.get(0));
-        return new LlmReply(dialogue, toolCalls, PlanDisposition.ACTION, contract);
+        return new LlmReply(dialogue, toolCalls, null, contract);
     }
 
     private static ToolCall toolCallOf(RawCall call) {
@@ -107,26 +111,23 @@ public final class PlannerProtocol {
         return new ToolCall(call.name(), call.arguments());
     }
 
-    private static LlmReply statusReplyOf(RawCall call) {
+    private static LlmReply statusReplyOf(RawCall call, String dialogue) {
         JsonObject arguments = call.arguments() == null ? new JsonObject() : call.arguments();
         if (arguments.size() != 2 || !arguments.has("status") || !arguments.has("message")) {
             throw LlmException.malformed("order status required exactly status and message");
         }
         String rawStatus = stringArgument(arguments, "status");
-        PlanDisposition disposition;
+        OrderCloseStatus status;
         try {
-            disposition = PlanDisposition.valueOf(rawStatus);
+            status = OrderCloseStatus.valueOf(rawStatus);
         } catch (IllegalArgumentException error) {
             throw LlmException.malformed("invalid order status: " + rawStatus);
-        }
-        if (!disposition.terminal()) {
-            throw LlmException.malformed("ACTION is not a terminal order status");
         }
         String message = stringArgument(arguments, "message").strip();
         if (message.isBlank()) {
             throw LlmException.malformed("order status message was blank");
         }
-        return new LlmReply(message, List.of(), disposition);
+        return new LlmReply(dialogue, List.of(), new OrderClose(status, message));
     }
 
     private static OrderContract contractOf(RawCall call) {
@@ -194,13 +195,12 @@ public final class PlannerProtocol {
     private static JsonObject statusTool() {
         JsonObject status = new JsonObject();
         status.addProperty("type", "string");
-        status.addProperty("description", "Terminal order status; ACTION is not allowed here."
-                + " COMPLETED closes a verified world order; ANSWERED closes a question or social"
-                + " remark that needed no world action.");
+        status.addProperty("description", "Why the current work order is closing. COMPLETED needs"
+                + " measured proof; CANCELLED means the player changed their mind. Answering a"
+                + " question is conversation, not a status.");
         JsonArray statuses = new JsonArray();
         statuses.add("COMPLETED");
-        statuses.add("ANSWERED");
-        statuses.add("CLARIFICATION");
+        statuses.add("CANCELLED");
         statuses.add("UNSUPPORTED");
         statuses.add("BLOCKED");
         status.add("enum", statuses);

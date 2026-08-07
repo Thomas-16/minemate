@@ -140,11 +140,17 @@ public final class AnthropicMessagesBackend implements LlmBackend {
             root.add("output_config", outputConfig);
         }
 
-        JsonObject message = new JsonObject();
-        message.addProperty("role", "user");
-        message.addProperty("content", prompt.user());
+        // Plain-string content per turn. The optional ephemeral breakpoint on the last stable
+        // history turn (design 5.1) is deferred: it is an optimization, and the two system
+        // breakpoints above already cover the expensive stable prefix.
         JsonArray messages = new JsonArray();
-        messages.add(message);
+        for (LlmTurn turn : prompt.turns()) {
+            JsonObject message = new JsonObject();
+            message.addProperty("role",
+                    turn.role() == LlmTurn.Role.ASSISTANT ? "assistant" : "user");
+            message.addProperty("content", turn.text());
+            messages.add(message);
+        }
         root.add("messages", messages);
         // No temperature and no top_p: the 5-series rejects them outright.
         return root;

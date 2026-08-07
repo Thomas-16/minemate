@@ -1,6 +1,7 @@
 package io.github.thomas16.minemate.planner;
 
 import io.github.thomas16.minemate.MineMate;
+import io.github.thomas16.minemate.chat.CompanionSpeech;
 import io.github.thomas16.minemate.context.EventKind;
 import io.github.thomas16.minemate.context.ReplanTrigger;
 import io.github.thomas16.minemate.context.WorldSnapshot;
@@ -67,7 +68,7 @@ public final class PlannerAutonomy {
                         BUDGET_EXHAUSTED_MESSAGE,
                         order.requestText());
             }
-            PlannerDispatch.tell(companion, BUDGET_EXHAUSTED_MESSAGE);
+            CompanionSpeech.send(companion, BUDGET_EXHAUSTED_MESSAGE);
             companion.closeStandingOrder();
             return;
         }
@@ -75,8 +76,11 @@ public final class PlannerAutonomy {
         order.consumeReplan();
         WorldSnapshot snapshot = companion.getContext().snapshot();
         PlannerDispatch.request(companion, planner, new PlanRequest(order.requestText(),
-                companion.getCompanionName().orElse(""), snapshot, snapshot.render(),
-                trigger.reason(), ToolRegistry.defaults().schemaJson(), null,
-                PlannerDispatch.ledgerTextOf(companion)));
+                companion.getCompanionName().orElse(""), RequestOrigin.AUTONOMOUS_REPLAN,
+                snapshot, snapshot.render(), trigger.reason(),
+                ToolRegistry.defaults().schemaJson(), null,
+                PlannerDispatch.ledgerTextOf(companion),
+                PlannerRequests.transcriptOf(companion),
+                PlannerRequests.ownerNameOf(companion)));
     }
 }

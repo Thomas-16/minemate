@@ -14,6 +14,7 @@ import com.player2.playerengine.player2api.Character;
 import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.context.CompanionContext;
 import io.github.thomas16.minemate.context.CompanionJournal;
+import io.github.thomas16.minemate.context.ConversationLog;
 import io.github.thomas16.minemate.planner.PlanExecutor;
 import io.github.thomas16.minemate.planner.StandingOrder;
 import io.github.thomas16.minemate.integration.CompanionDefensePolicy;
@@ -59,6 +60,7 @@ public class CompanionEntity extends LivingEntity
     public static final int MAX_NAME_LENGTH = 32;
 
     private static final String OWNER_NBT_KEY = "minemate_owner";
+    private static final String CONVERSATION_NBT_KEY = "minemate_conversation";
 
     /**
      * Placeholder identity for PlayerEngine's controller. We never set an
@@ -77,6 +79,7 @@ public class CompanionEntity extends LivingEntity
     private CompanionContext context;
     private PlanExecutor planExecutor;
     private StandingOrder standingOrder;
+    private ConversationLog conversationLog;
 
     private UUID ownerUuid;
     private Vec3 lastVelocity = Vec3.ZERO;
@@ -96,6 +99,9 @@ public class CompanionEntity extends LivingEntity
             this.reflexTelemetry = new CompanionReflexTelemetry(this, this.controller);
             this.context = new CompanionContext(this);
             this.planExecutor = new PlanExecutor(this);
+            this.conversationLog = new ConversationLog(
+                    MineMate.plannerConfig().chatTranscriptTurns(),
+                    MineMate.plannerConfig().chatTranscriptChars());
         }
     }
 
@@ -140,6 +146,11 @@ public class CompanionEntity extends LivingEntity
     /** Server-side only; null on the client. */
     public PlanExecutor getPlanExecutor() {
         return planExecutor;
+    }
+
+    /** Server-side only; null on the client. Bounded conversational memory. */
+    public ConversationLog getConversationLog() {
+        return conversationLog;
     }
 
     /** The owner order being worked on, or null when the companion has no standing instruction. */
@@ -395,6 +406,10 @@ public class CompanionEntity extends LivingEntity
         if (tag.hasUUID(OWNER_NBT_KEY)) {
             this.ownerUuid = tag.getUUID(OWNER_NBT_KEY);
         }
+        if (this.conversationLog != null && tag.contains(CONVERSATION_NBT_KEY)) {
+            this.conversationLog.readNbt(
+                    tag.getList(CONVERSATION_NBT_KEY, ConversationLog.nbtListType()));
+        }
     }
 
     @Override
@@ -405,6 +420,9 @@ public class CompanionEntity extends LivingEntity
         tag.putInt("SelectedItemSlot", this.inventory.selectedSlot);
         if (this.ownerUuid != null) {
             tag.putUUID(OWNER_NBT_KEY, this.ownerUuid);
+        }
+        if (this.conversationLog != null) {
+            tag.put(CONVERSATION_NBT_KEY, this.conversationLog.writeNbt());
         }
     }
 

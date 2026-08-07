@@ -69,8 +69,6 @@ public final class PlanExecutor {
     private Goal activeGoal;
     private long startMs;
     private PlanOutcome lastOutcome;
-    private int plannerRequestGeneration;
-    private boolean plannerRequestPending;
 
     public PlanExecutor(CompanionEntity companion) {
         this.companion = Objects.requireNonNull(companion, "companion");
@@ -305,36 +303,27 @@ public final class PlanExecutor {
         return value != null && value.isJsonPrimitive() ? value.getAsString() : "";
     }
 
-    /**
-     * Server-thread-only. Claims the next planner request slot and returns its generation, which
-     * {@link #isCurrentPlannerRequest} later checks.
-     *
-     * <p>A planner answers on its own schedule, and a slow one leaves a window in which the owner
-     * can cancel, stop, or ask for something else entirely. Without this, that older answer still
-     * arrives and starts a plan nobody is waiting for any more.
-     */
+    // ---- stage-4a delegates: request concurrency now lives on ConversationCoordinator. ------
+    // These keep every caller compiling unchanged and are deleted in stage 4b.
+
+    /** Server-thread-only. Claims the next planner request slot; see the coordinator. */
     public int beginPlannerRequest() {
-        assertServerThread();
-        plannerRequestPending = true;
-        return ++plannerRequestGeneration;
+        return companion.getConversationCoordinator().beginPlannerRequest();
     }
 
     /** Whether a completed planner request is still the one the owner is waiting for. */
     public boolean isCurrentPlannerRequest(int generation) {
-        return generation == plannerRequestGeneration;
+        return companion.getConversationCoordinator().isCurrentPlannerRequest(generation);
     }
 
     /** Server-thread-only. Marks the in-flight request answered, whatever the answer was. */
     public void completePlannerRequest(int generation) {
-        assertServerThread();
-        if (generation == plannerRequestGeneration) {
-            plannerRequestPending = false;
-        }
+        companion.getConversationCoordinator().completePlannerRequest(generation);
     }
 
     /** Whether a planner has been asked for a plan that has not come back yet. */
     public boolean isPlannerRequestPending() {
-        return plannerRequestPending;
+        return companion.getConversationCoordinator().isRequestPending();
     }
 
     /**
@@ -343,9 +332,7 @@ public final class PlanExecutor {
      * have produced one may still be outstanding.
      */
     public void discardPendingPlannerRequests() {
-        assertServerThread();
-        plannerRequestGeneration++;
-        plannerRequestPending = false;
+        companion.getConversationCoordinator().discardPendingPlannerRequests();
     }
 
     /** Server-thread-only. Cancels the running step as well as the plan. */

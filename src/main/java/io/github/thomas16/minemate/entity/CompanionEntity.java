@@ -15,6 +15,7 @@ import io.github.thomas16.minemate.MineMate;
 import io.github.thomas16.minemate.context.CompanionContext;
 import io.github.thomas16.minemate.context.CompanionJournal;
 import io.github.thomas16.minemate.context.ConversationLog;
+import io.github.thomas16.minemate.planner.ConversationCoordinator;
 import io.github.thomas16.minemate.planner.PlanExecutor;
 import io.github.thomas16.minemate.planner.StandingOrder;
 import io.github.thomas16.minemate.integration.CompanionDefensePolicy;
@@ -78,6 +79,7 @@ public class CompanionEntity extends LivingEntity
     private CompanionReflexTelemetry reflexTelemetry;
     private CompanionContext context;
     private PlanExecutor planExecutor;
+    private ConversationCoordinator conversationCoordinator;
     private StandingOrder standingOrder;
     private ConversationLog conversationLog;
 
@@ -99,6 +101,7 @@ public class CompanionEntity extends LivingEntity
             this.reflexTelemetry = new CompanionReflexTelemetry(this, this.controller);
             this.context = new CompanionContext(this);
             this.planExecutor = new PlanExecutor(this);
+            this.conversationCoordinator = new ConversationCoordinator(this);
             this.conversationLog = new ConversationLog(
                     MineMate.plannerConfig().chatTranscriptTurns(),
                     MineMate.plannerConfig().chatTranscriptChars());
@@ -146,6 +149,11 @@ public class CompanionEntity extends LivingEntity
     /** Server-side only; null on the client. */
     public PlanExecutor getPlanExecutor() {
         return planExecutor;
+    }
+
+    /** Server-side only; null on the client. Owns model-request concurrency and owner turns. */
+    public ConversationCoordinator getConversationCoordinator() {
+        return conversationCoordinator;
     }
 
     /** Server-side only; null on the client. Bounded conversational memory. */
@@ -249,6 +257,9 @@ public class CompanionEntity extends LivingEntity
             // executor polls to decide whether to advance. Context goes last, on settled state.
             this.planExecutor.tick();
             this.context.tick();
+            // After context: this slice's replan triggers have been heard (and refused or
+            // deferred) before a queued owner turn or a deferred replan is allowed to dispatch.
+            this.conversationCoordinator.tick();
         }
         super.tick();
         this.updateSwingTime();

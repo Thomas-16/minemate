@@ -39,6 +39,10 @@ public final class PlannerConfig {
     public static final int DEFAULT_MAX_REPLANS = 3;
     public static final int DEFAULT_CHAT_TRANSCRIPT_TURNS = 40;
     public static final int DEFAULT_CHAT_TRANSCRIPT_CHARS = 6000;
+    public static final int DEFAULT_CHAT_EARSHOT_BLOCKS = 24;
+    public static final boolean DEFAULT_CHAT_REQUIRES_NAME = false;
+    public static final int DEFAULT_CHAT_DEBOUNCE_MS = 600;
+    public static final int DEFAULT_CHAT_REQUESTS_PER_MINUTE = 12;
 
     private static final String PROPERTY_KEY = "minemate.planner.apiKey";
     private static final String PROPERTY_MODEL = "minemate.planner.model";
@@ -55,22 +59,29 @@ public final class PlannerConfig {
     private final int maxReplansPerOrder;
     private final int chatTranscriptTurns;
     private final int chatTranscriptChars;
+    private final int chatEarshotBlocks;
+    private final boolean chatRequiresName;
+    private final int chatDebounceMs;
+    private final int chatRequestsPerMinute;
     private final String apiKey;
     private final String apiKeySource;
 
     private PlannerConfig(boolean enabled, String provider, String baseUrl, String model,
             String reasoningEffort, String verbosity, int timeoutSeconds, int maxOutputTokens,
             int maxReplansPerOrder, int chatTranscriptTurns, int chatTranscriptChars,
-            String apiKey) {
+            int chatEarshotBlocks, boolean chatRequiresName, int chatDebounceMs,
+            int chatRequestsPerMinute, String apiKey) {
         this(enabled, provider, baseUrl, model, reasoningEffort, verbosity, timeoutSeconds,
                 maxOutputTokens, maxReplansPerOrder, chatTranscriptTurns, chatTranscriptChars,
+                chatEarshotBlocks, chatRequiresName, chatDebounceMs, chatRequestsPerMinute,
                 apiKey, "explicit");
     }
 
     private PlannerConfig(boolean enabled, String provider, String baseUrl, String model,
             String reasoningEffort, String verbosity, int timeoutSeconds, int maxOutputTokens,
             int maxReplansPerOrder, int chatTranscriptTurns, int chatTranscriptChars,
-            String apiKey, String apiKeySource) {
+            int chatEarshotBlocks, boolean chatRequiresName, int chatDebounceMs,
+            int chatRequestsPerMinute, String apiKey, String apiKeySource) {
         this.enabled = enabled;
         this.provider = provider;
         this.baseUrl = baseUrl;
@@ -82,6 +93,10 @@ public final class PlannerConfig {
         this.maxReplansPerOrder = maxReplansPerOrder;
         this.chatTranscriptTurns = chatTranscriptTurns;
         this.chatTranscriptChars = chatTranscriptChars;
+        this.chatEarshotBlocks = chatEarshotBlocks;
+        this.chatRequiresName = chatRequiresName;
+        this.chatDebounceMs = chatDebounceMs;
+        this.chatRequestsPerMinute = chatRequestsPerMinute;
         this.apiKey = apiKey;
         this.apiKeySource = apiKeySource;
     }
@@ -109,7 +124,9 @@ public final class PlannerConfig {
         return new PlannerConfig(true, DEFAULT_PROVIDER, defaultBaseUrl(DEFAULT_PROVIDER),
                 defaultModel(DEFAULT_PROVIDER), DEFAULT_EFFORT, DEFAULT_VERBOSITY,
                 DEFAULT_TIMEOUT_SECONDS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_REPLANS,
-                DEFAULT_CHAT_TRANSCRIPT_TURNS, DEFAULT_CHAT_TRANSCRIPT_CHARS, "");
+                DEFAULT_CHAT_TRANSCRIPT_TURNS, DEFAULT_CHAT_TRANSCRIPT_CHARS,
+                DEFAULT_CHAT_EARSHOT_BLOCKS, DEFAULT_CHAT_REQUIRES_NAME,
+                DEFAULT_CHAT_DEBOUNCE_MS, DEFAULT_CHAT_REQUESTS_PER_MINUTE, "");
     }
 
     /**
@@ -124,7 +141,8 @@ public final class PlannerConfig {
         return new PlannerConfig(true, provider, baseUrl, model, defaults.reasoningEffort,
                 defaults.verbosity, timeoutSeconds, defaults.maxOutputTokens, maxReplansPerOrder,
                 defaults.chatTranscriptTurns, defaults.chatTranscriptChars,
-                apiKey == null ? "" : apiKey);
+                defaults.chatEarshotBlocks, defaults.chatRequiresName, defaults.chatDebounceMs,
+                defaults.chatRequestsPerMinute, apiKey == null ? "" : apiKey);
     }
 
     public static PlannerConfig loadOrCreate() {
@@ -174,6 +192,10 @@ public final class PlannerConfig {
         json.addProperty("maxReplansPerOrder", DEFAULT_MAX_REPLANS);
         json.addProperty("chatTranscriptTurns", DEFAULT_CHAT_TRANSCRIPT_TURNS);
         json.addProperty("chatTranscriptChars", DEFAULT_CHAT_TRANSCRIPT_CHARS);
+        json.addProperty("chatEarshotBlocks", DEFAULT_CHAT_EARSHOT_BLOCKS);
+        json.addProperty("chatRequiresName", DEFAULT_CHAT_REQUIRES_NAME);
+        json.addProperty("chatDebounceMs", DEFAULT_CHAT_DEBOUNCE_MS);
+        json.addProperty("chatRequestsPerMinute", DEFAULT_CHAT_REQUESTS_PER_MINUTE);
         json.addProperty("anthropicApiKey", "");
         json.addProperty("openaiApiKey", "");
         try {
@@ -212,6 +234,10 @@ public final class PlannerConfig {
                 integer(json, "maxReplansPerOrder", defaults.maxReplansPerOrder, 0, 20),
                 integer(json, "chatTranscriptTurns", defaults.chatTranscriptTurns, 4, 200),
                 integer(json, "chatTranscriptChars", defaults.chatTranscriptChars, 500, 50_000),
+                integer(json, "chatEarshotBlocks", defaults.chatEarshotBlocks, 1, 128),
+                bool(json, "chatRequiresName", defaults.chatRequiresName),
+                integer(json, "chatDebounceMs", defaults.chatDebounceMs, 0, 5_000),
+                integer(json, "chatRequestsPerMinute", defaults.chatRequestsPerMinute, 1, 60),
                 key.value(), key.source());
     }
 
@@ -316,6 +342,26 @@ public final class PlannerConfig {
     /** Bounded conversation memory: approximate rendered-character budget for the transcript. */
     public int chatTranscriptChars() {
         return chatTranscriptChars;
+    }
+
+    /** Chat routing: how close unaddressed owner chat must be for the companion to hear it. */
+    public int chatEarshotBlocks() {
+        return chatEarshotBlocks;
+    }
+
+    /** Chat routing: when true, only name-addressed chat reaches the companion. */
+    public boolean chatRequiresName() {
+        return chatRequiresName;
+    }
+
+    /** Chat input: how long the coordinator waits for further typing before one owner turn forms. */
+    public int chatDebounceMs() {
+        return chatDebounceMs;
+    }
+
+    /** Chat cost control: rolling per-minute cap on coalesced hosted chat turns. */
+    public int chatRequestsPerMinute() {
+        return chatRequestsPerMinute;
     }
 
     public Optional<String> apiKey() {

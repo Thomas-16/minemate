@@ -160,6 +160,33 @@ public final class PlanExecutor {
                 contract));
     }
 
+    /**
+     * One server-thread transition for an accepted owner action: replaces whatever is running.
+     * Every validation already happened in {@link #prepare}, so nothing on this path can fail.
+     * Order matters: the old plan's goal is cancelled and its evidence harvested into the old
+     * ledger by {@code finish} before the order swap, because {@code harvestEvidence} reads the
+     * live standing order; only then does the fresh order open with a fresh epoch and budget.
+     */
+    public StartResult startOwnerAction(PreparedPlan prepared, String ownerTurnText) {
+        assertServerThread();
+        if (plan != null) {
+            if (awaitingGoalId != null && companion.getSupervisor().isBusy()) {
+                companion.getSupervisor().cancel(Reasons.SUPERSEDED);
+            }
+            // Publishes the superseded outcome and arms PLAN_FINISHED, which autonomy will
+            // refuse because the replacement plan is active by then.
+            finish(PlanStatus.CANCELLED, Reasons.SUPERSEDED);
+        }
+        companion.closeStandingOrder();
+        companion.openStandingOrder(ownerTurnText);
+        if (prepared.contract() != null) {
+            StandingOrder order = companion.getStandingOrder();
+            order.declareContract(prepared.contract());
+            companion.resolveOwner().ifPresent(order.ledger()::captureOwnerBaselines);
+        }
+        return commit(prepared);
+    }
+
     /** One server-thread transition installing an already-validated plan. */
     public StartResult commit(PreparedPlan prepared) {
         assertServerThread();

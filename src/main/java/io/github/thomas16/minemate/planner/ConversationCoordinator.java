@@ -41,6 +41,21 @@ public final class ConversationCoordinator {
     }
 
     /**
+     * Request-local state for one owner response attempt whose first reply declared a contract
+     * without world calls. Nothing outside the attempt exists yet: no order, no ledger, and the
+     * reply's speech stays buffered until covering actions are accepted, so the companion never
+     * promises work it has not committed to (design section 5.4).
+     */
+    public record PendingCommitment(OrderContract contract, String bufferedSpeech,
+            String ownerTurnText) {
+        public PendingCommitment {
+            Objects.requireNonNull(contract, "contract");
+            bufferedSpeech = bufferedSpeech == null ? "" : bufferedSpeech;
+            ownerTurnText = ownerTurnText == null ? "" : ownerTurnText;
+        }
+    }
+
+    /**
      * Bound on the coalesced turn waiting behind an in-flight request. Oldest lines are evicted
      * first: the newest correction is the operative text, not the opening remark.
      */
@@ -55,6 +70,8 @@ public final class ConversationCoordinator {
     private final ArrayDeque<String> debounceLines = new ArrayDeque<>();
     private long debounceDeadlineGameTime = -1L;
     private DeferredReplan deferredReplan;
+    private PendingCommitment pendingCommitment;
+    private boolean attemptRepairUsed;
 
     public ConversationCoordinator(CompanionEntity companion) {
         this.companion = Objects.requireNonNull(companion, "companion");
@@ -105,6 +122,11 @@ public final class ConversationCoordinator {
     /** Claims the next request slot. Whatever was in flight before is stale from this moment. */
     public RequestTicket begin(RequestOrigin origin) {
         assertServerThread();
+        if (origin == RequestOrigin.OWNER_CHAT || origin == RequestOrigin.AUTONOMOUS_REPLAN) {
+            // A fresh attempt; whatever a previous attempt buffered or spent dies with it. The
+            // continuation and repair origins belong to the current attempt and keep its state.
+            clearAttemptState();
+        }
         StandingOrder order = companion.getStandingOrder();
         long orderEpoch = order == null ? 0L : order.epoch();
         String planId = companion.getPlanExecutor() == null ? ""
@@ -149,6 +171,34 @@ public final class ConversationCoordinator {
         return inFlight == null && queuedLines.isEmpty() && debounceLines.isEmpty();
     }
 
+    // ---- pending commitment (request-local, stage 5) ----------------------------------------
+
+    /** The current attempt's stored contract-only commitment, or null. */
+    public PendingCommitment pendingCommitment() {
+        return pendingCommitment;
+    }
+
+    public void storePendingCommitment(PendingCommitment commitment) {
+        assertServerThread();
+        pendingCommitment = commitment;
+    }
+
+    /** One bounded semantic repair per owner response attempt, request-local until acceptance. */
+    public boolean attemptRepairAvailable() {
+        return !attemptRepairUsed;
+    }
+
+    public void consumeAttemptRepair() {
+        assertServerThread();
+        attemptRepairUsed = true;
+    }
+
+    /** Ends the current owner response attempt: accepted, failed, or superseded, it is over. */
+    public void clearAttemptState() {
+        pendingCommitment = null;
+        attemptRepairUsed = false;
+    }
+
     // ---- deferred replans -------------------------------------------------------------------
 
     /**
@@ -176,6 +226,7 @@ public final class ConversationCoordinator {
         debounceLines.clear();
         debounceDeadlineGameTime = -1L;
         deferredReplan = null;
+        clearAttemptState();
     }
 
     // ---- tick -------------------------------------------------------------------------------

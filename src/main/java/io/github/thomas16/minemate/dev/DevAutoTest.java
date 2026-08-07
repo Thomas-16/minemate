@@ -716,9 +716,13 @@ public final class DevAutoTest {
                         ignoredServer -> prepareLlmMultiStep(),
                         DevAutoTest::clearLlmPlanner,
                         () -> null),
-                Scenario.plan("llm_unknown_tool",
-                        ignored -> null,
-                        DevAutoTest::acceptLlmUnknownTool,
+                // An unknown tool in an owner reply spends the request-local repair; the fixture
+                // repeats the habit, so the attempt fails conversationally with no plan, no
+                // outcome, and no order ever opened.
+                Scenario.probe("llm_unknown_tool",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && llmPlannerSettled(),
+                        DevAutoTest::llmUnknownToolVerdict,
                         200,
                         ignoredServer -> prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(
                                 llmResponse("On it.",
@@ -840,8 +844,7 @@ public final class DevAutoTest {
                 // is in flight stales that result and gets its own request afterwards.
                 Scenario.probe("chat_owner_beats_autonomy",
                         () -> llmTransport != null && llmTransport.calls() == 2
-                                && llmPlannerSettled()
-                                && companion.getStandingOrder() == null,
+                                && llmPlannerSettled(),
                         DevAutoTest::chatOwnerBeatsAutonomyVerdict,
                         900,
                         ignoredServer -> prepareChatOwnerBeatsAutonomy(),
@@ -997,12 +1000,14 @@ public final class DevAutoTest {
                 // A COMPLETED claim with no delivery evidence is rejected, repaired once, and when
                 // the model insists, closed honestly: three requests, nothing executed.
                 Scenario.probe("llm_completed_denied_close",
-                        () -> llmPlannerSettled() && companion.getStandingOrder() == null,
+                        () -> llmTransport != null && llmTransport.calls() == 3
+                                && llmPlannerSettled()
+                                && companion.getStandingOrder() == null,
                         DevAutoTest::llmCompletedDeniedCloseVerdict,
-                        300,
+                        600,
                         ignoredServer -> prepareLlmCompletedDeniedClose(),
                         DevAutoTest::clearLlmPlanner,
-                        DevAutoTest::planRejectionInvariant),
+                        () -> null),
                 // The full reject-repair-deliver-accept loop: an unevidenced COMPLETED spends the
                 // repair, the repaired fetch delivers, and the next COMPLETED closes on evidence.
                 Scenario.probe("llm_completed_without_evidence",
@@ -1198,6 +1203,13 @@ public final class DevAutoTest {
             // The autonomous replan is now in flight; the owner speaks over it.
             chatInterventionDone = true;
             companion.getConversationCoordinator().submitOwnerTurnNow("actually never mind that");
+        }
+        if ("llm_completed_without_evidence".equals(scenario.name()) && !chatInterventionDone
+                && llmTransport != null && llmTransport.calls() >= 3) {
+            // The owner arrives just as the repaired fetch is requested, so the first fetch
+            // blocked owner_offline and the repaired one can actually deliver.
+            chatInterventionDone = true;
+            prepareFakeOwner(COMPLETED_REPAIR_OWNER_UUID, "MineMateCompletedRepairOwner");
         }
         if (scenarioTicks > scenario.hardCapTicks()) {
             fail(server, scenario.name() + " exceeded its hard cap");
@@ -1600,9 +1612,8 @@ public final class DevAutoTest {
         if (companion.getConversationLog() != null) {
             companion.getConversationLog().clear();
         }
-        companion.openStandingOrder(requestText);
         // The same entry point the command path uses, so what the suite exercises cannot drift
-        // from what the player's /companion plan does.
+        // from what the player's /companion plan does. No order opens until acceptance.
         companion.getConversationCoordinator().submitOwnerTurnNow(requestText);
     }
 
@@ -1753,27 +1764,34 @@ public final class DevAutoTest {
      * free continuation, the unevidenced COMPLETED spends the repair, and the repeated claim
      * closes the order honestly. Nothing executes.
      */
+    /**
+     * No owner on purpose: the accepted fetch blocks owner_offline, so the ledger stays
+     * unevidenced and the replan's COMPLETED claim must be denied, repaired, and -- when the
+     * fixture repeats the claim -- honestly closed as unconfirmed.
+     */
     private static void prepareLlmCompletedDeniedClose() {
-        prepareInventory();
-        prepareFakeOwner(FAKE_OWNER_UUID, "MineMateOwner");
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 2));
         installLlmPlanner(FixtureTransport.of(
                 FixtureTransport.ok(llmResponse("I will bring you the planks.",
-                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true))),
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true),
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}"))),
                 FixtureTransport.ok(llmResponse(null,
-                        llmStatus("COMPLETED", "Delivered them to you.")))), 0);
+                        llmStatus("COMPLETED", "Delivered them to you.")))), 1);
         requestLlmPlan("bring me two oak planks");
     }
 
     /**
-     * The full loop: an unevidenced COMPLETED is rejected and repaired, the repaired fetch really
-     * delivers, and the next COMPLETED closes on the ledger's evidence.
+     * The full loop: the accepted fetch blocks with no owner around, the replan's COMPLETED claim
+     * is rejected and repaired, the repaired fetch really delivers (the owner arrives mid-repair
+     * via the tick hook), and the next COMPLETED closes on the ledger's evidence.
      */
     private static void prepareLlmCompletedWithoutEvidence() {
+        chatInterventionDone = false;
         prepareInventory(new ItemStack(Items.OAK_PLANKS, 2));
-        prepareFakeOwner(COMPLETED_REPAIR_OWNER_UUID, "MineMateCompletedRepairOwner");
         installLlmPlanner(FixtureTransport.of(
                 FixtureTransport.ok(llmResponse("I will bring you the planks.",
-                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true))),
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true),
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}"))),
                 FixtureTransport.ok(llmResponse(null,
                         llmStatus("COMPLETED", "Delivered them to you."))),
                 FixtureTransport.ok(llmResponse("Bringing them over now.",
@@ -1884,7 +1902,6 @@ public final class DevAutoTest {
         if (companion.getConversationLog() != null) {
             companion.getConversationLog().clear();
         }
-        companion.openStandingOrder(order);
         companion.getConversationCoordinator().submitOwnerTurnNow(order);
     }
 
@@ -2234,6 +2251,11 @@ public final class DevAutoTest {
         if (entries.stream().anyMatch(entry -> entry.text().contains("Back to it."))) {
             return "the stale autonomous reply's speech reached the conversation";
         }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || !"keep gathering dirt".equals(order.requestText())) {
+            return "the speech-only owner reply should have preserved the open order, saw "
+                    + order;
+        }
         return null;
     }
 
@@ -2503,7 +2525,6 @@ public final class DevAutoTest {
         log.recordOwner("hello there", gameTime);
         log.recordCompanion(AUTOTEST_COMPANION_NAME + ": Hey! Good to see you.", gameTime);
         log.recordActivity("delivered 1 crafting_table to owner", gameTime);
-        companion.openStandingOrder("where are you?");
         companion.getConversationCoordinator().submitOwnerTurnNow("where are you?");
     }
 
@@ -2915,7 +2936,7 @@ public final class DevAutoTest {
 
     private static String llmCompletedDeniedCloseVerdict() {
         if (llmTransport.calls() != 3) {
-            return "expected continuation, rejected COMPLETED, then close, saw "
+            return "expected action, rejected COMPLETED, then close, saw "
                     + llmTransport.calls();
         }
         String repairBody = llmTransport.requestBody(2);
@@ -2926,14 +2947,8 @@ public final class DevAutoTest {
                 + " COMPLETED but the ledger shows 0 of 2 oak_planks delivered)")) {
             return "the repeated claim did not record the ledger violation";
         }
-        if (sawNewPlanOutcome()) {
-            return "an unevidenced COMPLETED reached PlanExecutor";
-        }
-        if (companion.getSupervisor().currentGoal().isPresent()) {
-            return "an unevidenced COMPLETED submitted a goal";
-        }
         if (companion.getPlanExecutor().isActive()) {
-            return "an unevidenced COMPLETED started a plan";
+            return "the denied close left a plan running";
         }
         return null;
     }
@@ -3122,16 +3137,21 @@ public final class DevAutoTest {
         return accepted;
     }
 
-    private static boolean acceptLlmUnknownTool(PlanOutcome outcome) {
-        boolean accepted = outcome.status() == PlanStatus.REJECTED
-                && Reasons.UNKNOWN_TOOL.equals(outcome.reason())
-                && outcome.stepOutcomes().isEmpty()
-                && outcome.completedSteps() == 0;
-        if (!accepted) {
-            MineMate.LOGGER.error("[autotest] llm_unknown_tool postcondition {}",
-                    outcome.toCompactString());
+    private static String llmUnknownToolVerdict() {
+        String failure = llmFailureVerdict("unknown tool");
+        if (failure != null) {
+            return failure;
         }
-        return accepted;
+        if (sawNewPlanOutcome()) {
+            return "an unknown-tool reply reached PlanExecutor";
+        }
+        if (llmTransport.calls() != 2) {
+            return "expected the bounded repair round, saw " + llmTransport.calls() + " requests";
+        }
+        if (!llmTransport.lastRequestBody().contains("REPAIR:")) {
+            return "the repair request carried no REPAIR note";
+        }
+        return null;
     }
 
     private static boolean acceptLlmHttpRetry(PlanOutcome outcome) {

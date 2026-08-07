@@ -158,12 +158,8 @@ public final class CompanionCommands {
             source.sendFailure(Component.literal("No companion nearby"));
             return 0;
         }
-        // Match the interactive feel of the chat verbs: a new request supersedes the old one.
-        if (companion.getPlanExecutor().isActive()) {
-            companion.getPlanExecutor().cancel(Reasons.SUPERSEDED);
-        }
-        // A fresh order, with a fresh replan budget. This is the only place one is opened.
-        companion.openStandingOrder(requestText);
+        // No order opens here and nothing is cancelled: the utterance is conversation until the
+        // reply proves otherwise, and an accepted action replaces the old work atomically.
         if (Planners.active() instanceof ScriptedPlanner scripted) {
             scripted.bind(companion);
         }

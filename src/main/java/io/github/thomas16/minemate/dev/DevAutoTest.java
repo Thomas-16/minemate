@@ -31,6 +31,8 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
@@ -54,7 +56,9 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import io.github.thomas16.minemate.chat.CompanionChatListener;
 import io.github.thomas16.minemate.chat.CompanionSpeech;
+import io.github.thomas16.minemate.entity.CompanionDirectory;
 import io.github.thomas16.minemate.context.CompanionJournal;
 import io.github.thomas16.minemate.context.ConversationLog;
 import io.github.thomas16.minemate.context.EventKind;
@@ -83,6 +87,7 @@ import io.github.thomas16.minemate.planner.RequestOrigin;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
 import io.github.thomas16.minemate.planner.StandingOrder;
 import io.github.thomas16.minemate.planner.llm.AnthropicMessagesBackend;
+import io.github.thomas16.minemate.planner.llm.HttpTransport;
 import io.github.thomas16.minemate.planner.llm.LlmException;
 import io.github.thomas16.minemate.planner.llm.LlmPrompt;
 import io.github.thomas16.minemate.planner.llm.LlmReply;
@@ -165,7 +170,16 @@ public final class DevAutoTest {
             "llm_replan_remainder_repair",
             "chat_newer_turn_stales_reply",
             "chat_stop_while_pending",
-            "chat_owner_beats_autonomy");
+            "chat_owner_beats_autonomy",
+            "chat_action_commit",
+            "chat_during_plan_status",
+            "chat_cancel",
+            "chat_failure_during_plan",
+            "chat_contract_only",
+            "chat_earshot",
+            "chat_name_address",
+            "chat_stop_form",
+            "chat_non_owner");
     /** Scenarios that make real network calls. Selectable by name, never included in a profile. */
     private static final Set<String> LIVE_SCENARIOS = Set.of("llm_live", "llm_live_multi_step");
     private static final UUID FAKE_OWNER_UUID =
@@ -183,6 +197,26 @@ public final class DevAutoTest {
             UUID.fromString("9d8c7b6a-5e4f-4a3b-8c2d-7f6e5d4c3b2a");
     private static final UUID FETCH_ITEMS_LLM_OWNER_UUID =
             UUID.fromString("2e7a9c4d-8b1f-4e6a-a3c5-9d8e7f6a5b4c");
+    private static final UUID CHAT_ACTION_OWNER_UUID =
+            UUID.fromString("6b3e91d7-4c28-4f5a-b0e9-8d17a25c43f6");
+    private static final UUID CHAT_CONTRACT_ONLY_OWNER_UUID =
+            UUID.fromString("c81f5d2a-9e64-4b07-a3d8-51b9e70f26c4");
+    private static final UUID CHAT_EARSHOT_OWNER_UUID =
+            UUID.fromString("1a4c8e2b-7d95-40f3-b6a1-c92d5e8f3a70");
+    private static final UUID CHAT_NAME_OWNER_UUID =
+            UUID.fromString("83f5d1c7-2b9e-4a06-9d84-e61b3f7c2a95");
+    private static final UUID CHAT_STOP_OWNER_UUID =
+            UUID.fromString("d92b6f3a-8c14-4e57-a0b9-7f2e5c8d1b46");
+    private static final UUID CHAT_NETHER_OWNER_UUID =
+            UUID.fromString("47e1a9d5-3f82-4c60-b7d3-9a5e2c8f1b74");
+    private static final UUID CHAT_UNLOADED_OWNER_UUID =
+            UUID.fromString("b58d2c9f-6a41-4e83-92c7-d1f8a3e5b620");
+    private static final UUID CHAT_NON_OWNER_PLAYER_UUID =
+            UUID.fromString("29c7e4b1-5d38-4f92-a6e0-8b3d1c7f5a29");
+    private static final UUID CHAT_NON_OWNER_REAL_OWNER_UUID =
+            UUID.fromString("f3a81d6c-4e29-47b5-90d8-2c6f9e1a4b83");
+    private static final UUID CHAT_CAP_OWNER_UUID =
+            UUID.fromString("60d4f2a8-9b17-4c53-8e6a-1f5c3d9b7e42");
     /**
      * llm_claude_plan completes a real delivery, and a FakePlayer that has been delivered to,
      * discarded and re-added from Fabric's profile cache stops receiving deliveries. Every
@@ -227,6 +261,13 @@ public final class DevAutoTest {
     private static FixtureTransport llmTransport;
     private static boolean llmBudgetSawFinalPlanOpen;
     private static boolean chatInterventionDone;
+    private static String chatCapturedPlanId;
+    private static String chatCapturedGoalId;
+    private static long chatCapturedEpoch;
+    private static OrderLedger chatCapturedLedger;
+    private static String chatDeferralNote;
+    private static ServerPlayer chatSecondPlayer;
+    private static int chatCapTurnsSent;
     private static CompanionResponse llmObservedLiveResponse;
     private static boolean ownerDamageAccepted;
     private static boolean ownerDirectAttackBlocked;
@@ -850,6 +891,187 @@ public final class DevAutoTest {
                         ignoredServer -> prepareChatOwnerBeatsAutonomy(),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
+                // Accepted owner actions open the order only at acceptance, seeded with the
+                // declared contract and its ledger.
+                Scenario.probe("chat_action_commit",
+                        () -> llmTransport != null && llmTransport.calls() == 1
+                                && companion.getPlanExecutor().isActive(),
+                        DevAutoTest::chatActionCommitVerdict,
+                        300,
+                        ignoredServer -> prepareChatActionCommit(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // A status question mid-plan preserves plan, goal, order epoch, and ledger
+                // identity; the answer is conversation, not lifecycle.
+                Scenario.probe("chat_during_plan_status",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && !companion.getConversationCoordinator().isRequestPending()
+                                && chatInterventionDone,
+                        DevAutoTest::chatDuringPlanStatusVerdict,
+                        600,
+                        ignoredServer -> prepareChatMidPlanWalk("go stand by the oak",
+                                FixtureTransport.ok(llmResponse("About halfway there."))),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // A mid-plan amendment replaces plan and order atomically: the old plan ends
+                // superseded, and a fresh epoch opens only after the replacement validated.
+                Scenario.probe("chat_during_plan_amend",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && chatInterventionDone
+                                && companion.getPlanExecutor().isActive()
+                                && !companion.getPlanExecutor().currentPlan().map(Plan::id)
+                                        .orElse("").equals(chatCapturedPlanId),
+                        DevAutoTest::chatDuringPlanAmendVerdict,
+                        600,
+                        ignoredServer -> prepareChatMidPlanWalk("walk to the far oak",
+                                // A far replacement target, so the new plan is still running
+                                // when the verdict compares identities.
+                                FixtureTransport.ok(llmResponse("Turning around.",
+                                        llmContract("[]", false),
+                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 24)
+                                                + ",\"z\":" + (spawn.getZ() + 2) + "}")))),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // An invalid replacement, repaired and still invalid, leaves the old plan and
+                // order untouched and says the old work is still running.
+                Scenario.probe("chat_invalid_amend",
+                        () -> llmTransport != null && llmTransport.calls() == 3
+                                && !companion.getConversationCoordinator().isRequestPending()
+                                && chatInterventionDone,
+                        DevAutoTest::chatInvalidAmendVerdict,
+                        600,
+                        ignoredServer -> prepareChatMidPlanWalk("walk to the oak",
+                                FixtureTransport.ok(llmResponse("Fetching it.",
+                                        llmContract("[{\"item\":\"stone_pickaxe\",\"count\":1}]",
+                                                true),
+                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 2)
+                                                + ",\"z\":" + spawn.getZ() + "}")))),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // A natural mid-plan cancellation stops executor and supervisor, harvests, and
+                // closes the order with one remembered line.
+                Scenario.probe("chat_cancel",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && llmPlannerSettled()
+                                && companion.getStandingOrder() == null
+                                && chatInterventionDone,
+                        DevAutoTest::chatCancelVerdict,
+                        600,
+                        ignoredServer -> prepareChatMidPlanWalk("walk over to the oak",
+                                FixtureTransport.ok(llmResponse("Sure, stopping.",
+                                        llmStatus("CANCELLED", "Stopping now.")))),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // A close with no assistant speech displays and remembers the status message.
+                Scenario.probe("chat_close_without_speech",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && llmPlannerSettled()
+                                && companion.getStandingOrder() == null
+                                && chatInterventionDone,
+                        DevAutoTest::chatCloseWithoutSpeechVerdict,
+                        600,
+                        ignoredServer -> prepareChatMidPlanWalk("walk toward the oak",
+                                FixtureTransport.ok(llmResponse(null,
+                                        llmStatus("CANCELLED", "Stopping now.")))),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // A transport failure mid-plan preserves the plan and order; the fallback says
+                // the old work is still running.
+                Scenario.probe("chat_failure_during_plan",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && !companion.getConversationCoordinator().isRequestPending()
+                                && chatInterventionDone,
+                        DevAutoTest::chatFailureDuringPlanVerdict,
+                        600,
+                        ignoredServer -> prepareChatMidPlanWalk("walk out to the oak",
+                                FixtureTransport.error(401, "unauthorized", "bad key")),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // The contract-only habit opens no order: the commitment stays request-local and
+                // exactly one order exists, after the covering actions are accepted.
+                Scenario.probe("chat_contract_only",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && companion.getPlanExecutor().isActive(),
+                        DevAutoTest::chatContractOnlyVerdict,
+                        300,
+                        ignoredServer -> prepareChatContractOnly(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> llmTransport != null && !companion.getPlanExecutor().isActive()
+                                && companion.getStandingOrder() != null
+                                ? "an order existed before any plan was accepted" : null),
+                // A plan boundary that fires during owner chat is deferred, not dropped, and is
+                // replayed as an autonomous replan once the conversation settles.
+                Scenario.probe("chat_plan_finishes_while_pending",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && companion.getPlanExecutor().isActive(),
+                        DevAutoTest::chatPlanFinishesWhilePendingVerdict,
+                        600,
+                        ignoredServer -> prepareChatPlanFinishesWhilePending(),
+                        DevAutoTest::clearLlmPlanner,
+                        () -> null),
+                // Nearby unaddressed owner chat routes; the same chat from beyond earshot does
+                // not, and the ignored line never reaches the transcript.
+                Scenario.probe("chat_earshot",
+                        () -> scenarioTicks > 120,
+                        DevAutoTest::chatEarshotVerdict,
+                        400,
+                        DevAutoTest::prepareChatEarshot,
+                        DevAutoTest::clearChatScenario,
+                        () -> null),
+                // The complete name plus a boundary routes at any distance and strips the prefix
+                // before the model turn; a near-miss name routes nothing.
+                Scenario.probe("chat_name_address",
+                        () -> scenarioTicks > 120,
+                        DevAutoTest::chatNameAddressVerdict,
+                        400,
+                        DevAutoTest::prepareChatNameAddress,
+                        DevAutoTest::clearChatScenario,
+                        () -> null),
+                // "Ada Stone, stop" mid-plan is deterministic: everything stops, the order
+                // closes, no model call is spent, and the companion acknowledges in character.
+                Scenario.probe("chat_stop_form",
+                        () -> chatInterventionDone && llmPlannerSettled()
+                                && companion.getStandingOrder() == null,
+                        DevAutoTest::chatStopFormVerdict,
+                        600,
+                        DevAutoTest::prepareChatStopForm,
+                        DevAutoTest::clearChatScenario,
+                        () -> null),
+                // Name-addressed chat reaches a loaded companion from another dimension.
+                Scenario.probe("chat_cross_dimension",
+                        () -> scenarioTicks > 120,
+                        DevAutoTest::chatCrossDimensionVerdict,
+                        400,
+                        DevAutoTest::prepareChatCrossDimension,
+                        DevAutoTest::clearChatScenario,
+                        () -> null),
+                // An addressed but unloaded companion produces the deterministic last-known line
+                // and never spends a model call.
+                Scenario.probe("chat_unloaded",
+                        () -> scenarioTicks > 60,
+                        DevAutoTest::chatUnloadedVerdict,
+                        300,
+                        DevAutoTest::prepareChatUnloaded,
+                        DevAutoTest::clearChatScenario,
+                        () -> null),
+                // Another player's chat never routes, while the owner's still does.
+                Scenario.probe("chat_non_owner",
+                        () -> scenarioTicks > 120,
+                        DevAutoTest::chatNonOwnerVerdict,
+                        400,
+                        DevAutoTest::prepareChatNonOwner,
+                        DevAutoTest::clearChatScenario,
+                        () -> null),
+                // Debounce folds rapid lines into one hosted turn; the rolling cap stops at the
+                // configured limit with one throttle line, and the throttled text stays heard.
+                Scenario.probe("chat_coalesce_and_cap",
+                        () -> chatCapTurnsSent >= 13 && llmPlannerSettled()
+                                && scenarioTicks > 320,
+                        DevAutoTest::chatCoalesceAndCapVerdict,
+                        900,
+                        DevAutoTest::prepareChatCoalesceAndCap,
+                        DevAutoTest::clearChatScenario,
+                        () -> null),
                 Scenario.probe("llm_plan_boundary",
                         () -> scenarioTicks > 250,
                         DevAutoTest::llmPlanBoundaryVerdict,
@@ -1210,6 +1432,66 @@ public final class DevAutoTest {
             // blocked owner_offline and the repaired one can actually deliver.
             chatInterventionDone = true;
             prepareFakeOwner(COMPLETED_REPAIR_OWNER_UUID, "MineMateCompletedRepairOwner");
+        }
+        boolean midPlanChat = switch (scenario.name()) {
+            case "chat_during_plan_status", "chat_during_plan_amend", "chat_invalid_amend",
+                    "chat_cancel", "chat_close_without_speech", "chat_failure_during_plan" -> true;
+            default -> false;
+        };
+        if (midPlanChat && !chatInterventionDone && scenarioTicks >= 20
+                && companion.getPlanExecutor().isActive()) {
+            // The walk is under way; the owner speaks. State is captured first so the verdict
+            // can compare plan, goal, epoch, and ledger identity against what was running.
+            chatInterventionDone = true;
+            captureChatPlanState();
+            companion.getConversationCoordinator().submitOwnerTurnNow(switch (scenario.name()) {
+                case "chat_during_plan_status" -> "how is it going";
+                case "chat_during_plan_amend" -> "actually walk back instead";
+                case "chat_invalid_amend" -> "fetch me a stone pickaxe";
+                case "chat_failure_during_plan" -> "are you lost";
+                default -> "stop walking please";
+            });
+        }
+        if ("chat_plan_finishes_while_pending".equals(scenario.name())) {
+            if (scenarioTicks == 2) {
+                companion.getConversationCoordinator().submitOwnerTurnNow("how is it going");
+            }
+            if (scenarioTicks == 4 && !chatInterventionDone) {
+                // The trigger a finished plan would have armed fires while the owner request is
+                // genuinely in flight, which is the only window in which deferral can happen.
+                chatInterventionDone = true;
+                if (!companion.getConversationCoordinator().isRequestPending()) {
+                    chatDeferralNote = "the owner request was not in flight when the trigger fired";
+                }
+                companion.getContext().triggers().arm(ReplanReason.PLAN_FINISHED,
+                        "succeeded goal_met");
+            }
+        }
+        if ("chat_earshot".equals(scenario.name()) && scenarioTicks == 60) {
+            // The first line has been heard and answered; the second comes from too far away.
+            moveFakeOwnerTo(60, 0);
+            CompanionChatListener.handle(server, fakeOwner, "are you still there");
+        }
+        if ("chat_name_address".equals(scenario.name()) && scenarioTicks == 60) {
+            // Near-miss names: no boundary after the complete name, and an incomplete name.
+            CompanionChatListener.handle(server, fakeOwner, "Ada Stones come here");
+            CompanionChatListener.handle(server, fakeOwner, "Ada come here");
+        }
+        if ("chat_stop_form".equals(scenario.name()) && !chatInterventionDone
+                && scenarioTicks >= 20 && companion.getPlanExecutor().isActive()) {
+            chatInterventionDone = true;
+            CompanionChatListener.handle(server, fakeOwner, "Ada Stone, stop");
+        }
+        if ("chat_non_owner".equals(scenario.name()) && scenarioTicks == 40) {
+            // The positive control: the real owner's chat still routes after the stranger's
+            // was ignored.
+            CompanionChatListener.handle(server, fakeOwner, "hello companion");
+        }
+        if ("chat_coalesce_and_cap".equals(scenario.name()) && scenarioTicks > 0
+                && scenarioTicks % 20 == 0 && chatCapTurnsSent < 13
+                && !companion.getConversationCoordinator().isRequestPending()) {
+            chatCapTurnsSent++;
+            CompanionChatListener.handle(server, fakeOwner, "line " + chatCapTurnsSent);
         }
         if (scenarioTicks > scenario.hardCapTicks()) {
             fail(server, scenario.name() + " exceeded its hard cap");
@@ -1587,6 +1869,190 @@ public final class DevAutoTest {
         }
         companion.openStandingOrder("keep gathering dirt");
         companion.getContext().triggers().arm(ReplanReason.PLAN_FINISHED, "succeeded goal_met");
+    }
+
+    private static void captureChatPlanState() {
+        chatCapturedPlanId = companion.getPlanExecutor().currentPlan().map(Plan::id).orElse("");
+        chatCapturedGoalId = companion.getSupervisor().currentGoal().map(Goal::id).orElse("");
+        StandingOrder order = companion.getStandingOrder();
+        chatCapturedEpoch = order == null ? -1L : order.epoch();
+        chatCapturedLedger = order == null ? null : order.ledger();
+    }
+
+    /**
+     * A long accepted walk with an empty contract: the canvas for every mid-plan conversation
+     * scenario. The tick hook injects the owner turn once the plan is genuinely under way, and
+     * the follow-up reply decides whether it was a status question, an amendment, a
+     * cancellation, or a failure.
+     */
+    private static void prepareChatMidPlanWalk(String requestText,
+            HttpTransport.HttpReply followUp) {
+        chatInterventionDone = false;
+        chatCapturedPlanId = null;
+        chatCapturedGoalId = null;
+        chatCapturedEpoch = -1L;
+        chatCapturedLedger = null;
+        prepareLlmPlan(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("Walking over.",
+                        llmContract("[]", false),
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 24) + ",\"z\":"
+                                + (spawn.getZ() + 8) + "}"))),
+                followUp), requestText);
+    }
+
+    private static void prepareChatActionCommit() {
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 2));
+        // With no owner the fetch would block on its first step and, with a zero replan budget,
+        // close the order before the verdict looks; the owner keeps the accepted plan running.
+        prepareFakeOwner(CHAT_ACTION_OWNER_UUID, "MineMateChatActionOwner");
+        prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(llmResponse("On my way.",
+                llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true),
+                llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}")))),
+                "bring me two oak planks");
+    }
+
+    private static void prepareChatContractOnly() {
+        prepareInventory(new ItemStack(Items.OAK_PLANKS, 2));
+        prepareFakeOwner(CHAT_CONTRACT_ONLY_OWNER_UUID, "MineMateChatContractOwner");
+        prepareLlmPlan(FixtureTransport.of(
+                FixtureTransport.ok(llmResponse("I can get those.",
+                        llmContract("[{\"item\":\"oak_planks\",\"count\":2}]", true))),
+                FixtureTransport.ok(llmResponse("On it.",
+                        llmCall("fetch", "{\"resource\":\"oak_planks\",\"count\":2}")))),
+                "bring me two oak planks");
+    }
+
+    /**
+     * An open order with everything idle, an owner turn in flight against a delayed fixture, and
+     * the plan-finished trigger armed inside that window: the deferral path end to end. The
+     * trigger state is reset in setup so the arm fires deterministically on the next tick.
+     */
+    private static void prepareChatPlanFinishesWhilePending() {
+        chatInterventionDone = false;
+        chatDeferralNote = null;
+        prepareInventory();
+        installLlmPlanner(FixtureTransport.delayed(400L,
+                FixtureTransport.ok(llmResponse("Still on it.")),
+                // A far target, so the replayed replan's plan is still active for the verdict.
+                FixtureTransport.ok(llmResponse("Back to it.",
+                        llmContract("[]", false),
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 24) + ",\"z\":"
+                                + (spawn.getZ() + 8) + "}")))), 1);
+        companion.getJournal().clear();
+        if (companion.getConversationLog() != null) {
+            companion.getConversationLog().clear();
+        }
+        companion.openStandingOrder("keep digging dirt");
+        chatCapturedEpoch = companion.getStandingOrder().epoch();
+        companion.getContext().triggers().reset();
+    }
+
+    private static void prepareChatEarshot(MinecraftServer server) {
+        prepareInventory();
+        prepareFakeOwner(CHAT_EARSHOT_OWNER_UUID, "MineMateChatEarshotOwner");
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("Right here with you."))), 0);
+        companion.getJournal().clear();
+        companion.getConversationLog().clear();
+        CompanionChatListener.handle(server, fakeOwner, "come over here");
+    }
+
+    private static void prepareChatNameAddress(MinecraftServer server) {
+        prepareInventory();
+        prepareFakeOwner(CHAT_NAME_OWNER_UUID, "MineMateChatNameOwner");
+        moveFakeOwnerTo(60, 0);
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("Coming."))), 0);
+        companion.getJournal().clear();
+        companion.getConversationLog().clear();
+        CompanionChatListener.handle(server, fakeOwner, "ada stone, come here");
+    }
+
+    private static void prepareChatStopForm(MinecraftServer server) {
+        chatInterventionDone = false;
+        prepareInventory();
+        prepareFakeOwner(CHAT_STOP_OWNER_UUID, "MineMateChatStopOwner");
+        prepareLlmPlan(FixtureTransport.of(FixtureTransport.ok(llmResponse("Walking over.",
+                llmContract("[]", false),
+                llmCall("goto", "{\"x\":" + (spawn.getX() + 24) + ",\"z\":"
+                        + (spawn.getZ() + 8) + "}")))),
+                "walk to the oak");
+    }
+
+    /**
+     * The owner speaks from the nether while the companion stays loaded in the overworld: the
+     * directory, not proximity, is what resolves an addressed line. The sender is never added to
+     * a player list; routing needs only its identity, level, and words.
+     */
+    private static void prepareChatCrossDimension(MinecraftServer server) {
+        prepareInventory();
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("On my way through the portal."))), 0);
+        companion.getJournal().clear();
+        companion.getConversationLog().clear();
+        ServerLevel nether = server.getLevel(Level.NETHER);
+        chatSecondPlayer = FakePlayer.get(nether != null ? nether
+                : (ServerLevel) companion.level(),
+                new GameProfile(CHAT_NETHER_OWNER_UUID, "MineMateChatNetherOwner"));
+        chatSecondPlayer.moveTo(0.5, 64.0, 0.5, 0.0F, 0.0F);
+        companion.setOwnerUuid(CHAT_NETHER_OWNER_UUID);
+        // An unaddressed line from another dimension is out of earshot by definition.
+        CompanionChatListener.handle(server, chatSecondPlayer, "hello over there");
+        CompanionChatListener.handle(server, chatSecondPlayer, "Ada Stone, hello there");
+    }
+
+    private static void prepareChatUnloaded(MinecraftServer server) {
+        prepareInventory();
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("You should never see this."))), 0);
+        companion.getJournal().clear();
+        companion.getConversationLog().clear();
+        companion.setOwnerUuid(null);
+        chatSecondPlayer = FakePlayer.get((ServerLevel) companion.level(),
+                new GameProfile(CHAT_UNLOADED_OWNER_UUID, "MineMateChatUnloadedOwner"));
+        chatSecondPlayer.moveTo(spawn.getX() - 3.5, spawn.getY(), spawn.getZ() + 0.5, 0.0F, 0.0F);
+        CompanionDirectory.of(server).putEntry(new CompanionDirectory.Entry(
+                UUID.randomUUID(), CHAT_UNLOADED_OWNER_UUID, "Far Friend",
+                Level.NETHER, new BlockPos(100, 64, -200)));
+        CompanionChatListener.handle(server, chatSecondPlayer, "Far Friend, where are you");
+    }
+
+    private static void prepareChatNonOwner(MinecraftServer server) {
+        prepareInventory();
+        prepareFakeOwner(CHAT_NON_OWNER_REAL_OWNER_UUID, "MineMateChatRealOwner");
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("Hey there."))), 0);
+        companion.getJournal().clear();
+        companion.getConversationLog().clear();
+        chatSecondPlayer = FakePlayer.get((ServerLevel) companion.level(),
+                new GameProfile(CHAT_NON_OWNER_PLAYER_UUID, "MineMateChatStranger"));
+        chatSecondPlayer.moveTo(spawn.getX() - 2.5, spawn.getY(), spawn.getZ() + 0.5, 0.0F, 0.0F);
+        CompanionChatListener.handle(server, chatSecondPlayer, "hello there friend");
+    }
+
+    private static void prepareChatCoalesceAndCap(MinecraftServer server) {
+        chatCapTurnsSent = 1;
+        companion.getConversationCoordinator().resetChatCap();
+        prepareInventory();
+        prepareFakeOwner(CHAT_CAP_OWNER_UUID, "MineMateChatCapOwner");
+        installLlmPlanner(FixtureTransport.of(FixtureTransport.ok(
+                llmResponse("Mhm."))), 0);
+        companion.getJournal().clear();
+        companion.getConversationLog().clear();
+        // Three lines inside one debounce window: one logical turn, one hosted request.
+        CompanionChatListener.handle(server, fakeOwner, "one");
+        CompanionChatListener.handle(server, fakeOwner, "two");
+        CompanionChatListener.handle(server, fakeOwner, "three");
+    }
+
+    private static void clearChatScenario(MinecraftServer server) {
+        CompanionDirectory.of(server).clearEntries();
+        // In case a scenario uncached the loaded companion, the next one gets it back.
+        CompanionDirectory.cache(companion);
+        // Consecutive scenarios compress the rolling minute; charges must not leak across.
+        companion.getConversationCoordinator().resetChatCap();
+        chatSecondPlayer = null;
+        clearLlmPlanner(server);
     }
 
     /** Craft leaves the output with the companion; the dependent fetch then delivers that output. */
@@ -2255,6 +2721,347 @@ public final class DevAutoTest {
         if (order == null || !"keep gathering dirt".equals(order.requestText())) {
             return "the speech-only owner reply should have preserved the open order, saw "
                     + order;
+        }
+        return null;
+    }
+
+    private static long companionLinesContaining(String text) {
+        return companion.getConversationLog().snapshot().stream()
+                .filter(entry -> entry.kind() == ConversationLog.EntryKind.COMPANION_UTTERANCE)
+                .filter(entry -> entry.text().contains(text))
+                .count();
+    }
+
+    private static String chatActionCommitVerdict() {
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null) {
+            return "acceptance did not open a standing order";
+        }
+        if (order.epoch() <= 0) {
+            return "the accepted order carries no epoch";
+        }
+        if (!"bring me two oak planks".equals(order.requestText())) {
+            return "the order text is not the owner turn: " + order.requestText();
+        }
+        OrderContract contract = order.contract();
+        if (contract == null || !contract.deliverToOwner() || contract.deliverables().size() != 1
+                || !"oak_planks".equals(contract.deliverables().get(0).item())) {
+            return "the declared contract was not seeded: " + contract;
+        }
+        if (order.ledger() == null) {
+            return "the contract did not seed a ledger";
+        }
+        if (!companion.getPlanExecutor().isActive()) {
+            return "the accepted plan is not active";
+        }
+        if (companionLinesContaining("On my way.") != 1) {
+            return "the acceptance speech was not delivered exactly once";
+        }
+        return null;
+    }
+
+    private static String chatDuringPlanStatusVerdict() {
+        if (!companion.getPlanExecutor().isActive()) {
+            return "the status question ended the plan";
+        }
+        if (!companion.getPlanExecutor().currentPlan().map(Plan::id).orElse("")
+                .equals(chatCapturedPlanId)) {
+            return "the status question changed the plan identity";
+        }
+        if (!companion.getSupervisor().currentGoal().map(Goal::id).orElse("")
+                .equals(chatCapturedGoalId)) {
+            return "the status question changed the goal identity";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || order.epoch() != chatCapturedEpoch) {
+            return "the status question changed the order epoch";
+        }
+        if (order.ledger() != chatCapturedLedger) {
+            return "the status question changed the ledger identity";
+        }
+        if (companionLinesContaining("About halfway there.") != 1) {
+            return "the status answer was not delivered exactly once";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "a status answer was recorded as a planner failure";
+        }
+        return null;
+    }
+
+    private static String chatDuringPlanAmendVerdict() {
+        PlanExecutor executor = companion.getPlanExecutor();
+        if (!executor.isActive()) {
+            return "the replacement plan is not active";
+        }
+        PlanOutcome outcome = executor.lastOutcome().orElse(null);
+        if (outcome == null || !outcome.planId().equals(chatCapturedPlanId)
+                || outcome.status() != PlanStatus.CANCELLED
+                || !Reasons.SUPERSEDED.equals(outcome.reason())) {
+            return "the old plan did not end cancelled/superseded: " + outcome;
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || order.epoch() <= chatCapturedEpoch) {
+            return "the amendment did not open a fresh order epoch";
+        }
+        if (!"actually walk back instead".equals(order.requestText())) {
+            return "the fresh order does not carry the amendment text: " + order.requestText();
+        }
+        if (companionLinesContaining("Turning around.") != 1) {
+            return "the amendment speech was not delivered exactly once";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "an accepted amendment was recorded as a planner failure";
+        }
+        return null;
+    }
+
+    private static String chatInvalidAmendVerdict() {
+        PlanExecutor executor = companion.getPlanExecutor();
+        if (!executor.isActive()) {
+            return "the invalid amendment ended the old plan";
+        }
+        if (!executor.currentPlan().map(Plan::id).orElse("").equals(chatCapturedPlanId)) {
+            return "the invalid amendment changed the plan identity";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || order.epoch() != chatCapturedEpoch) {
+            return "the invalid amendment changed the order epoch";
+        }
+        if (companionLinesContaining("I could not work out how to switch to that.") != 1) {
+            return "the failure line was not delivered exactly once";
+        }
+        if (companionLinesContaining("I am still working on: walk to the oak.") != 1) {
+            return "the failure line does not say the old work is still running";
+        }
+        return null;
+    }
+
+    private static String chatCancelVerdict() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "the cancellation left a plan running";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "the cancellation left a goal running";
+        }
+        PlanOutcome outcome = companion.getPlanExecutor().lastOutcome().orElse(null);
+        if (outcome == null || !outcome.planId().equals(chatCapturedPlanId)
+                || outcome.status() != PlanStatus.CANCELLED
+                || !Reasons.CANCELLED_BY_OWNER.equals(outcome.reason())) {
+            return "the plan did not end cancelled_by_owner: " + outcome;
+        }
+        if (companionLinesContaining("Sure, stopping.") != 1) {
+            return "the cancellation speech was not delivered exactly once";
+        }
+        if (companionLinesContaining("Stopping now.") != 0) {
+            return "the fallback message was displayed despite nonblank speech";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "a legal cancellation was recorded as a planner failure";
+        }
+        return null;
+    }
+
+    private static String chatCloseWithoutSpeechVerdict() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "the close left a plan running";
+        }
+        String expected = AUTOTEST_COMPANION_NAME + ": Stopping now.";
+        List<ConversationLog.Entry> entries = companion.getConversationLog().snapshot();
+        long fallbackLines = entries.stream()
+                .filter(entry -> entry.kind() == ConversationLog.EntryKind.COMPANION_UTTERANCE)
+                .filter(entry -> expected.equals(entry.text()))
+                .count();
+        if (fallbackLines != 1) {
+            return "the status message was not displayed as the named line exactly once";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "a legal close was recorded as a planner failure";
+        }
+        return null;
+    }
+
+    private static String chatFailureDuringPlanVerdict() {
+        PlanExecutor executor = companion.getPlanExecutor();
+        if (!executor.isActive()) {
+            return "the transport failure ended the plan";
+        }
+        if (!executor.currentPlan().map(Plan::id).orElse("").equals(chatCapturedPlanId)) {
+            return "the transport failure changed the plan identity";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || order.epoch() != chatCapturedEpoch) {
+            return "the transport failure changed the order epoch";
+        }
+        if (!journalHas(EventKind.PLANNER_FAILED)) {
+            return "no planner_failed event was recorded";
+        }
+        if (companionLinesContaining("I am still working on: walk out to the oak.") != 1) {
+            return "the fallback does not say the old work is still running";
+        }
+        return null;
+    }
+
+    private static String chatContractOnlyVerdict() {
+        if (!llmTransport.requestBody(1).contains("now recorded")) {
+            return "the continuation request did not say the contract was recorded";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null) {
+            return "acceptance did not open the order";
+        }
+        OrderContract contract = order.contract();
+        if (contract == null || !contract.deliverToOwner() || contract.deliverables().size() != 1
+                || !"oak_planks".equals(contract.deliverables().get(0).item())) {
+            return "the commitment's contract was not seeded on the order: " + contract;
+        }
+        if (order.ledger() == null) {
+            return "the contract did not seed a ledger";
+        }
+        if (companionLinesContaining("I can get those.") != 1) {
+            return "the buffered speech was not delivered exactly once after acceptance";
+        }
+        if (companionLinesContaining("On it.") != 1) {
+            return "the continuation's speech was not delivered exactly once";
+        }
+        if (journalHas(EventKind.PLANNER_FAILED)) {
+            return "the absorbed contract-only reply was recorded as a planner failure";
+        }
+        return null;
+    }
+
+    private static String chatPlanFinishesWhilePendingVerdict() {
+        if (chatDeferralNote != null) {
+            return chatDeferralNote;
+        }
+        if (!llmTransport.requestBody(0).contains("PLAYER: how is it going")) {
+            return "the first request was not the owner turn";
+        }
+        if (!llmTransport.requestBody(1).contains("ORDER (open): keep digging dirt")) {
+            return "the deferred replan was not replayed as an autonomous request";
+        }
+        StandingOrder order = companion.getStandingOrder();
+        if (order == null || order.epoch() != chatCapturedEpoch) {
+            return "the chat did not preserve the deferred order";
+        }
+        if (order.replansUsed() != 1) {
+            return "expected the replayed replan to charge the budget once, saw "
+                    + order.replansUsed();
+        }
+        if (companionLinesContaining("Still on it.") != 1) {
+            return "the chat answer was not delivered exactly once";
+        }
+        return null;
+    }
+
+    private static String chatEarshotVerdict() {
+        if (llmTransport.calls() != 1) {
+            return "expected only the nearby line to route, saw " + llmTransport.calls()
+                    + " requests";
+        }
+        if (!llmTransport.requestBody(0).contains("PLAYER: come over here")) {
+            return "the nearby line did not reach the model as the player turn";
+        }
+        long ownerLines = companion.getConversationLog().snapshot().stream()
+                .filter(entry -> entry.kind() == ConversationLog.EntryKind.OWNER_UTTERANCE)
+                .count();
+        if (ownerLines != 1) {
+            return "the out-of-earshot line entered the transcript: " + ownerLines + " owner lines";
+        }
+        return null;
+    }
+
+    private static String chatNameAddressVerdict() {
+        if (llmTransport.calls() != 1) {
+            return "expected only the addressed line to route, saw " + llmTransport.calls()
+                    + " requests";
+        }
+        String body = llmTransport.requestBody(0);
+        if (!body.contains("PLAYER: come here")) {
+            return "the addressed line did not reach the model with the prefix stripped";
+        }
+        if (body.contains("ada stone")) {
+            return "the name prefix leaked into the model turn";
+        }
+        return null;
+    }
+
+    private static String chatStopFormVerdict() {
+        if (llmTransport.calls() != 1) {
+            return "the stop form spent a model call: " + llmTransport.calls() + " requests";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            return "the stop form left a plan running";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "the stop form left a goal running";
+        }
+        PlanOutcome outcome = companion.getPlanExecutor().lastOutcome().orElse(null);
+        if (outcome == null || outcome.status() != PlanStatus.CANCELLED
+                || !Reasons.CANCELLED_BY_OWNER.equals(outcome.reason())) {
+            return "the plan did not end cancelled_by_owner: " + outcome;
+        }
+        if (companion.getConversationCoordinator().isOwnerTurnPending()) {
+            return "the stop form left an owner turn pending";
+        }
+        if (companionLinesContaining("Stopping.") != 1) {
+            return "the stop acknowledgement was not spoken exactly once";
+        }
+        return null;
+    }
+
+    private static String chatCrossDimensionVerdict() {
+        if (llmTransport.calls() != 1) {
+            return "expected the addressed cross-dimension line to route once, saw "
+                    + llmTransport.calls() + " requests";
+        }
+        if (!llmTransport.requestBody(0).contains("PLAYER: hello there")) {
+            return "the cross-dimension line did not reach the model with the prefix stripped";
+        }
+        return null;
+    }
+
+    private static String chatUnloadedVerdict() {
+        if (llmTransport.calls() != 0) {
+            return "an unloaded companion spent a model call: " + llmTransport.calls();
+        }
+        if (companion.getConversationCoordinator().isOwnerTurnPending()) {
+            return "an unloaded companion queued an owner turn";
+        }
+        return null;
+    }
+
+    private static String chatNonOwnerVerdict() {
+        if (llmTransport.calls() != 1) {
+            return "expected only the owner's line to route, saw " + llmTransport.calls()
+                    + " requests";
+        }
+        List<ConversationLog.Entry> entries = companion.getConversationLog().snapshot();
+        if (entries.stream().anyMatch(entry -> entry.text().contains("hello there friend"))) {
+            return "a stranger's chat entered the transcript";
+        }
+        if (!llmTransport.requestBody(0).contains("PLAYER: hello companion")) {
+            return "the owner's line did not reach the model";
+        }
+        return null;
+    }
+
+    private static String chatCoalesceAndCapVerdict() {
+        int cap = MineMate.plannerConfig().chatRequestsPerMinute();
+        if (llmTransport.calls() != cap) {
+            return "expected exactly " + cap + " hosted turns, saw " + llmTransport.calls();
+        }
+        if (!llmTransport.requestBody(0).contains("PLAYER: one\\ntwo\\nthree")) {
+            return "the debounced lines did not coalesce into one player turn";
+        }
+        if (companionLinesContaining("so much chatter") != 1) {
+            return "expected exactly one throttle line, saw "
+                    + companionLinesContaining("so much chatter");
+        }
+        boolean throttledHeard = companion.getConversationLog().snapshot().stream()
+                .anyMatch(entry -> entry.kind() == ConversationLog.EntryKind.OWNER_UTTERANCE
+                        && entry.text().contains("line 13"));
+        if (!throttledHeard) {
+            return "the throttled turn was not remembered as heard";
         }
         return null;
     }

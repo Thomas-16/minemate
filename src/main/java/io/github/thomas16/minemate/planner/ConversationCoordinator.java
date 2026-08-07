@@ -1,6 +1,7 @@
 package io.github.thomas16.minemate.planner;
 
 import io.github.thomas16.minemate.MineMate;
+import io.github.thomas16.minemate.chat.CompanionSpeech;
 import io.github.thomas16.minemate.context.ReplanTrigger;
 import io.github.thomas16.minemate.entity.CompanionEntity;
 
@@ -61,6 +62,13 @@ public final class ConversationCoordinator {
      */
     private static final int MAX_QUEUED_TURN_CHARS = 2000;
 
+    /** One rolling minute, in game ticks, for the chat request cap. */
+    private static final long CAP_WINDOW_TICKS = 1200L;
+
+    /** Spoken once per saturation of the rolling cap; ASCII, like all generated player text. */
+    private static final String THROTTLE_MESSAGE =
+            "Give me a moment - I can only keep up with so much chatter at once.";
+
     private final CompanionEntity companion;
 
     private int generation;
@@ -72,6 +80,10 @@ public final class ConversationCoordinator {
     private DeferredReplan deferredReplan;
     private PendingCommitment pendingCommitment;
     private boolean attemptRepairUsed;
+    private final ArrayDeque<Long> hostedChatTurnTicks = new ArrayDeque<>();
+    private boolean throttleNotified;
+    /** False once a command turn joins the pending turn; commands never throttle. */
+    private boolean pendingTurnFromChatOnly = true;
 
     public ConversationCoordinator(CompanionEntity companion) {
         this.companion = Objects.requireNonNull(companion, "companion");
@@ -88,6 +100,7 @@ public final class ConversationCoordinator {
         if (text == null || text.isBlank()) {
             return;
         }
+        pendingTurnFromChatOnly = false;
         if (inFlight != null) {
             // The in-flight reply answers an utterance the owner has already moved past.
             generation++;
@@ -100,6 +113,7 @@ public final class ConversationCoordinator {
             return;
         }
         dispatch(text.strip());
+        pendingTurnFromChatOnly = true;
     }
 
     /**
@@ -199,6 +213,16 @@ public final class ConversationCoordinator {
         attemptRepairUsed = false;
     }
 
+    /**
+     * Test seam: forgets rate-limiter history. The window is real time an owner lives through,
+     * but consecutive headless scenarios compress hours of play into seconds and must not leak
+     * charges into each other.
+     */
+    public void resetChatCap() {
+        hostedChatTurnTicks.clear();
+        throttleNotified = false;
+    }
+
     // ---- deferred replans -------------------------------------------------------------------
 
     /**
@@ -255,6 +279,20 @@ public final class ConversationCoordinator {
             String turn = String.join("\n", queuedLines);
             queuedLines.clear();
             queuedChars = 0;
+            boolean fromChatOnly = pendingTurnFromChatOnly;
+            pendingTurnFromChatOnly = true;
+            if (fromChatOnly && !tryChargeChatTurn(gameTime)) {
+                // Over the rolling cap: the words are still heard and remembered -- they become
+                // history for the next hosted request -- but this turn is never auto-submitted.
+                if (companion.getConversationLog() != null) {
+                    companion.getConversationLog().recordOwner(turn, gameTime);
+                }
+                if (!throttleNotified) {
+                    throttleNotified = true;
+                    CompanionSpeech.send(companion, THROTTLE_MESSAGE);
+                }
+                return;
+            }
             dispatch(turn);
             return;
         }
@@ -268,6 +306,24 @@ public final class ConversationCoordinator {
                 PlannerAutonomy.onReplanTrigger(companion, deferred.trigger());
             }
         }
+    }
+
+    /**
+     * Charges the rolling per-minute chat cap, counting coalesced hosted turns rather than raw
+     * chat lines. Command turns never pass through here: {@code /companion plan} stays the
+     * deterministic fallback whatever the chatter level.
+     */
+    private boolean tryChargeChatTurn(long gameTime) {
+        while (!hostedChatTurnTicks.isEmpty()
+                && gameTime - hostedChatTurnTicks.peekFirst() >= CAP_WINDOW_TICKS) {
+            hostedChatTurnTicks.removeFirst();
+        }
+        if (hostedChatTurnTicks.size() >= MineMate.plannerConfig().chatRequestsPerMinute()) {
+            return false;
+        }
+        hostedChatTurnTicks.addLast(gameTime);
+        throttleNotified = false;
+        return true;
     }
 
     private void enqueue(String text) {

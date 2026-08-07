@@ -83,6 +83,7 @@ public final class PlanExecutor {
     private Goal activeGoal;
     private long startMs;
     private PlanOutcome lastOutcome;
+    private boolean waitingForSupervisorHandoff;
 
     public PlanExecutor(CompanionEntity companion) {
         this.companion = Objects.requireNonNull(companion, "companion");
@@ -172,6 +173,9 @@ public final class PlanExecutor {
         if (plan != null) {
             if (awaitingGoalId != null && companion.getSupervisor().isBusy()) {
                 companion.getSupervisor().cancel(Reasons.SUPERSEDED);
+                // The cancelled goal takes a tick to leave the supervisor; the replacement's
+                // first step must wait for that instead of being refused by submit.
+                waitingForSupervisorHandoff = true;
             }
             // Publishes the superseded outcome and arms PLAN_FINISHED, which autonomy will
             // refuse because the replacement plan is active by then.
@@ -233,6 +237,13 @@ public final class PlanExecutor {
             return;
         }
         if (awaitingGoalId == null) {
+            if (waitingForSupervisorHandoff && companion.getSupervisor().isBusy()) {
+                // The goal this plan superseded is still winding down inside the supervisor;
+                // submitting now would be refused and wrongly end the replacement. It clears
+                // within a tick or two, because the goal was already cancelled.
+                return;
+            }
+            waitingForSupervisorHandoff = false;
             startStep();
             return;
         }
@@ -387,6 +398,7 @@ public final class PlanExecutor {
 
     private void finish(PlanStatus status, String reason) {
         harvestEvidence(null);
+        waitingForSupervisorHandoff = false;
         Plan finished = plan;
         long elapsed = startMs == 0L ? 0L : Math.max(0L, System.currentTimeMillis() - startMs);
         List<PlanStepOutcome> outcomes = List.copyOf(stepOutcomes);

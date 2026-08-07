@@ -1,9 +1,11 @@
 package io.github.thomas16.minemate;
 
+import io.github.thomas16.minemate.chat.CompanionChatListener;
 import io.github.thomas16.minemate.command.CompanionCommands;
 import io.github.thomas16.minemate.context.ReplanTriggers;
 import io.github.thomas16.minemate.debug.CompanionDebugNetworking;
 import io.github.thomas16.minemate.dev.DevAutoTest;
+import io.github.thomas16.minemate.entity.CompanionDirectory;
 import io.github.thomas16.minemate.entity.MineMateEntities;
 import io.github.thomas16.minemate.integration.PlayerEngineQuiet;
 import io.github.thomas16.minemate.planner.HostedPlanner;
@@ -42,6 +44,9 @@ public class MineMate implements ModInitializer {
 		// Proceed with mild caution.
 
 		MineMateEntities.register();
+		// Before command registration: the directory must exist before any command can query it.
+		CompanionDirectory.init();
+		CompanionChatListener.init();
 		CompanionDebugNetworking.init();
 		CommandRegistrationCallback.EVENT.register(
 				(dispatcher, registryAccess, environment) -> CompanionCommands.register(dispatcher, registryAccess));

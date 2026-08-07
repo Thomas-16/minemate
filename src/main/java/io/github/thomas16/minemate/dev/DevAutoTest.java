@@ -59,6 +59,7 @@ import io.github.thomas16.minemate.context.CompanionJournal;
 import io.github.thomas16.minemate.context.ConversationLog;
 import io.github.thomas16.minemate.context.EventKind;
 import io.github.thomas16.minemate.context.JournalEntry;
+import io.github.thomas16.minemate.context.ReplanReason;
 import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.planner.CompanionResponse;
 import io.github.thomas16.minemate.planner.ContractCoverage;
@@ -161,7 +162,10 @@ public final class DevAutoTest {
             "order_ledger",
             "llm_completed_with_receipt",
             "llm_completed_denied_close",
-            "llm_replan_remainder_repair");
+            "llm_replan_remainder_repair",
+            "chat_newer_turn_stales_reply",
+            "chat_stop_while_pending",
+            "chat_owner_beats_autonomy");
     /** Scenarios that make real network calls. Selectable by name, never included in a profile. */
     private static final Set<String> LIVE_SCENARIOS = Set.of("llm_live", "llm_live_multi_step");
     private static final UUID FAKE_OWNER_UUID =
@@ -222,6 +226,7 @@ public final class DevAutoTest {
     private static boolean planSawForbiddenGoal;
     private static FixtureTransport llmTransport;
     private static boolean llmBudgetSawFinalPlanOpen;
+    private static boolean chatInterventionDone;
     private static CompanionResponse llmObservedLiveResponse;
     private static boolean ownerDamageAccepted;
     private static boolean ownerDirectAttackBlocked;
@@ -805,6 +810,43 @@ public final class DevAutoTest {
                                 "go a very long way"),
                         DevAutoTest::clearLlmPlanner,
                         DevAutoTest::planRejectionInvariant),
+                // A correction arriving during inference: the older action reply must never
+                // commit, and the follow-up request carries the newer text.
+                Scenario.probe("chat_newer_turn_stales_reply",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && llmPlannerSettled()
+                                && companion.getStandingOrder() == null,
+                        DevAutoTest::chatNewerTurnStalesReplyVerdict,
+                        300,
+                        ignoredServer -> prepareChatNewerTurnStalesReply(),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                // The owner stops while the request is in flight: nothing later may speak, plan,
+                // or revive the order, and no follow-up request is spent.
+                Scenario.probe("chat_stop_while_pending",
+                        () -> scenarioTicks > 60
+                                && !companion.getConversationCoordinator().isRequestPending(),
+                        DevAutoTest::chatStopWhilePendingVerdict,
+                        300,
+                        ignoredServer -> prepareLlmPlan(FixtureTransport.delayed(400L,
+                                FixtureTransport.ok(llmResponse("Heading out.",
+                                        llmContract("[]", false),
+                                        llmCall("goto", "{\"x\":" + (spawn.getX() + 40_000)
+                                                + ",\"z\":" + spawn.getZ() + "}")))),
+                                "go somewhere far"),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
+                // Owner chat outranks autonomy: an owner turn injected while an autonomous replan
+                // is in flight stales that result and gets its own request afterwards.
+                Scenario.probe("chat_owner_beats_autonomy",
+                        () -> llmTransport != null && llmTransport.calls() == 2
+                                && llmPlannerSettled()
+                                && companion.getStandingOrder() == null,
+                        DevAutoTest::chatOwnerBeatsAutonomyVerdict,
+                        900,
+                        ignoredServer -> prepareChatOwnerBeatsAutonomy(),
+                        DevAutoTest::clearLlmPlanner,
+                        DevAutoTest::planRejectionInvariant),
                 Scenario.probe("llm_plan_boundary",
                         () -> scenarioTicks > 250,
                         DevAutoTest::llmPlanBoundaryVerdict,
@@ -1136,6 +1178,26 @@ public final class DevAutoTest {
             // the only window in which a stale answer can be created.
             companion.getConversationCoordinator().invalidateAll();
             companion.closeStandingOrder();
+        }
+        if ("chat_newer_turn_stales_reply".equals(scenario.name()) && scenarioTicks == 2) {
+            // Well inside the fixture's 400ms delay: the correction arrives while the first
+            // request is genuinely in flight, staling it and queueing the newer turn.
+            companion.getConversationCoordinator().submitOwnerTurnNow("actually never mind");
+        }
+        if ("chat_stop_while_pending".equals(scenario.name()) && scenarioTicks == 2) {
+            // The exact sequence /companion stop runs, minus the command wrapper.
+            companion.getConversationCoordinator().invalidateAll();
+            companion.closeStandingOrder();
+            if (companion.getPlanExecutor().isActive()) {
+                companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
+            }
+        }
+        if ("chat_owner_beats_autonomy".equals(scenario.name()) && !chatInterventionDone
+                && llmTransport != null && llmTransport.calls() == 1
+                && companion.getConversationCoordinator().isRequestPending()) {
+            // The autonomous replan is now in flight; the owner speaks over it.
+            chatInterventionDone = true;
+            companion.getConversationCoordinator().submitOwnerTurnNow("actually never mind that");
         }
         if (scenarioTicks > scenario.hardCapTicks()) {
             fail(server, scenario.name() + " exceeded its hard cap");
@@ -1481,6 +1543,38 @@ public final class DevAutoTest {
         prepareInventory();
         installLlmPlanner(transport, 0);
         requestLlmPlan(requestText);
+    }
+
+    private static void prepareChatNewerTurnStalesReply() {
+        prepareLlmPlan(FixtureTransport.delayed(400L,
+                FixtureTransport.ok(llmResponse("On it.",
+                        llmContract("[]", false),
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 40_000)
+                                + ",\"z\":" + spawn.getZ() + "}"))),
+                FixtureTransport.ok(llmResponse("Okay, never mind."))),
+                "go a very long way");
+    }
+
+    /**
+     * An autonomous replan without a world walk: the trigger a finished plan would have armed is
+     * armed directly, with the order open and everything idle, so autonomy fires its own request
+     * against the delayed fixture. The owner then speaks over it mid-flight.
+     */
+    private static void prepareChatOwnerBeatsAutonomy() {
+        chatInterventionDone = false;
+        prepareInventory();
+        installLlmPlanner(FixtureTransport.delayed(400L,
+                FixtureTransport.ok(llmResponse("Back to it.",
+                        llmContract("[]", false),
+                        llmCall("goto", "{\"x\":" + (spawn.getX() + 40_000)
+                                + ",\"z\":" + spawn.getZ() + "}"))),
+                FixtureTransport.ok(llmResponse("Sure, dropping it."))), 1);
+        companion.getJournal().clear();
+        if (companion.getConversationLog() != null) {
+            companion.getConversationLog().clear();
+        }
+        companion.openStandingOrder("keep gathering dirt");
+        companion.getContext().triggers().arm(ReplanReason.PLAN_FINISHED, "succeeded goal_met");
     }
 
     /** Craft leaves the output with the companion; the dependent fetch then delivers that output. */
@@ -2044,6 +2138,101 @@ public final class DevAutoTest {
         }
         if (llmTransport.calls() != 1) {
             return "expected one request, saw " + llmTransport.calls();
+        }
+        return null;
+    }
+
+    /** The correction typed during inference wins; the older action reply never commits. */
+    private static String chatNewerTurnStalesReplyVerdict() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "the stale action reply still started a plan";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "the stale action reply still submitted a goal";
+        }
+        if (sawNewPlanOutcome()) {
+            return "the stale action reply still published a plan outcome";
+        }
+        if (llmTransport.calls() != 2) {
+            return "expected two requests, saw " + llmTransport.calls();
+        }
+        if (!llmTransport.lastRequestBody().contains("actually never mind")) {
+            return "the follow-up request does not carry the owner's correction";
+        }
+        List<ConversationLog.Entry> entries = companion.getConversationLog().snapshot();
+        long companionLines = entries.stream()
+                .filter(entry -> entry.kind() == ConversationLog.EntryKind.COMPANION_UTTERANCE)
+                .count();
+        if (companionLines != 1) {
+            return "expected exactly one companion utterance, saw " + companionLines;
+        }
+        if (entries.stream().anyMatch(entry -> entry.text().contains("On it."))) {
+            return "the stale reply's speech reached the conversation";
+        }
+        return null;
+    }
+
+    /** Stop while the request is in flight: no speech, no plan, no order, no follow-up call. */
+    private static String chatStopWhilePendingVerdict() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "a plan started after stop";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "a goal was submitted after stop";
+        }
+        if (sawNewPlanOutcome()) {
+            return "a plan outcome was published after stop";
+        }
+        if (llmTransport.calls() != 1) {
+            return "expected one request, saw " + llmTransport.calls();
+        }
+        if (companion.getStandingOrder() != null) {
+            return "the order survived stop";
+        }
+        if (companion.getConversationCoordinator().isOwnerTurnPending()) {
+            return "an owner turn survived stop";
+        }
+        long companionLines = companion.getConversationLog().snapshot().stream()
+                .filter(entry -> entry.kind() == ConversationLog.EntryKind.COMPANION_UTTERANCE)
+                .count();
+        if (companionLines != 0) {
+            return "the stale reply still spoke after stop";
+        }
+        return null;
+    }
+
+    /** The owner turn injected over an in-flight autonomous replan outranks its result. */
+    private static String chatOwnerBeatsAutonomyVerdict() {
+        if (!chatInterventionDone) {
+            return "the owner turn was never injected while the replan was in flight";
+        }
+        if (companion.getPlanExecutor().isActive()) {
+            return "the stale autonomous reply still started a plan";
+        }
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "the stale autonomous reply still submitted a goal";
+        }
+        if (sawNewPlanOutcome()) {
+            return "the stale autonomous reply still published a plan outcome";
+        }
+        if (llmTransport.calls() != 2) {
+            return "expected two requests, saw " + llmTransport.calls();
+        }
+        if (!llmTransport.requestBody(0).contains("ORDER (open): keep gathering dirt")) {
+            return "the first request was not the autonomous replan";
+        }
+        if (!llmTransport.lastRequestBody().contains("PLAYER: actually never mind that")) {
+            return "the owner turn's request does not carry the owner's words";
+        }
+        List<ConversationLog.Entry> entries = companion.getConversationLog().snapshot();
+        long companionLines = entries.stream()
+                .filter(entry -> entry.kind() == ConversationLog.EntryKind.COMPANION_UTTERANCE)
+                .count();
+        if (companionLines != 1) {
+            return "expected exactly one companion utterance, saw " + companionLines;
+        }
+        if (entries.stream().anyMatch(entry -> entry.text().contains("Back to it."))) {
+            return "the stale autonomous reply's speech reached the conversation";
         }
         return null;
     }

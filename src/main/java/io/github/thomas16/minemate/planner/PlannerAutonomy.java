@@ -47,8 +47,19 @@ public final class PlannerAutonomy {
         }
 
         PlanExecutor executor = companion.getPlanExecutor();
-        if (executor == null || executor.isActive()
-                || companion.getConversationCoordinator().isRequestPending()) {
+        if (executor == null || executor.isActive()) {
+            return;
+        }
+        ConversationCoordinator coordinator = companion.getConversationCoordinator();
+        if (!coordinator.mayStartAutonomousRequest()) {
+            // Owner conversation outranks autonomy. A trigger that fires while the owner is
+            // mid-exchange is retained and reconsidered once the conversation settles, so a plan
+            // boundary is not lost to a status question; a trigger that fires behind a pending
+            // autonomous request is dropped, exactly as before.
+            StandingOrder order = companion.getStandingOrder();
+            if (order != null && coordinator.isOwnerTurnPending()) {
+                coordinator.deferReplan(trigger, order);
+            }
             return;
         }
         if (companion.getSupervisor() != null && companion.getSupervisor().isBusy()) {

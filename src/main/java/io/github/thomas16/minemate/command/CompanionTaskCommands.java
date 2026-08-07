@@ -149,7 +149,7 @@ final class CompanionTaskCommands {
         }
         CompanionEntity companion = CompanionCommands.findCompanion(sender);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby - /companion spawn first"));
+            CompanionCommands.sendNoCompanion(source, sender);
             return 0;
         }
         if (target == sender || target == companion) {
@@ -170,7 +170,7 @@ final class CompanionTaskCommands {
         }
         CompanionEntity companion = CompanionCommands.findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby - /companion spawn first"));
+            CompanionCommands.sendNoCompanion(source, player);
             return 0;
         }
         Goal goal = CompanionCommands.buildTool(source, companion, call);

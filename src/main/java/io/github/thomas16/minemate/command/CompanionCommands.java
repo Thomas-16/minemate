@@ -4,8 +4,10 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 
-import io.github.thomas16.minemate.entity.CompanionEntity;
+import io.github.thomas16.minemate.chat.CompanionStop;
 import io.github.thomas16.minemate.debug.CompanionDebugNetworking;
+import io.github.thomas16.minemate.entity.CompanionDirectory;
+import io.github.thomas16.minemate.entity.CompanionEntity;
 import io.github.thomas16.minemate.entity.MineMateEntities;
 import io.github.thomas16.minemate.task.Goal;
 import io.github.thomas16.minemate.task.GoalProgress;
@@ -34,7 +36,6 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 
-import java.util.List;
 import java.util.Optional;
 
 /** Temporary developer commands for spawning and directing the companion. */
@@ -73,25 +74,11 @@ public final class CompanionCommands {
         }
         CompanionEntity companion = findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby"));
+            sendNoCompanion(source, player);
             return 0;
         }
-        // Unconditional and separate from the branch below, because a planner request can be in
-        // flight while the supervisor is busy with a manual order. Without this, a plan requested
-        // moments ago would arrive and start seconds after the owner said stop. Invalidation also
-        // drops queued owner turns and any deferred replan.
-        companion.getConversationCoordinator().invalidateAll();
-        // Stop means stop: no later event may revive this order through the replan path.
-        companion.closeStandingOrder();
-        // The plan must be cancelled first. Cancelling only the supervisor lets the executor start
-        // the very next step on the following tick, so "stop" would appear to do nothing.
-        if (companion.getPlanExecutor().isActive()) {
-            companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
-        } else if (companion.getSupervisor().isBusy()) {
-            companion.getSupervisor().cancel(Reasons.CANCELLED_BY_OWNER);
-        } else {
-            companion.getController().cancelUserTask();
-        }
+        // The exact sequence the chat stop forms run; sharing it keeps the two paths honest.
+        CompanionStop.stop(companion);
         source.sendSuccess(() -> Component.literal("Companion stopped"), false);
         return 1;
     }
@@ -103,7 +90,7 @@ public final class CompanionCommands {
         }
         CompanionEntity companion = findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby"));
+            sendNoCompanion(source, player);
             return 0;
         }
         WorldSnapshot snapshot = companion.getContext().snapshot();
@@ -155,7 +142,7 @@ public final class CompanionCommands {
         }
         CompanionEntity companion = findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby"));
+            sendNoCompanion(source, player);
             return 0;
         }
         // No order opens here and nothing is cancelled: the utterance is conversation until the
@@ -175,7 +162,7 @@ public final class CompanionCommands {
         }
         CompanionEntity companion = findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby"));
+            sendNoCompanion(source, player);
             return 0;
         }
         companion.closeStandingOrder();
@@ -202,7 +189,7 @@ public final class CompanionCommands {
         }
         CompanionEntity companion = findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby"));
+            sendNoCompanion(source, player);
             return 0;
         }
         Optional<Goal> current = companion.getSupervisor().currentGoal();
@@ -246,7 +233,7 @@ public final class CompanionCommands {
         }
         CompanionEntity companion = findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby"));
+            sendNoCompanion(source, player);
             return 0;
         }
         if (!CompanionDebugNetworking.open(player, companion)) {
@@ -283,8 +270,9 @@ public final class CompanionCommands {
             return 0;
         }
         ServerLevel level = player.serverLevel();
-        CompanionEntity existing = findCompanion(player);
-        if (existing != null) {
+        // Directory-backed exclusivity: refuses even when the existing companion is unloaded or
+        // in another dimension, which the old proximity query could never see.
+        if (CompanionDirectory.of(player.getServer()).hasCompanion(player.getUUID())) {
             source.sendFailure(Component.literal("You already have a companion"));
             return 0;
         }
@@ -305,7 +293,7 @@ public final class CompanionCommands {
         }
         CompanionEntity companion = findCompanion(player);
         if (companion == null) {
-            source.sendFailure(Component.literal("No companion nearby"));
+            sendNoCompanion(source, player);
             return 0;
         }
         companion.discard();
@@ -347,13 +335,27 @@ public final class CompanionCommands {
         }
     }
 
-    /** Finds the player's own companion within 128 blocks. */
+    /**
+     * The player's companion, resolved by the server-level directory: any distance, any
+     * dimension, never a proximity query. Null when none is loaded anywhere.
+     */
     static CompanionEntity findCompanion(ServerPlayer player) {
-        List<CompanionEntity> companions = player.serverLevel().getEntitiesOfClass(
-                CompanionEntity.class,
-                player.getBoundingBox().inflate(128.0),
-                candidate -> candidate.isAlive()
-                        && candidate.getOwnerUuid().map(player.getUUID()::equals).orElse(false));
-        return companions.isEmpty() ? null : companions.get(0);
+        return CompanionDirectory.of(player.getServer())
+                .loadedCompanionOf(player.getUUID()).orElse(null);
+    }
+
+    /** Names why no companion answered: none exists at all, or one is unloaded far away. */
+    static void sendNoCompanion(CommandSourceStack source, ServerPlayer player) {
+        Optional<CompanionDirectory.Entry> entry =
+                CompanionDirectory.of(player.getServer()).entryOf(player.getUUID());
+        if (entry.isEmpty()) {
+            source.sendFailure(
+                    Component.literal("You do not have a companion - /companion spawn first"));
+            return;
+        }
+        CompanionDirectory.Entry known = entry.get();
+        source.sendFailure(Component.literal(known.companionName() + " is away near ("
+                + known.lastKnownPos().getX() + ", " + known.lastKnownPos().getY() + ", "
+                + known.lastKnownPos().getZ() + ") in " + known.dimension().location()));
     }
 }

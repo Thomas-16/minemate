@@ -687,9 +687,13 @@ public final class DevAutoTest {
                         },
                         ignoredServer -> clearFixtures(),
                         DevAutoTest::planAbortInvariant),
-                Scenario.plan("plan_invalid_tool_rejected",
-                        ignored -> null,
-                        DevAutoTest::acceptPlanInvalidTool,
+                // Invalid actions in an owner reply spend the request-local repair; the script
+                // repeats them, so the attempt fails conversationally with no plan, no outcome,
+                // and no order -- and nothing ever reaches the supervisor.
+                Scenario.probe("plan_invalid_tool_rejected",
+                        () -> ScriptedPlanner.instance().requestCount() >= 2
+                                && !companion.getConversationCoordinator().isRequestPending(),
+                        DevAutoTest::planInvalidToolVerdict,
                         200,
                         DevAutoTest::preparePlanInvalidTool,
                         ignoredServer -> {
@@ -1732,6 +1736,8 @@ public final class DevAutoTest {
 
     private static void preparePlanInvalidTool(MinecraftServer server) {
         prepareInventory();
+        // Scenario-owned: the verdict asserts on PLANNER_FAILED, which must be this attempt's.
+        companion.getJournal().clear();
         ScriptedPlanner planner = ScriptedPlanner.instance();
         planner.clear();
         planner.bind(companion);
@@ -1748,17 +1754,27 @@ public final class DevAutoTest {
                 snapshot.render(), null, ToolRegistry.defaults().schemaJson()));
     }
 
-    private static boolean acceptPlanInvalidTool(PlanOutcome outcome) {
-        boolean accepted = outcome.status() == PlanStatus.REJECTED
-                && Reasons.UNKNOWN_RESOURCE.equals(outcome.reason())
-                && outcome.stepOutcomes().isEmpty()
-                && outcome.completedSteps() == 0
-                && ScriptedPlanner.instance().requestCount() > 0;
-        if (!accepted) {
-            MineMate.LOGGER.error("[autotest] plan_invalid_tool_rejected postcondition {} requests={}",
-                    outcome.toCompactString(), ScriptedPlanner.instance().requestCount());
+    private static String planInvalidToolVerdict() {
+        if (companion.getPlanExecutor().isActive()) {
+            return "an invalid plan started anyway";
         }
-        return accepted;
+        if (companion.getSupervisor().currentGoal().isPresent()) {
+            return "an invalid plan submitted a goal";
+        }
+        if (sawNewPlanOutcome()) {
+            return "an invalid plan reached PlanExecutor";
+        }
+        if (ScriptedPlanner.instance().requestCount() != 2) {
+            return "expected the bounded repair round, saw "
+                    + ScriptedPlanner.instance().requestCount() + " requests";
+        }
+        if (companion.getStandingOrder() != null) {
+            return "an order opened for a rejected attempt";
+        }
+        if (!journalHas(EventKind.PLANNER_FAILED)) {
+            return "no planner_failed event was recorded";
+        }
+        return null;
     }
 
     /** A rejected plan must not have moved the companion: nothing may ever reach the supervisor. */

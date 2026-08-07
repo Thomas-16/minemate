@@ -36,28 +36,31 @@ public final class PlannerDispatch {
 
     public static void request(CompanionEntity companion, Planner planner, PlanRequest request) {
         MinecraftServer server = companion.getServer();
-        PlanExecutor executor = companion.getPlanExecutor();
-        if (server == null || executor == null) {
+        ConversationCoordinator coordinator = companion.getConversationCoordinator();
+        if (server == null || companion.getPlanExecutor() == null || coordinator == null) {
             return;
         }
         // Claimed now, on the server thread, so a later request or a cancel can disown this one.
-        int generation = executor.beginPlannerRequest();
+        ConversationCoordinator.RequestTicket ticket = coordinator.begin(request.origin());
         planner.plan(request).whenComplete((response, error) ->
-                server.execute(() -> apply(companion, planner, request, response, error, generation)));
+                server.execute(() -> apply(companion, planner, request, response, error, ticket)));
     }
 
     private static void apply(CompanionEntity companion, Planner planner, PlanRequest request,
-            CompanionResponse response, Throwable error, int generation) {
+            CompanionResponse response, Throwable error,
+            ConversationCoordinator.RequestTicket ticket) {
         if (companion.isRemoved() || companion.getPlanExecutor() == null) {
             return;
         }
-        if (!companion.getPlanExecutor().isCurrentPlannerRequest(generation)) {
+        ConversationCoordinator coordinator = companion.getConversationCoordinator();
+        // Even a stale reply frees the in-flight slot; the queued turn behind it needs that.
+        coordinator.completeInFlight(ticket);
+        if (!coordinator.isCurrent(ticket)) {
             // The owner cancelled, stopped, or asked for something else while this was in flight.
             // Silently dropped: they already got feedback from whatever superseded it.
             MineMate.LOGGER.debug("Discarding stale response from planner {}", planner.name());
             return;
         }
-        companion.getPlanExecutor().completePlannerRequest(generation);
         if (error != null || response == null) {
             String detail = error == null ? "no response produced" : rootMessage(error);
             MineMate.LOGGER.warn("Planner {} failed: {}", planner.name(), detail);

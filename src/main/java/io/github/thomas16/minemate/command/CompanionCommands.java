@@ -16,7 +16,6 @@ import io.github.thomas16.minemate.context.WorldSnapshot;
 import io.github.thomas16.minemate.integration.ReflexSnapshot;
 import io.github.thomas16.minemate.planner.HostedPlanner;
 import io.github.thomas16.minemate.planner.Planner;
-import io.github.thomas16.minemate.planner.PlannerRequests;
 import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
 import io.github.thomas16.minemate.planner.StandingOrder;
@@ -79,8 +78,9 @@ public final class CompanionCommands {
         }
         // Unconditional and separate from the branch below, because a planner request can be in
         // flight while the supervisor is busy with a manual order. Without this, a plan requested
-        // moments ago would arrive and start seconds after the owner said stop.
-        companion.getPlanExecutor().discardPendingPlannerRequests();
+        // moments ago would arrive and start seconds after the owner said stop. Invalidation also
+        // drops queued owner turns and any deferred replan.
+        companion.getConversationCoordinator().invalidateAll();
         // Stop means stop: no later event may revive this order through the replan path.
         companion.closeStandingOrder();
         // The plan must be cancelled first. Cancelling only the supervisor lets the executor start
@@ -167,7 +167,7 @@ public final class CompanionCommands {
         if (Planners.active() instanceof ScriptedPlanner scripted) {
             scripted.bind(companion);
         }
-        PlannerRequests.owner(companion, Planners.active(), requestText);
+        companion.getConversationCoordinator().submitOwnerTurnNow(requestText);
         source.sendSuccess(() -> Component.literal("Planning: " + requestText), false);
         return 1;
     }
@@ -183,14 +183,15 @@ public final class CompanionCommands {
             return 0;
         }
         companion.closeStandingOrder();
+        boolean requestWasPending = companion.getConversationCoordinator().isRequestPending();
+        companion.getConversationCoordinator().invalidateAll();
         if (companion.getPlanExecutor().isActive()) {
             companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
             source.sendSuccess(() -> Component.literal("Plan cancelled"), false);
             return 1;
         }
-        // Nothing is running yet, but the planner may still be composing an answer.
-        if (companion.getPlanExecutor().isPlannerRequestPending()) {
-            companion.getPlanExecutor().discardPendingPlannerRequests();
+        // Nothing was running, but the planner may still have been composing an answer.
+        if (requestWasPending) {
             source.sendSuccess(() -> Component.literal("Pending plan request cancelled"), false);
             return 1;
         }

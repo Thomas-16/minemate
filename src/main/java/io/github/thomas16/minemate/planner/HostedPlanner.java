@@ -83,9 +83,9 @@ public final class HostedPlanner implements Planner {
         // and touches nothing but the reply. PlannerDispatch owns the hop back to the server.
         //
         // The timeout is enforced here as well as in the transport on purpose. A request that never
-        // completes would leave isPlannerRequestPending() true forever, which silently disables
-        // replanning for that companion for the rest of the session; a backend that forgets its own
-        // deadline must not be able to cause that.
+        // completes would leave the coordinator's in-flight slot occupied forever, which silently
+        // disables replanning and wedges queued owner turns for that companion for the rest of the
+        // session; a backend that forgets its own deadline must not be able to cause that.
         return backend.complete(prompt)
                 .orTimeout(config.timeout().toMillis(), TimeUnit.MILLISECONDS)
                 .thenApply(HostedPlanner::toResponse);

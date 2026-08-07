@@ -223,29 +223,6 @@ public final class ConversationCoordinator {
         PlannerRequests.owner(companion, Planners.active(), turnText);
     }
 
-    // ---- legacy int-based shims, used only by PlanExecutor's delegates; deleted in stage 4b --
-
-    int beginPlannerRequest() {
-        return begin(RequestOrigin.OWNER_CHAT).generation();
-    }
-
-    boolean isCurrentPlannerRequest(int requestGeneration) {
-        return requestGeneration == generation;
-    }
-
-    void completePlannerRequest(int requestGeneration) {
-        assertServerThread();
-        if (inFlight != null && inFlight.generation() == requestGeneration) {
-            inFlight = null;
-        }
-    }
-
-    void discardPendingPlannerRequests() {
-        assertServerThread();
-        generation++;
-        inFlight = null;
-    }
-
     private void assertServerThread() {
         assert companion.getServer() != null && companion.getServer().isSameThread();
     }

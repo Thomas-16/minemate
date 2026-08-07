@@ -269,7 +269,10 @@ public class CompanionEntity extends LivingEntity
     @Override
     public void remove(RemovalReason reason) {
         if (!this.level().isClientSide && this.controller != null) {
-            // First: the shutdown below arms a replan trigger, and without this the autonomy
+            // Before everything: no in-flight response, queued turn, or deferred replan may act
+            // on a companion that is on its way out.
+            this.conversationCoordinator.invalidateAll();
+            // The shutdown below arms a replan trigger, and without this the autonomy
             // listener would answer it by planning for a companion that is on its way out.
             this.standingOrder = null;
             // Before the supervisor, so the plan reports its own terminal outcome rather than

@@ -77,7 +77,6 @@ import io.github.thomas16.minemate.planner.Planner;
 import io.github.thomas16.minemate.planner.PlannerAutonomy;
 import io.github.thomas16.minemate.planner.PlannerConfig;
 import io.github.thomas16.minemate.planner.PlannerDispatch;
-import io.github.thomas16.minemate.planner.PlannerRequests;
 import io.github.thomas16.minemate.planner.Planners;
 import io.github.thomas16.minemate.planner.RequestOrigin;
 import io.github.thomas16.minemate.planner.ScriptedPlanner;
@@ -831,7 +830,7 @@ public final class DevAutoTest {
                 // gets one repair; a reply that stays incomplete after its repair closes the order.
                 Scenario.probe("llm_contract_repair",
                         () -> llmTransport != null && llmTransport.calls() == 2
-                                && !companion.getPlanExecutor().isPlannerRequestPending(),
+                                && !companion.getConversationCoordinator().isRequestPending(),
                         () -> llmContractRepairVerdict("does not fetch 1 iron_sword"),
                         400,
                         ignoredServer -> prepareLlmContractRepair(),
@@ -851,7 +850,7 @@ public final class DevAutoTest {
                 // follow-up plan is still validated against the whole stored contract.
                 Scenario.probe("llm_contract_only_continuation",
                         () -> llmTransport != null && llmTransport.calls() == 2
-                                && !companion.getPlanExecutor().isPlannerRequestPending(),
+                                && !companion.getConversationCoordinator().isRequestPending(),
                         DevAutoTest::llmContractContinuationVerdict,
                         400,
                         ignoredServer -> prepareLlmContractOnlyContinuation(),
@@ -975,7 +974,7 @@ public final class DevAutoTest {
                 // repaired toward the canonical fetch shape, quoting the ledger's blocked state.
                 Scenario.probe("llm_replan_remainder_repair",
                         () -> llmTransport != null && llmTransport.calls() == 3
-                                && !companion.getPlanExecutor().isPlannerRequestPending(),
+                                && !companion.getConversationCoordinator().isRequestPending(),
                         DevAutoTest::llmReplanRemainderRepairVerdict,
                         400,
                         ignoredServer -> prepareLlmReplanRemainderRepair(),
@@ -1135,7 +1134,7 @@ public final class DevAutoTest {
         if ("llm_stale_request".equals(scenario.name()) && scenarioTicks == 2) {
             // Well inside the fixture's 400ms delay: the request is genuinely in flight, which is
             // the only window in which a stale answer can be created.
-            companion.getPlanExecutor().discardPendingPlannerRequests();
+            companion.getConversationCoordinator().invalidateAll();
             companion.closeStandingOrder();
         }
         if (scenarioTicks > scenario.hardCapTicks()) {
@@ -1508,9 +1507,9 @@ public final class DevAutoTest {
             companion.getConversationLog().clear();
         }
         companion.openStandingOrder(requestText);
-        // The same builder the command path uses, so what the suite exercises cannot drift from
-        // what the player's /companion plan does.
-        PlannerRequests.owner(companion, Planners.active(), requestText);
+        // The same entry point the command path uses, so what the suite exercises cannot drift
+        // from what the player's /companion plan does.
+        companion.getConversationCoordinator().submitOwnerTurnNow(requestText);
     }
 
     private static void prepareLlmReplanBudget() {
@@ -1711,7 +1710,7 @@ public final class DevAutoTest {
 
     private static void clearLlmPlanner(MinecraftServer server) {
         if (companion != null && companion.getPlanExecutor() != null) {
-            companion.getPlanExecutor().discardPendingPlannerRequests();
+            companion.getConversationCoordinator().invalidateAll();
             if (companion.getPlanExecutor().isActive()) {
                 companion.getPlanExecutor().cancel(Reasons.CANCELLED_BY_OWNER);
             }
@@ -1729,8 +1728,8 @@ public final class DevAutoTest {
 
     /** True once the planner has answered, one way or another, and left the executor idle. */
     private static boolean llmPlannerSettled() {
-        PlanExecutor executor = companion.getPlanExecutor();
-        return !executor.isPlannerRequestPending() && !executor.isActive();
+        return !companion.getConversationCoordinator().isRequestPending()
+                && !companion.getPlanExecutor().isActive();
     }
 
     /**
@@ -1792,7 +1791,7 @@ public final class DevAutoTest {
             companion.getConversationLog().clear();
         }
         companion.openStandingOrder(order);
-        PlannerRequests.owner(companion, Planners.active(), order);
+        companion.getConversationCoordinator().submitOwnerTurnNow(order);
     }
 
     private static final String LLM_LIVE_ORDER = "get me 2 dirt and then come stand next to me";
@@ -1813,15 +1812,14 @@ public final class DevAutoTest {
     /** The model has answered once the request is no longer pending and something came of it. */
     private static boolean llmLiveAnswered() {
         PlanExecutor executor = companion.getPlanExecutor();
-        return !executor.isPlannerRequestPending()
+        return !companion.getConversationCoordinator().isRequestPending()
                 && (executor.isActive() || sawNewPlanOutcome()
                         || journalHas(EventKind.PLANNER_FAILED)
                         || companion.getStandingOrder() == null);
     }
 
     private static boolean llmLiveMultiStepAnswered() {
-        PlanExecutor executor = companion.getPlanExecutor();
-        if (executor.isPlannerRequestPending()) {
+        if (companion.getConversationCoordinator().isRequestPending()) {
             return false;
         }
         return llmObservedLiveResponse != null || sawNewPlanOutcome()
@@ -2008,7 +2006,7 @@ public final class DevAutoTest {
         if (companion.getPlanExecutor().isActive()) {
             return label + ": a plan started anyway";
         }
-        if (companion.getPlanExecutor().isPlannerRequestPending()) {
+        if (companion.getConversationCoordinator().isRequestPending()) {
             return label + ": the request is still pending";
         }
         if (companion.getSupervisor().currentGoal().isPresent()) {
@@ -2317,7 +2315,7 @@ public final class DevAutoTest {
         log.recordCompanion(AUTOTEST_COMPANION_NAME + ": Hey! Good to see you.", gameTime);
         log.recordActivity("delivered 1 crafting_table to owner", gameTime);
         companion.openStandingOrder("where are you?");
-        PlannerRequests.owner(companion, Planners.active(), "where are you?");
+        companion.getConversationCoordinator().submitOwnerTurnNow("where are you?");
     }
 
     /** The seeded history reaches the OpenAI wire as alternating turns with tool_choice auto. */

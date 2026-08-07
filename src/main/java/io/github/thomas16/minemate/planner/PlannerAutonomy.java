@@ -47,7 +47,8 @@ public final class PlannerAutonomy {
         }
 
         PlanExecutor executor = companion.getPlanExecutor();
-        if (executor == null || executor.isActive() || executor.isPlannerRequestPending()) {
+        if (executor == null || executor.isActive()
+                || companion.getConversationCoordinator().isRequestPending()) {
             return;
         }
         if (companion.getSupervisor() != null && companion.getSupervisor().isBusy()) {

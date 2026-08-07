@@ -303,43 +303,14 @@ public final class PlanExecutor {
         return value != null && value.isJsonPrimitive() ? value.getAsString() : "";
     }
 
-    // ---- stage-4a delegates: request concurrency now lives on ConversationCoordinator. ------
-    // These keep every caller compiling unchanged and are deleted in stage 4b.
-
-    /** Server-thread-only. Claims the next planner request slot; see the coordinator. */
-    public int beginPlannerRequest() {
-        return companion.getConversationCoordinator().beginPlannerRequest();
-    }
-
-    /** Whether a completed planner request is still the one the owner is waiting for. */
-    public boolean isCurrentPlannerRequest(int generation) {
-        return companion.getConversationCoordinator().isCurrentPlannerRequest(generation);
-    }
-
-    /** Server-thread-only. Marks the in-flight request answered, whatever the answer was. */
-    public void completePlannerRequest(int generation) {
-        companion.getConversationCoordinator().completePlannerRequest(generation);
-    }
-
-    /** Whether a planner has been asked for a plan that has not come back yet. */
-    public boolean isPlannerRequestPending() {
-        return companion.getConversationCoordinator().isRequestPending();
-    }
-
     /**
-     * Server-thread-only. Abandons any in-flight planner request without touching a running plan.
-     * {@code /companion stop} needs this even with no plan active, because the request that would
-     * have produced one may still be outstanding.
+     * Server-thread-only. Cancels the running step as well as the plan. Since stage 4b this
+     * touches only the plan: disowning an in-flight planner request is the
+     * {@link ConversationCoordinator}'s job, and callers that mean "stop everything" call its
+     * {@code invalidateAll()} themselves.
      */
-    public void discardPendingPlannerRequests() {
-        companion.getConversationCoordinator().discardPendingPlannerRequests();
-    }
-
-    /** Server-thread-only. Cancels the running step as well as the plan. */
     public void cancel(String reason) {
         assertServerThread();
-        // Before the early return: a cancel with no plan yet still has to disown a pending request.
-        discardPendingPlannerRequests();
         if (plan == null) {
             return;
         }
@@ -352,7 +323,6 @@ public final class PlanExecutor {
     /** Server-thread-only. Ends the plan without touching the supervisor, which is stopping too. */
     public void shutdown(String reason) {
         assertServerThread();
-        discardPendingPlannerRequests();
         if (plan != null) {
             finish(PlanStatus.FAILED, reason);
         }

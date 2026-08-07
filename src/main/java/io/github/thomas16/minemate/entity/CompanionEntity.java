@@ -84,6 +84,7 @@ public class CompanionEntity extends LivingEntity
     private ConversationLog conversationLog;
 
     private UUID ownerUuid;
+    private long orderEpochCounter;
     private Vec3 lastVelocity = Vec3.ZERO;
 
     public CompanionEntity(EntityType<? extends CompanionEntity> type, Level level) {
@@ -166,9 +167,10 @@ public class CompanionEntity extends LivingEntity
         return standingOrder;
     }
 
-    /** Opens a fresh order with a full replan budget, replacing any order still open. */
+    /** Opens a fresh order with a full replan budget and a fresh epoch, replacing any still open. */
     public void openStandingOrder(String requestText) {
-        this.standingOrder = new StandingOrder(requestText, this.level().getGameTime());
+        this.standingOrder = new StandingOrder(requestText, this.level().getGameTime(),
+                ++this.orderEpochCounter);
     }
 
     public void closeStandingOrder() {

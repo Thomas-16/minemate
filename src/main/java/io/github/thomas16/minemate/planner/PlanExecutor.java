@@ -46,8 +46,22 @@ public final class PlanExecutor {
 
     public enum StartResult { ACCEPTED, BUSY, REJECTED }
 
-    /** A plan whose every step passed validation; the only thing {@link #commit} accepts. */
-    public record PreparedPlan(Plan plan, List<ToolValidation.Accepted> steps) {
+    /** What contract discipline {@link #prepare} must hold a plan to. */
+    public enum CoverageScope {
+        /** No contract in play: structural validation only. */
+        NONE,
+        /** The whole declared contract must be covered, as on a first accepted action reply. */
+        FULL,
+        /** Only the ledger's undelivered remainder must be covered, as on a replan. */
+        REMAINDER
+    }
+
+    /**
+     * A plan whose every step passed validation, plus the contract it was validated against
+     * (null when none was declared); the only thing {@link #commit} accepts.
+     */
+    public record PreparedPlan(Plan plan, List<ToolValidation.Accepted> steps,
+            OrderContract contract) {
     }
 
     /** The result of pure validation: a committable plan or one reason it cannot run. */
@@ -98,14 +112,20 @@ public final class PlanExecutor {
         };
     }
 
-    /**
-     * Pure validation: step bound, registry acceptance, continuous-tool placement. Mutates no
-     * live state, so a caller can prepare a replacement while other work still runs.
-     *
-     * <p>Contract coverage stays in {@link PlannerDispatch} for now — it depends on standing-order
-     * state only dispatch knows. It folds in here when stage 5 adds atomic plan replacement.
-     */
+    /** Structural validation only; see the four-argument overload. */
     public PrepareOutcome prepare(Plan newPlan) {
+        return prepare(newPlan, null, CoverageScope.NONE, null);
+    }
+
+    /**
+     * Pure validation: step bound, registry acceptance, continuous-tool placement, and contract
+     * coverage at the requested scope. Mutates no live state, so a caller can prepare a
+     * replacement while other work still runs. Dispatch stays the semantic gate that chooses the
+     * scope and refreshes the ledger; the checking itself lives here, so {@link #commit} can only
+     * ever receive a plan whose whole discipline passed.
+     */
+    public PrepareOutcome prepare(Plan newPlan, OrderContract contract, CoverageScope scope,
+            OrderLedger remainderLedger) {
         assertServerThread();
         if (newPlan == null || newPlan.steps().isEmpty()) {
             return new PrepareOutcome.Invalid(Reasons.PLAN_EMPTY);
@@ -127,7 +147,17 @@ public final class PlanExecutor {
             }
             accepted.add(ok);
         }
-        return new PrepareOutcome.Ready(new PreparedPlan(newPlan, List.copyOf(accepted)));
+        String coverageViolation = switch (scope) {
+            case NONE -> null;
+            case FULL -> ContractCoverage.violation(contract, newPlan.steps());
+            case REMAINDER -> ContractCoverage.remainderViolation(remainderLedger,
+                    newPlan.steps());
+        };
+        if (coverageViolation != null) {
+            return new PrepareOutcome.Invalid(coverageViolation);
+        }
+        return new PrepareOutcome.Ready(new PreparedPlan(newPlan, List.copyOf(accepted),
+                contract));
     }
 
     /** One server-thread transition installing an already-validated plan. */

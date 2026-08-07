@@ -72,8 +72,17 @@ public final class PlannerDispatch {
             companion.closeStandingOrder();
             return;
         }
+        if (ticket.origin() != RequestOrigin.OWNER_CHAT
+                && orderEpochOf(companion) != ticket.orderEpochAtStart()) {
+            // A replan, continuation, or repair continues the order that was open when its
+            // request began. That order has since closed or been replaced, so this result no
+            // longer addresses anything; §7.2 forbids replaying it.
+            MineMate.LOGGER.debug("Discarding response for a closed or replaced order from {}",
+                    planner.name());
+            return;
+        }
         if (response.close() != null) {
-            applyClose(companion, planner, request, response);
+            applyClose(companion, planner, request, response, ticket);
             return;
         }
         if (response.isConversation()) {
@@ -156,7 +165,7 @@ public final class PlannerDispatch {
 
     /** Close the standing order, with COMPLETED resting on ledger evidence rather than a claim. */
     private static void applyClose(CompanionEntity companion, Planner planner, PlanRequest request,
-            CompanionResponse response) {
+            CompanionResponse response, ConversationCoordinator.RequestTicket ticket) {
         OrderClose close = response.close();
         StandingOrder order = companion.getStandingOrder();
         if (order == null) {
@@ -165,6 +174,13 @@ public final class PlannerDispatch {
             MineMate.LOGGER.debug("Planner {} closed a non-existent order ({})", planner.name(),
                     close.status());
             CompanionSpeech.send(companion, displayLineOf(response));
+            return;
+        }
+        if (order.epoch() != ticket.orderEpochAtStart()) {
+            // The order this close was composed against is gone; the one now open is someone
+            // else's business. Stale, ignored, nothing delivered (design section 2).
+            MineMate.LOGGER.debug("Planner {} closed a superseded order ({})", planner.name(),
+                    close.status());
             return;
         }
         if (close.status() == OrderCloseStatus.COMPLETED && order.contract() != null
@@ -291,6 +307,12 @@ public final class PlannerDispatch {
                 request.toolSchemaJson(), note, ledgerTextOf(companion),
                 PlannerRequests.transcriptOf(companion),
                 PlannerRequests.ownerNameOf(companion)));
+    }
+
+    /** The epoch of the currently open order, or 0 with none open. */
+    private static long orderEpochOf(CompanionEntity companion) {
+        StandingOrder order = companion.getStandingOrder();
+        return order == null ? 0L : order.epoch();
     }
 
     /** The standing order's ledger rendered for the prompt, refreshed against the live owner. */

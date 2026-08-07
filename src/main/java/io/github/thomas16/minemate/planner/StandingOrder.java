@@ -12,15 +12,17 @@ public final class StandingOrder {
 
     private final String requestText;
     private final long openedAtGameTime;
+    private final long epoch;
     private int replansUsed;
     private OrderContract contract;
     private OrderLedger ledger;
     private boolean repairUsed;
     private boolean awaitingCoverage;
 
-    public StandingOrder(String requestText, long openedAtGameTime) {
+    public StandingOrder(String requestText, long openedAtGameTime, long epoch) {
         this.requestText = requestText == null ? "" : requestText;
         this.openedAtGameTime = openedAtGameTime;
+        this.epoch = epoch;
     }
 
     public String requestText() {
@@ -29,6 +31,15 @@ public final class StandingOrder {
 
     public long openedAtGameTime() {
         return openedAtGameTime;
+    }
+
+    /**
+     * Monotonic per-companion identity, assigned when the order opens. A model response is only
+     * applicable to the order that was open when its request began; the epoch is how a completion
+     * proves that, since object references cannot cross the wire and game time can collide.
+     */
+    public long epoch() {
+        return epoch;
     }
 
     /** Replans spent so far; the owner's own request is not charged against the budget. */

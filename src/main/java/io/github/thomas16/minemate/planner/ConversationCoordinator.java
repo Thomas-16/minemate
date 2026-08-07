@@ -25,11 +25,15 @@ public final class ConversationCoordinator {
 
     /**
      * Identity a completion carries back to the server thread; staleness and applicability are
-     * decided against this, never against a bare number a closure remembered.
+     * decided against this, never against a bare number a closure remembered. The order epoch and
+     * plan id are captured when the request begins, so dispatch can tell whether a result still
+     * addresses the world it was asked about ({@code 0} / {@code ""} when none was open).
      */
-    public record RequestTicket(int generation, RequestOrigin origin) {
+    public record RequestTicket(int generation, RequestOrigin origin, long orderEpochAtStart,
+            String planIdAtStart) {
         public RequestTicket {
             Objects.requireNonNull(origin, "origin");
+            planIdAtStart = planIdAtStart == null ? "" : planIdAtStart;
         }
     }
 
@@ -101,7 +105,11 @@ public final class ConversationCoordinator {
     /** Claims the next request slot. Whatever was in flight before is stale from this moment. */
     public RequestTicket begin(RequestOrigin origin) {
         assertServerThread();
-        inFlight = new RequestTicket(++generation, origin);
+        StandingOrder order = companion.getStandingOrder();
+        long orderEpoch = order == null ? 0L : order.epoch();
+        String planId = companion.getPlanExecutor() == null ? ""
+                : companion.getPlanExecutor().currentPlan().map(Plan::id).orElse("");
+        inFlight = new RequestTicket(++generation, origin, orderEpoch, planId);
         return inFlight;
     }
 
